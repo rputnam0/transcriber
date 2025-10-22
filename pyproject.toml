@@ -1,0 +1,58 @@
+[project]
+name = "transcriber"
+version = "0.2.0"
+description = "GPU Whisper/WhisperX transcription with alignment + diarization (local + Docker)"
+authors = [{ name = "rputnam" }]
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+
+dependencies = [
+    # WhisperX and ASR
+    "whisperx>=3.7.4,<3.8",
+    "faster-whisper",
+    # Diarization GPU path
+    "onnxruntime-gpu>=1.18,<2",
+    # Runtime CUDA/cuDNN libs for CT2 & ORT (CUDA 12 + cuDNN 9)
+    "nvidia-cublas-cu12>=12.4,<13",
+    "nvidia-cudnn-cu12>=9.0,<10",
+    # Utilities
+    "pillow>=10.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    # Torch family from cu128 index
+    "torch",
+    "torchvision",
+    "torchaudio",
+    # Hugging Face fast transfer (since HF_HUB_ENABLE_HF_TRANSFER=1 is set)
+    "hf-transfer>=0.1.8",
+]
+
+[project.scripts]
+transcribe = "transcriber.cli:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = ["pytest>=8.4.2"]
+
+# uv: install PyTorch wheels built for CUDA 12.8
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
