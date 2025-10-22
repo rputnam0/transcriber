@@ -74,6 +74,8 @@ def _get_model(
     compute_type: str,
     cache_root: Optional[str],
     local_files_only: bool,
+    *,
+    strict_cuda: bool = False,
 ):
     # Lazy import to honor env vars set by the CLI
     import whisperx  # type: ignore
@@ -88,11 +90,11 @@ def _get_model(
                 local_files_only=local_files_only,
             )
         except Exception as exc:  # noqa: BLE001
-            # Two fallback strategies:
+            # Two fallback strategies (disabled when strict_cuda is True):
             # 1) If running on GPU, try CPU.
             # 2) If compute_type looks incompatible for the device (e.g., float16 on CPU),
             #    try a conservative CPU-friendly compute type.
-            if device != "cpu":
+            if device != "cpu" and not strict_cuda:
                 logger.warning(
                     "Model load failed on %s (%s); retrying on CPU.",
                     device,
@@ -115,7 +117,7 @@ def _get_model(
                 return model
             # Already on CPU: attempt a conservative compute_type if not already using one
             cpu_safe_types = {"int8", "int8_float32", "int8_np"}
-            if compute_type not in cpu_safe_types:
+            if compute_type not in cpu_safe_types and not strict_cuda:
                 cpu_key = (model_name, "cpu", "int8", cache_root, local_files_only)
                 if cpu_key not in _MODEL_CACHE:
                     logger.info(
@@ -215,6 +217,7 @@ def transcribe_with_whisperx(
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
     quiet: bool = True,
     force_device: Optional[str] = None,
+    strict_cuda: bool = False,
 ) -> Tuple[List[dict], Optional[List[dict]]]:
     """Run ASR + alignment + diarization via WhisperX for a single file."""
     # Lazy import here as well for direct function callers
@@ -239,7 +242,14 @@ def transcribe_with_whisperx(
         audio_path,
     )
     with _silence_stdio(quiet):
-        model = _get_model(model_name, device, compute_type, model_cache_dir, local_files_only)
+        model = _get_model(
+            model_name,
+            device,
+            compute_type,
+            model_cache_dir,
+            local_files_only,
+            strict_cuda=strict_cuda,
+        )
 
     # Attempt to force VAD to CPU if requested and supported by installed whisperx.
     # Adaptive batch size to avoid OOM while utilizing VRAM
@@ -311,6 +321,10 @@ def transcribe_with_whisperx(
     try:
         diar_device = "cpu" if pyannote_on_cpu else device
         if diar_device == "cuda" and not _cudnn_usable():
+            if strict_cuda:
+                raise RuntimeError(
+                    "cuDNN unavailable: strict CUDA mode forbids CPU diarization fallback"
+                )
             logger.warning(
                 "cuDNN not available or failed to load; falling back to CPU for diarization."
             )

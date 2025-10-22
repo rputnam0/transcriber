@@ -15,6 +15,84 @@ from tqdm import tqdm
 from .audio import gather_inputs, cleanup_tmp, is_audio_file
 from .consolidate import consolidate, save_outputs, choose_speaker
 
+# Keep global references to preloaded CUDA libraries so they aren't dlclosed
+_CUDA_PRELOAD_HANDLES: list = []
+
+def _ensure_cuda_libs_on_path() -> None:
+    """Expose bundled CUDA libraries (cudnn/cublas) to the dynamic loader.
+
+    Many Python wheels (torch, onnxruntime-gpu) rely on split NVIDIA libraries
+    provided by pip packages like `nvidia-cudnn-cu12` and `nvidia-cublas-cu12`.
+    When these aren't discoverable, users may see errors such as:
+      Unable to load any of {libcudnn_cnn.so.9.1.0, libcudnn_cnn.so.9.1, ...}
+
+    This helper prepends their lib directories to LD_LIBRARY_PATH at runtime.
+    """
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        lib_dirs = []
+        # Probe sys.path for namespace packages installed by pip
+        for root in map(_Path, _sys.path):
+            for sub in (
+                root / "nvidia" / "cudnn" / "lib",
+                root / "nvidia" / "cublas" / "lib",
+            ):
+                if sub.exists() and sub.is_dir():
+                    lib_dirs.append(str(sub.resolve()))
+        if not lib_dirs:
+            return
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        parts = [p for p in current.split(":") if p]
+        for d in lib_dirs:
+            if d not in parts:
+                parts.insert(0, d)
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+    except Exception:
+        # Best-effort; don't crash CLI on path adjustments
+        pass
+
+def _preload_cudnn_libs() -> None:
+    """Attempt to preload cuDNN split libraries to avoid lazy loader issues.
+
+    On some systems, libraries like `libcudnn_cnn.so.9` are present but not
+    discovered consistently by deep dependencies (e.g., pyannote/onnxruntime).
+    Explicitly dlopen the common cuDNN components.
+    """
+    try:
+        import ctypes
+        import glob
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        # Find candidate directories first
+        lib_dirs = []
+        for root in map(_Path, _sys.path):
+            cand = root / "nvidia" / "cudnn" / "lib"
+            if cand.exists():
+                lib_dirs.append(str(cand))
+        names = [
+            "libcudnn.so.9",
+            "libcudnn_cnn.so.9",
+            "libcudnn_ops.so.9",
+            "libcudnn_adv.so.9",
+            "libcudnn_graph.so.9",
+            "libcudnn_heuristic.so.9",
+        ]
+        for d in lib_dirs:
+            for n in names:
+                p = _Path(d) / n
+                if p.exists():
+                    try:
+                        _CUDA_PRELOAD_HANDLES.append(ctypes.CDLL(str(p)))
+                    except Exception:
+                        # Best-effort; continue preloading remaining libraries
+                        pass
+    except Exception:
+        # Ignore preload failures
+        pass
+
 def _setup_logging_and_warnings(log_level: str, quiet: bool) -> None:
     """Configure logging and warnings to reduce noise by default.
 
@@ -142,6 +220,7 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         "watch": "watch",
         "watch_interval": "watch_interval",
         "watch_stability": "watch_stability",
+        "watch_input": "watch_input",
         "input": "input",
     }
     for ck, ak in key_map.items():
@@ -223,6 +302,9 @@ def run_transcribe(
     cache_mode: str | None = None,
     device: str | None = None,
 ) -> None:
+    # Ensure cuDNN/cuBLAS split libraries are visible to the loader
+    _ensure_cuda_libs_on_path()
+    _preload_cudnn_libs()
     logger = logging.getLogger("transcriber")
     # Track whether the user explicitly provided a cache root
     user_provided_cache = bool(cache_root)
@@ -361,8 +443,9 @@ def run_transcribe(
                 vad_on_cpu=(vad_on_cpu or pyannote_on_cpu),
                 pyannote_on_cpu=pyannote_on_cpu,
                 progress_cb=_progress_cb,
-                    quiet=quiet,
-                    force_device=device_guess,
+                quiet=quiet,
+                force_device=device_guess,
+                strict_cuda=(device == "cuda"),
                 )
             if pbar is not None:
                 pbar.close()
@@ -584,9 +667,23 @@ def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
 
     try:
         while True:
-            input_root = args.input or (cfg.get("input") if isinstance(cfg, dict) else None)
+            if isinstance(cfg, dict):
+                cfg_watch_input = cfg.get("watch_input")
+                cfg_input = cfg.get("input")
+            else:
+                cfg_watch_input = None
+                cfg_input = None
+            input_root = (
+                getattr(args, "watch_input", None)
+                or cfg_watch_input
+                or args.input
+                or cfg_input
+            )
             if not input_root:
-                logger.error("Watch: missing INPUT and no 'input' in config; sleeping %ss", interval)
+                logger.error(
+                    "Watch: missing INPUT/--watch-input and no 'input'/'watch_input' in config; sleeping %ss",
+                    interval,
+                )
                 time.sleep(interval)
                 continue
             root = Path(input_root)
@@ -648,12 +745,14 @@ def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
                             write_srt=not args.no_srt,
                             write_jsonl=not args.no_jsonl,
                             cache_root=args.cache_root,
+                            cache_mode=args.cache_mode,
                             local_files_only=args.local_files_only,
                             single_file_speaker=args.single_file_speaker,
                             vad_on_cpu=args.vad_on_cpu,
                             pyannote_on_cpu=args.pyannote_on_cpu,
                             quiet=args.quiet,
                             auto_batch=args.auto_batch,
+                            device=None if getattr(args, "device", "auto") == "auto" else args.device,
                         )
                     except BaseException as exc:  # noqa: PIE786
                         msg = str(exc)
@@ -705,6 +804,10 @@ def main():
     ap.add_argument("--watch", action="store_true", help="Continuously watch INPUT directory for new audio/ZIP files")
     ap.add_argument("--watch-interval", type=int, default=10, help="Polling interval (seconds) in watch mode")
     ap.add_argument("--watch-stability", type=int, default=5, help="Minimum age (seconds) before a new file is considered stable for processing")
+    ap.add_argument(
+        "--watch-input",
+        help="Override the directory to monitor in watch mode (defaults to INPUT/config input)",
+    )
     ap.add_argument("--output-dir", default="outputs")
     ap.add_argument("--speaker-mapping", dest="speaker_mapping", help="YAML/JSON mapping of speaker IDs -> names")
     ap.add_argument("--min-speakers", type=int)
@@ -756,7 +859,7 @@ def main():
 
     # Input may come from config; ensure it exists
     effective_input = args.input or (cfg.get("input") if isinstance(cfg, dict) else None)
-    if not effective_input:
+    if not effective_input and not args.watch:
         ap.error("Missing INPUT and no 'input' provided in config")
 
     if args.watch:

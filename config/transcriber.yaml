@@ -1,0 +1,13 @@
+# Config used by local development; copy or tweak as needed.
+backend: whisperx
+device: cuda
+model: large-v3
+compute_type: float16
+batch_size: 32
+auto_batch: true
+cache_mode: repo
+speaker_mapping: config/speaker_mapping.yaml
+# input: audio/Session_32.zip
+watch_input: audio
+log_level: WARNING
+quiet: true

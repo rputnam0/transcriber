@@ -1,0 +1,15 @@
+# Map recording-specific track IDs or diarization labels to display names.
+# Matching is case-insensitive and robust to filename prefixes/suffixes.
+
+autbot_80hd55561_0: "B. Ver"
+bfschmity_0: "Kaladen Sash"
+travisaurus6985_0: "Cyrus Schwert"
+joeeeenathan_0: "Dungeon Master"
+kinglizard7958_0: "Leopold Magnus"
+jessev567890_0: "Zariel Torgan"
+traceritops_0: "Cletus Clobbington"
+
+
+# Example of using diarization cluster names as keys
+# SPEAKER_00: "Facilitator"
+# SPEAKER_01: "Participant A"

@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+#cache file
+
+.hf_cache
+
 # audio files
 audio/
 outputs/
