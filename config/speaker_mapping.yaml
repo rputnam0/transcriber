@@ -2,12 +2,13 @@
 # Matching is case-insensitive and robust to filename prefixes/suffixes.
 
 autbot_80hd55561_0: "B. Ver"
-bfschmity_0: "Kaladen Sash"
+bfschmity_0: "Kaladen Shash"
 travisaurus6985_0: "Cyrus Schwert"
 joeeeenathan_0: "Dungeon Master"
 kinglizard7958_0: "Leopold Magnus"
-jessev567890_0: "Zariel Torgan"
-traceritops_0: "Cletus Clobbington"
+#jessev567890_0: "Zariel Torgan"
+jessev567890_0: "David Tanglethorn"
+traceritops_0: "Cletus Cobbington"
 
 
 # Example of using diarization cluster names as keys

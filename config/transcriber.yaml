@@ -2,12 +2,38 @@
 backend: whisperx
 device: cuda
 model: large-v3
+auto_batch: true
 compute_type: float16
 batch_size: 32
 auto_batch: true
-cache_mode: repo
+language: en
 speaker_mapping: config/speaker_mapping.yaml
-# input: audio/Session_32.zip
-watch_input: audio
+
+
+# Input / watch mode
+# `input` runs a single transcription. Set `watch: true` to keep scanning a directory,
+# optionally overriding the folder with `watch_input`.
+input: audio/
+watch: true
+watch_input: /mnt/g/'My Drive'/DND/Audio/transcribe/
+watch_interval: 10
+watch_stability: 5
+output_dir: /mnt/g/'My Drive'/DND/Transcripts
+
+
+# Output formats
+# Disable these flags to skip generating the associated files.
+write_srt: true
+write_jsonl: true
+
+# Cache location strategy
+# cache_mode options: home (=~/hf_cache), repo (=./.hf_cache), env (=respect HF env vars)
+cache_mode: home
+# cache_root overrides the directory used for Hugging Face caches; leave empty to auto-select.
+cache_root:
+# Set to true to prevent downloads (offline usage); requires models cached already.
+local_files_only: false
+
+
 log_level: WARNING
 quiet: true

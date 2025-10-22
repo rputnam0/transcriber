@@ -37,6 +37,11 @@ Verify: `uv run python -c "import torch;print('cuda',torch.cuda.is_available(),'
 ## Configuration
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.
 
+## Watch Mode
+- Launch the watcher: `uv run transcribe --watch --config config/transcriber.yaml`. Use `watch_input` (config) or `--watch-input` (CLI) when the directory you monitor differs from the one-shot `input`.
+- Config sticks after startup; restart the process (Ctrl+C and rerun) or bounce your service (`systemctl restart transcriber-watch`, `supervisorctl restart transcriber`, etc.) to pick up config edits.
+- Logs go to stdout by default. When running manually, pipe to a file and tail it (`uv run … --watch | tee -a watch.log`, then `tail -f watch.log`). For services, follow the manager’s viewer (`journalctl -fu transcriber-watch`, `docker logs -f transcriber-watch`).
+
 ## Speaker Mapping
 Map track IDs or diarization labels to display names. Example (`config/speaker_mapping.example.yaml`):
 
