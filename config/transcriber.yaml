@@ -15,10 +15,10 @@ speaker_mapping: config/speaker_mapping.yaml
 # optionally overriding the folder with `watch_input`.
 input: audio/
 watch: true
-watch_input: /mnt/g/'My Drive'/DND/Audio/transcribe/
+watch_input: /mnt/g/My Drive/DND/Audio/transcribe/
 watch_interval: 10
 watch_stability: 5
-output_dir: /mnt/g/'My Drive'/DND/Transcripts
+output_dir: /mnt/g/My Drive/DND/Transcripts
 
 
 # Output formats
