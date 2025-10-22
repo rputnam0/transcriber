@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 from .srt import write_srt
 import re
@@ -16,7 +16,12 @@ def _format_ts(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def choose_speaker(filename: str, mapping: Dict[str, str]) -> str:
+def choose_speaker(
+    filename: str,
+    mapping: Dict[str, str],
+    *,
+    return_match: bool = False,
+) -> Union[str, Tuple[str, bool]]:
     """Pick a friendly speaker label based on path / mapping tokens.
 
     Behavior mirrors the prototype's flexible matching:
@@ -27,10 +32,17 @@ def choose_speaker(filename: str, mapping: Dict[str, str]) -> str:
     """
     stem = Path(filename).stem
     if not mapping:
-        return stem
+        return (stem, False) if return_match else stem
 
     # Normalise mapping keys (drop extension, lower)
     normalized = {Path(key).stem.lower(): value for key, value in mapping.items()}
+    key_simplified: Dict[str, str] = {}
+    simplified_lookup: Dict[str, str] = {}
+    for key, value in normalized.items():
+        simplified = re.sub(r"[^a-z0-9]+", "", key)
+        key_simplified[key] = simplified
+        if simplified and simplified not in simplified_lookup:
+            simplified_lookup[simplified] = value
 
     raw_lower = stem.lower()
     # Candidate tokens from filename to match against mapping keys
@@ -49,18 +61,33 @@ def choose_speaker(filename: str, mapping: Dict[str, str]) -> str:
             seen.add(c)
             uniq_candidates.append(c)
 
-    # 1) Exact match on any candidate token
+    # 1) Exact match on any candidate token (original or simplified)
     for cand in uniq_candidates:
+        simplified = re.sub(r"[^a-z0-9]+", "", cand)
         if cand in normalized:
-            return normalized[cand]
+            value = normalized[cand]
+            return (value, True) if return_match else value
+        if simplified and simplified in simplified_lookup:
+            value = simplified_lookup[simplified]
+            return (value, True) if return_match else value
 
     # 2) Substring containment either direction (like the prototype)
     for cand in uniq_candidates:
+        simplified = re.sub(r"[^a-z0-9]+", "", cand)
         for key, value in normalized.items():
             if cand in key or key in cand:
-                return value
+                result = value
+                return (result, True) if return_match else result
+            key_simple = key_simplified.get(key)
+            if (
+                simplified
+                and key_simple
+                and (simplified in key_simple or key_simple in simplified)
+            ):
+                result = value
+                return (result, True) if return_match else result
 
-    return stem
+    return (stem, False) if return_match else stem
 
 
 def consolidate(all_segments: List[Tuple[str, List[dict]]]) -> List[Tuple[str, str, str]]:

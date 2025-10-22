@@ -38,8 +38,10 @@ Verify: `uv run python -c "import torch;print('cuda',torch.cuda.is_available(),'
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.
 
 ## Watch Mode
-- Launch the watcher: `uv run transcribe --watch --config config/transcriber.yaml`. Use `watch_input` (config) or `--watch-input` (CLI) when the directory you monitor differs from the one-shot `input`.
+- Keep two configs: `config/transcriber.yaml` for interactive CLI runs, and `config/transcriber.watch.yaml` (copy from `config/transcriber.watch.example.yaml`) for the background watcher.
+- Launch the watcher interactively with `uv run transcribe --watch --config config/transcriber.watch.yaml`. Use `watch_input` (config) or `--watch-input` (CLI) when the directory you monitor differs from the one-shot `input`.
 - Config sticks after startup; restart the process (Ctrl+C and rerun). If you installed it with `scripts/install_watch_service.sh`, restart via `systemctl --user restart transcriber-watch.service`.
+- The bundled `scripts/watch_service_runner.sh` now passes the watch config automatically; override with `WATCH_CONFIG=/path/to/custom.yaml`.
 - Logs go to stdout by default. Manually: pipe to a file and tail it (`uv run … --watch | tee -a watch.log`, then `tail -f watch.log`). For the systemd user service, follow logs with `journalctl --user -u transcriber-watch.service -f -o cat`.
 
 ## Speaker Mapping

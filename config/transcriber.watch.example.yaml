@@ -1,0 +1,23 @@
+backend: whisperx
+device: auto
+model: large-v3
+compute_type: float16
+batch_size: 32
+auto_batch: true
+
+# Watch-specific settings
+watch: true
+watch_input: audio/incoming
+watch_interval: 10
+watch_stability: 5
+output_dir: outputs
+
+# Speaker mapping can still be used to rename tracks when known.
+speaker_mapping: config/speaker_mapping.example.yaml
+
+# Cache + logging settings carry over from the interactive CLI defaults.
+cache_mode: repo
+cache_root:
+local_files_only: false
+log_level: WARNING
+quiet: true

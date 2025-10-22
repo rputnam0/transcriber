@@ -1,7 +1,7 @@
 # Map recording-specific track IDs or diarization labels to display names.
 # Matching is case-insensitive and robust to filename prefixes/suffixes.
 
-autbot_80hd55561_0: "B. Ver"
+autbot_80hd_55561_0: "B. Ver"
 bfschmity_0: "Kaladen Shash"
 travisaurus6985_0: "Cyrus Schwert"
 joeeeenathan_0: "Dungeon Master"

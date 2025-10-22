@@ -39,6 +39,12 @@ PY
     export LD_LIBRARY_PATH="$CUDA_LIBS:${LD_LIBRARY_PATH:-}"
   fi
 fi
+WATCH_CONFIG_DEFAULT="$REPO_DIR/config/transcriber.watch.yaml"
+CONFIG_ARGS=()
+if [[ -n "${WATCH_CONFIG:-}" ]]; then
+  CONFIG_ARGS+=(--config "$WATCH_CONFIG")
+elif [[ -f "$WATCH_CONFIG_DEFAULT" ]]; then
+  CONFIG_ARGS+=(--config "$WATCH_CONFIG_DEFAULT")
+fi
 
-exec "$TRANSCRIBE_BIN" audio/ --watch "$@"
-
+exec "$TRANSCRIBE_BIN" "${CONFIG_ARGS[@]}" audio/ --watch "$@"

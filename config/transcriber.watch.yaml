@@ -1,0 +1,29 @@
+# Config used by local development; copy or tweak as needed.
+backend: whisperx
+device: cuda
+model: large-v3
+auto_batch: true
+compute_type: float16
+batch_size: 32
+auto_batch: true
+language: en
+
+# Watch-specific settings
+watch: true
+watch_input: /mnt/g/My Drive/DND/Audio/transcribe/
+watch_interval: 10
+watch_stability: 5
+output_dir: /mnt/g/My Drive/DND/Transcripts
+
+write_srt: false
+write_jsonl: false
+
+# Speaker mapping can still be used to rename tracks when known.
+speaker_mapping: config/speaker_mapping.yaml
+
+# Cache + logging settings carry over from the interactive CLI defaults.
+cache_mode: home
+cache_root:
+local_files_only: false
+log_level: WARNING
+quiet: true

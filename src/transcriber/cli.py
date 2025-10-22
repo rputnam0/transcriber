@@ -179,6 +179,10 @@ def _find_config_path(explicit: str | None) -> str | None:
         return env
     cwd = Path.cwd()
     for candidate in (
+        cwd / "transcriber.cli.yaml",
+        cwd / "transcriber.cli.json",
+        cwd / "config" / "transcriber.cli.yaml",
+        cwd / "config" / "transcriber.cli.json",
         cwd / "transcriber.yaml",
         cwd / "transcriber.json",
         cwd / "config" / "transcriber.yaml",
@@ -368,9 +372,17 @@ def run_transcribe(
             exc,
         )
         mapping_pre = {}
-    file_labels: Dict[str, str] = {
-        f: (choose_speaker(f, mapping_pre) if mapping_pre else Path(f).stem) for f in files
-    }
+    file_labels: Dict[str, str] = {}
+    mapping_hits: Dict[str, bool] = {}
+    if mapping_pre:
+        for f in files:
+            label, matched = choose_speaker(f, mapping_pre, return_match=True)
+            file_labels[f] = label
+            mapping_hits[f] = matched
+    else:
+        for f in files:
+            file_labels[f] = Path(f).stem
+            mapping_hits[f] = False
 
     if backend == "whisperx":
         # Import after environment setup so Hugging Face picks up HF_* vars
@@ -390,6 +402,37 @@ def run_transcribe(
             eff_bs = _recommend_batch_size(device_guess, model_name, compute_type, user_hint=batch_size)
         iter_files = files
         use_tqdm = _tqdm_enabled()
+        mapping_covers_all = bool(mapping_pre) and all(mapping_hits.get(f, False) for f in files)
+        diarization_forced = (min_speakers is not None) or (max_speakers is not None)
+        multi_track_zip = tmp_root is not None and len(files) > 1
+        enable_diarization = True
+        if multi_track_zip and not diarization_forced:
+            enable_diarization = False
+            logger.info(
+                "Skipping diarization: multi-track ZIP input treated as per-speaker stems (%d tracks).",
+                len(files),
+            )
+            missing = [
+                Path(f).name
+                for f in files
+                if mapping_pre and not mapping_hits.get(f, False)
+            ]
+            if missing:
+                logger.warning(
+                    "Speaker mapping missing entries for %s — using raw stems as labels.",
+                    ", ".join(missing),
+                )
+        elif mapping_covers_all and not diarization_forced:
+            enable_diarization = False
+            logger.info(
+                "Skipping diarization: speaker mapping resolved all input files (%d/%d).",
+                len(files),
+                len(files),
+            )
+        elif mapping_covers_all and diarization_forced:
+            logger.info(
+                "Speaker mapping covers all inputs, but diarization remains enabled due to explicit speaker count constraints."
+            )
         if use_tqdm:
             iter_files = tqdm(
                 files,
@@ -446,7 +489,8 @@ def run_transcribe(
                 quiet=quiet,
                 force_device=device_guess,
                 strict_cuda=(device == "cuda"),
-                )
+                enable_diarization=enable_diarization,
+            )
             if pbar is not None:
                 pbar.close()
             dur = int(time.time() - start_ts)
@@ -768,6 +812,7 @@ def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n👋 Watch mode stopped by user.")
+        raise
 
 
 def main():
@@ -867,12 +912,14 @@ def main():
         while True:
             try:
                 watch_and_transcribe(args, cfg)
+            except KeyboardInterrupt:
+                logging.getLogger("transcriber").warning("Watch mode interrupted by user; exiting.")
+                break
             except BaseException as exc:  # noqa: PIE786
                 logging.getLogger("transcriber").error("Watch loop crashed: %s", exc)
                 time.sleep(int(getattr(args, "watch_interval", 10)))
                 continue
-        # Unreachable
-        # return
+        return
 
     run_transcribe(
         input_path=effective_input,

@@ -13,12 +13,12 @@ speaker_mapping: config/speaker_mapping.yaml
 # Input / watch mode
 # `input` runs a single transcription. Set `watch: true` to keep scanning a directory,
 # optionally overriding the folder with `watch_input`.
-input: audio/
-watch: true
+input: .audio/
+watch: false
 watch_input: /mnt/g/My Drive/DND/Audio/transcribe/
 watch_interval: 10
 watch_stability: 5
-output_dir: /mnt/g/My Drive/DND/Transcripts
+output_dir: .outputs/
 
 
 # Output formats

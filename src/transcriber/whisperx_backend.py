@@ -158,29 +158,56 @@ def _get_diar_pipeline(device: str, hf_token: Optional[str]):
       - whisperx.DiarizationPipeline(use_auth_token=..., device=...)
       - whisperx.load_diarize_model(device=..., use_auth_token=...)
       - whisperx.load_diarization_model(device=..., use_auth_token=...)
+      - whisperx.diarize.DiarizationPipeline(...)
     """
     import whisperx  # type: ignore
     cache_key = (device, hf_token)
     if cache_key in _DIAR_CACHE:
         return _DIAR_CACHE[cache_key]
 
-    pipeline = None
-    # 1) Newer/older direct class
-    try:
-        pipeline = getattr(whisperx, "DiarizationPipeline")(use_auth_token=hf_token, device=device)
-    except AttributeError:
-        pipeline = None
-    except TypeError:
-        # Some builds may not accept use_auth_token kwarg
-        try:
-            pipeline = getattr(whisperx, "DiarizationPipeline")(device=device)
-        except Exception:
-            pipeline = None
+    def _instantiate(ctor):
+        """Try constructing a pipeline with progressively simpler signatures."""
+        if ctor is None:
+            return None
+        attempts = []
+        if hf_token:
+            attempts.append({"use_auth_token": hf_token, "device": device})
+        attempts.append({"device": device})
+        attempts.append({})
+        for kwargs in attempts:
+            try:
+                return ctor(**kwargs)
+            except TypeError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to initialise diarization pipeline %s: %s", ctor, exc)
+        return None
 
-    # 2) Loader helpers under different names
+    pipeline = None
+    # 1) Newer/older direct class on the top-level package
+    pipeline = _instantiate(getattr(whisperx, "DiarizationPipeline", None))
+
+    # 2) Module-scoped class (whisperx.diarize.DiarizationPipeline) introduced in newer releases
+    if pipeline is None:
+        try:
+            from whisperx import diarize as _wx_diarize  # type: ignore
+
+            pipeline = _instantiate(getattr(_wx_diarize, "DiarizationPipeline", None))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to import whisperx.diarize.DiarizationPipeline: %s", exc)
+
+    # 3) Loader helpers under different names
     if pipeline is None:
         for fn_name in ("load_diarize_model", "load_diarization_model"):
             fn = getattr(whisperx, fn_name, None)
+            if fn is None:
+                # Some builds expose the helpers from whisperx.diarize instead
+                try:
+                    from whisperx import diarize as _wx_diarize  # type: ignore
+
+                    fn = getattr(_wx_diarize, fn_name, None)
+                except Exception:  # noqa: BLE001
+                    fn = None
             if fn is None:
                 continue
             try:
@@ -218,6 +245,7 @@ def transcribe_with_whisperx(
     quiet: bool = True,
     force_device: Optional[str] = None,
     strict_cuda: bool = False,
+    enable_diarization: bool = True,
 ) -> Tuple[List[dict], Optional[List[dict]]]:
     """Run ASR + alignment + diarization via WhisperX for a single file."""
     # Lazy import here as well for direct function callers
@@ -319,37 +347,97 @@ def transcribe_with_whisperx(
 
     diar_segments: Optional[List[dict]] = None
     try:
-        diar_device = "cpu" if pyannote_on_cpu else device
-        if diar_device == "cuda" and not _cudnn_usable():
-            if strict_cuda:
-                raise RuntimeError(
-                    "cuDNN unavailable: strict CUDA mode forbids CPU diarization fallback"
+        if not enable_diarization:
+            logger.info("Diarization disabled by configuration; skipping for %s", audio_path)
+        else:
+            diar_device = "cpu" if pyannote_on_cpu else device
+            if diar_device == "cuda" and not _cudnn_usable():
+                if strict_cuda:
+                    raise RuntimeError(
+                        "cuDNN unavailable: strict CUDA mode forbids CPU diarization fallback"
+                    )
+                logger.warning(
+                    "cuDNN not available or failed to load; falling back to CPU for diarization."
                 )
-            logger.warning(
-                "cuDNN not available or failed to load; falling back to CPU for diarization."
+                diar_device = "cpu"
+            with _silence_stdio(quiet):
+                diar_pipeline = _get_diar_pipeline(diar_device, hf_token)
+                diar_result = diar_pipeline(
+                    audio_path,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                )
+
+            def _is_dataframe(obj) -> bool:
+                try:
+                    import pandas as pd  # type: ignore
+
+                    return isinstance(obj, pd.DataFrame)
+                except Exception:
+                    return False
+
+            def _segments_from_dataframe(df) -> List[dict]:
+                try:
+                    records = df.to_dict(orient="records")
+                except Exception:
+                    return []
+                serialised: List[dict] = []
+                for row in records:
+                    start = row.get("start")
+                    end = row.get("end")
+                    if (start is None or end is None) and "segment" in row:
+                        seg_obj = row.get("segment")
+                        start = getattr(seg_obj, "start", start)
+                        end = getattr(seg_obj, "end", end)
+                    serialised.append(
+                        {
+                            "start": float(start or 0.0),
+                            "end": float(end or 0.0),
+                            "speaker": row.get("speaker") or row.get("label"),
+                        }
+                    )
+                return serialised
+
+            assign_source = diar_result
+            speaker_embeddings = None
+            if isinstance(diar_result, tuple):
+                if diar_result:
+                    assign_source = diar_result[0]
+                if len(diar_result) > 1 and isinstance(diar_result[1], dict):
+                    speaker_embeddings = diar_result[1]
+
+            if _is_dataframe(assign_source):
+                diar_segments = _segments_from_dataframe(assign_source)
+            elif isinstance(diar_result, dict):
+                diar_segments = list(diar_result.get("segments") or [])
+            elif isinstance(diar_result, list):
+                diar_segments = list(diar_result)
+            else:
+                diar_segments = []
+
+            assign_candidates = []
+            if _is_dataframe(assign_source):
+                if speaker_embeddings is not None:
+                    assign_candidates.append(
+                        (assign_source, {"segments": aligned_segments}, speaker_embeddings)
+                    )
+                assign_candidates.append((assign_source, {"segments": aligned_segments}))
+            assign_candidates.append(
+                (diar_result, {"segments": aligned_segments}, diar_pipeline)
             )
-            diar_device = "cpu"
-        with _silence_stdio(quiet):
-            diar_pipeline = _get_diar_pipeline(diar_device, hf_token)
-            diar_result = diar_pipeline(
-                audio_path,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-            )
-            diar_segments = diar_result.get("segments", [])
-            try:
-                speaker_aligned = whisperx.assign_word_speakers(
-                    diar_result,
-                    {"segments": aligned_segments},
+            assign_candidates.append((diar_result, {"segments": aligned_segments}))
+
+            speaker_aligned = None
+            for args in assign_candidates:
+                try:
+                    speaker_aligned = whisperx.assign_word_speakers(*args)
+                    break
+                except TypeError:
+                    continue
+            if speaker_aligned:
+                aligned_segments = (
+                    speaker_aligned.get("segments", aligned_segments) or aligned_segments
                 )
-            except TypeError:
-                # Some versions expect the diarization model/pipeline as a third arg
-                speaker_aligned = whisperx.assign_word_speakers(
-                    diar_result,
-                    {"segments": aligned_segments},
-                    diar_pipeline,
-                )
-            aligned_segments = speaker_aligned.get("segments", aligned_segments) or aligned_segments
     except Exception as exc:  # noqa: BLE001 - best effort diarization
         logger.warning("Diarization failed for %s: %s", audio_path, exc)
     finally:
