@@ -144,6 +144,17 @@ def save_outputs(
                         "speaker": segment.get("speaker"),
                         "text": segment.get("text", "").strip(),
                     }
+                    for meta_key in (
+                        "speaker_raw",
+                        "speaker_match_score",
+                        "speaker_match_distance",
+                        "speaker_match_cluster",
+                        "speaker_match_source",
+                    ):
+                        if meta_key in segment:
+                            record[meta_key] = segment.get(meta_key)
+                    if "speaker_match" in segment:
+                        record["speaker_match"] = segment["speaker_match"]
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     if write_srt_file:

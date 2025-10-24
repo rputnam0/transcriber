@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from transcriber.speaker_bank import SpeakerBank, SpeakerBankConfig
+from transcriber.cli import _resolve_speaker_bank_paths
+
+
+def test_speaker_bank_persistence_and_matching(tmp_path):
+    root = tmp_path / "bank"
+    bank = SpeakerBank(
+        root,
+        profile="campaign",
+        cluster_method="dbscan",
+        dbscan_eps=0.3,
+        dbscan_min_samples=1,
+    )
+    alice_primary = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    alice_variant = np.array([0.96, 0.25, 0.0], dtype=np.float32)
+    alice_character = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    bank.extend(
+        [
+            ("alice", alice_primary, "scene1.wav", {"diar_label": "SPEAKER_00"}),
+            ("alice", alice_variant, "scene2.wav", {"diar_label": "SPEAKER_01"}),
+            ("alice", alice_character, "scene3.wav", {"diar_label": "SPEAKER_02"}),
+        ]
+    )
+    bank.save()
+
+    # Reload to ensure persistence is working
+    reopened = SpeakerBank(
+        root,
+        profile="campaign",
+        cluster_method="dbscan",
+        dbscan_eps=0.3,
+        dbscan_min_samples=1,
+    )
+    summary = reopened.summary()
+    assert summary["entries"] == 3
+    assert "alice" in summary["speakers"]
+
+    match = reopened.match(np.array([1.0, 0.01, 0], dtype=np.float32), threshold=0.5)
+    assert match is not None
+    assert match["speaker"] == "alice"
+    assert match["score"] > 0.8
+
+    no_match = reopened.match(np.array([-1.0, 0.0, 0.0], dtype=np.float32), threshold=0.9)
+    assert no_match is None
+
+    manifest = json.loads((reopened.profile_dir / "bank.json").read_text(encoding="utf-8"))
+    assert manifest["profile"] == "campaign"
+
+    pca_path = reopened.render_pca(tmp_path / "pca.png")
+    if pca_path:
+        assert Path(pca_path).exists()
+
+
+def test_resolve_speaker_bank_paths(tmp_path, monkeypatch):
+    # Force HF root via monkeypatch for reproducibility
+    override_root = tmp_path / "bank_root"
+    cfg = SpeakerBankConfig()
+    root, profile, profile_dir = _resolve_speaker_bank_paths(cfg, str(override_root), None)
+    assert root == (override_root / "speaker_bank").resolve()
+    assert profile == "default"
+    assert profile_dir == root / "default"

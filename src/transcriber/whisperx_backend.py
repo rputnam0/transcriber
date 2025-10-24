@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Tuple, Callable
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import os
 
+import numpy as np
+
 _MODEL_CACHE: Dict[Tuple[str, str, str, Optional[str], bool], object] = {}
 _ALIGN_CACHE: Dict[Tuple[str, str, Optional[str]], Tuple[object, object]] = {}
 _DIAR_CACHE: Dict[Tuple[str, Optional[str]], object] = {}
@@ -228,6 +230,20 @@ def _get_diar_pipeline(device: str, hf_token: Optional[str]):
     return pipeline
 
 
+def _normalize_embeddings(payload) -> Dict[str, np.ndarray]:
+    embeddings: Dict[str, np.ndarray] = {}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            vec = np.asarray(value, dtype=np.float32).flatten()
+            if vec.size == 0:
+                continue
+            norm = np.linalg.norm(vec)
+            if norm == 0.0:
+                continue
+            embeddings[str(key)] = (vec / norm).astype(np.float32)
+    return embeddings
+
+
 def transcribe_with_whisperx(
     audio_path: str,
     model_name: str,
@@ -246,7 +262,7 @@ def transcribe_with_whisperx(
     force_device: Optional[str] = None,
     strict_cuda: bool = False,
     enable_diarization: bool = True,
-) -> Tuple[List[dict], Optional[List[dict]]]:
+) -> Tuple[List[dict], Optional[List[dict]], Dict[str, np.ndarray]]:
     """Run ASR + alignment + diarization via WhisperX for a single file."""
     # Lazy import here as well for direct function callers
     import whisperx  # type: ignore
@@ -346,6 +362,7 @@ def transcribe_with_whisperx(
                 pass
 
     diar_segments: Optional[List[dict]] = None
+    speaker_embedding_map: Dict[str, np.ndarray] = {}
     try:
         if not enable_diarization:
             logger.info("Diarization disabled by configuration; skipping for %s", audio_path)
@@ -355,18 +372,31 @@ def transcribe_with_whisperx(
                 if strict_cuda:
                     raise RuntimeError(
                         "cuDNN unavailable: strict CUDA mode forbids CPU diarization fallback"
-                    )
+                )
                 logger.warning(
                     "cuDNN not available or failed to load; falling back to CPU for diarization."
                 )
                 diar_device = "cpu"
+            diar_result = None
+            diar_kwargs = {
+                "min_speakers": min_speakers,
+                "max_speakers": max_speakers,
+            }
             with _silence_stdio(quiet):
                 diar_pipeline = _get_diar_pipeline(diar_device, hf_token)
-                diar_result = diar_pipeline(
-                    audio_path,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                )
+                try:
+                    diar_result = diar_pipeline(
+                        audio_path,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                        return_embeddings=True,
+                    )
+                except TypeError:
+                    diar_result = diar_pipeline(
+                        audio_path,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                    )
 
             def _is_dataframe(obj) -> bool:
                 try:
@@ -405,6 +435,7 @@ def transcribe_with_whisperx(
                     assign_source = diar_result[0]
                 if len(diar_result) > 1 and isinstance(diar_result[1], dict):
                     speaker_embeddings = diar_result[1]
+                    speaker_embedding_map = _normalize_embeddings(speaker_embeddings)
 
             if _is_dataframe(assign_source):
                 diar_segments = _segments_from_dataframe(assign_source)
@@ -459,4 +490,96 @@ def transcribe_with_whisperx(
         )
 
     logger.info("Produced %d aligned segment(s) for %s", len(structured_segments), audio_path)
-    return structured_segments, diar_segments
+    return structured_segments, diar_segments, speaker_embedding_map
+
+
+def extract_speaker_embeddings(
+    audio_path: str,
+    hf_token: Optional[str],
+    *,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    pyannote_on_cpu: bool = False,
+    force_device: Optional[str] = None,
+    quiet: bool = True,
+) -> Tuple[Dict[str, np.ndarray], Optional[List[dict]]]:
+    """Return normalised speaker embeddings (cosine space) for an audio file."""
+    diar_device = force_device if force_device in {"cpu", "cuda"} else _detect_device()
+    if pyannote_on_cpu:
+        diar_device = "cpu"
+    if diar_device == "cuda" and not _cudnn_usable():
+        diar_device = "cpu"
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "Speaker embedding extraction: device=%s min=%s max=%s file=%s",
+        diar_device,
+        min_speakers,
+        max_speakers,
+        audio_path,
+    )
+    diar_segments: Optional[List[dict]] = None
+    embeddings: Dict[str, np.ndarray] = {}
+    with _silence_stdio(quiet):
+        diar_pipeline = _get_diar_pipeline(diar_device, hf_token)
+        try:
+            diar_result = diar_pipeline(
+                audio_path,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                return_embeddings=True,
+            )
+        except TypeError:
+            diar_result = diar_pipeline(
+                audio_path,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+    def _is_dataframe(obj) -> bool:
+        try:
+            import pandas as pd  # type: ignore
+
+            return isinstance(obj, pd.DataFrame)
+        except Exception:
+            return False
+
+    def _segments_from_dataframe(df) -> List[dict]:
+        try:
+            records = df.to_dict(orient="records")
+        except Exception:
+            return []
+        serialised: List[dict] = []
+        for row in records:
+            start = row.get("start")
+            end = row.get("end")
+            if (start is None or end is None) and "segment" in row:
+                seg_obj = row.get("segment")
+                start = getattr(seg_obj, "start", start)
+                end = getattr(seg_obj, "end", end)
+            serialised.append(
+                {
+                    "start": float(start or 0.0),
+                    "end": float(end or 0.0),
+                    "speaker": row.get("speaker") or row.get("label"),
+                }
+            )
+        return serialised
+
+    assign_source = diar_result
+    if isinstance(diar_result, tuple):
+        if diar_result:
+            assign_source = diar_result[0]
+        if len(diar_result) > 1 and isinstance(diar_result[1], dict):
+            embeddings = _normalize_embeddings(diar_result[1])
+            logger.info(
+                "Speaker embedding extraction: received %d embedding(s) from pipeline",
+                len(embeddings),
+            )
+    if _is_dataframe(assign_source):
+        diar_segments = _segments_from_dataframe(assign_source)
+    elif isinstance(assign_source, dict):
+        diar_segments = list(assign_source.get("segments") or [])
+    elif isinstance(assign_source, list):
+        diar_segments = list(assign_source)
+    if not embeddings:
+        logger.warning("Speaker embedding extraction returned 0 embeddings for %s", audio_path)
+    return embeddings, diar_segments

@@ -51,14 +51,22 @@ autbot_80hd55561_0: "B. Ver"
 bfschmity_0: "Kaladen"
 travisaurus6985_0: "Cyrus Schwert"
 
-Matching is case‑insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; for `x-foo_0`, `foo_0` is preferred.
+Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; for `x-foo_0`, `foo_0` is preferred.
+
+## Speaker Bank
+- Enable the speaker embedding bank to tag recurring players across sessions: `--speaker-bank` (default when configured) or `speaker_bank.enabled` in the config.
+- Profiles live under the cache root (`<cache>/speaker_bank/<profile>/` by default). Override with `--speaker-bank-path` or `speaker_bank.path`.
+- Store bank data separately from Hugging Face caches by combining `--speaker-bank-root` with `--hf-cache-root`; useful when models are shared globally but embeddings stay project-local.
+- Train incrementally from single-speaker stems with `--speaker-bank-train-stems`; updates are persisted automatically and a PCA snapshot is stored alongside debug summaries.
+- Match mixed files against the bank during transcription; unmatched segments are labelled `unknown` and retain their raw diarization label in `speaker_raw` for inspection.
+- Run offline training on processed audio with `--speaker-bank-train-only PATH` to ingest new voices without triggering transcription.
 
 ## Inputs & Outputs
-- Inputs: single audio, directory (recursive), or ZIP (multi‑track safe extract)
+- Inputs: single audio (.wav, .mp3, .ogg, .flac, .m4a), directory (recursive), or ZIP (multi-track safe extract)
 - Outputs in `outputs/<INPUT_BASE>/`: `.txt`, `.srt`, `.jsonl`, optional `.diarization.json`
 
 ## Caching
-Default root `~/hf_cache`: HF hub (`$HF_HOME/hub`), models (`$HF_HOME/models`), align (`$HF_HOME/align`). Configure with `--cache-root` or `--cache-mode home|repo|env`. Offline: `--local-files-only` (set `HF_TOKEN` for gated models).
+Default root `~/hf_cache`: HF hub (`$HF_HOME/hub`), models (`$HF_HOME/models`), align (`$HF_HOME/align`). Configure with `--cache-root` or `--cache-mode home|repo|env`. Use `--hf-cache-root` to pin model caches independently, and `--speaker-bank-root` to relocate bank profiles (e.g., keep embeddings inside the repo while sharing models globally). Offline: `--local-files-only` (set `HF_TOKEN` for gated models).
 
 ## Troubleshooting
 - cuDNN error (`libcudnn_cnn.so.9…`): use the CLI (auto‑fix) or export split‑lib paths as above.

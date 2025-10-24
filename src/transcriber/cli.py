@@ -5,8 +5,10 @@ import json
 import sys
 import logging
 import os
+import shutil
+import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 import time
@@ -14,6 +16,7 @@ from tqdm import tqdm
 
 from .audio import gather_inputs, cleanup_tmp, is_audio_file
 from .consolidate import consolidate, save_outputs, choose_speaker
+from .speaker_bank import SpeakerBank, SpeakerBankConfig
 
 # Keep global references to preloaded CUDA libraries so they aren't dlclosed
 _CUDA_PRELOAD_HANDLES: list = []
@@ -101,6 +104,28 @@ def _setup_logging_and_warnings(log_level: str, quiet: bool) -> None:
     - When not quiet: honor the requested log level.
     """
     import warnings
+    from matplotlib import MatplotlibDeprecationWarning  # type: ignore
+
+    warnings.filterwarnings(
+        "ignore",
+        message=".*get_cmap function was deprecated.*",
+        category=MatplotlibDeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Using `TRANSFORMERS_CACHE` is deprecated.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="torchaudio._backend.list_audio_backends has been deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="builtin type SwigPy.* has no __module__ attribute",
+        category=DeprecationWarning,
+    )
 
     # Default to WARNING in quiet mode so our own progress logs are visible
     requested = getattr(logging, (log_level or "ERROR").upper(), logging.ERROR)
@@ -235,6 +260,37 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         defaults["no_srt"] = not bool(cfg["write_srt"])
     if "write_jsonl" in cfg:
         defaults["no_jsonl"] = not bool(cfg["write_jsonl"])
+    if "hf_cache_root" in cfg and cfg["hf_cache_root"] is not None:
+        defaults["hf_cache_root"] = cfg["hf_cache_root"]
+    if "speaker_bank_root" in cfg and cfg["speaker_bank_root"] is not None:
+        defaults["speaker_bank_root"] = cfg["speaker_bank_root"]
+    if "cache_root" in cfg and cfg["cache_root"] is not None:
+        defaults.setdefault("hf_cache_root", cfg["cache_root"])
+    sb_cfg = {}
+    if isinstance(cfg, dict):
+        sb_cfg = cfg.get("speaker_bank") or {}
+    if isinstance(sb_cfg, dict):
+        if "enabled" in sb_cfg:
+            defaults["speaker_bank_enabled"] = bool(sb_cfg.get("enabled"))
+        if "path" in sb_cfg and sb_cfg.get("path") is not None:
+            defaults["speaker_bank_path"] = sb_cfg.get("path")
+        if "threshold" in sb_cfg and sb_cfg.get("threshold") is not None:
+            defaults["speaker_bank_threshold"] = float(sb_cfg.get("threshold"))
+        if "radius_factor" in sb_cfg and sb_cfg.get("radius_factor") is not None:
+            defaults["speaker_bank_radius_factor"] = float(sb_cfg.get("radius_factor"))
+        if "use_existing" in sb_cfg:
+            defaults["speaker_bank_use_existing"] = bool(sb_cfg.get("use_existing"))
+        if "train_from_stems" in sb_cfg:
+            defaults["speaker_bank_train_stems"] = bool(sb_cfg.get("train_from_stems"))
+        if "emit_pca" in sb_cfg:
+            defaults["speaker_bank_emit_pca"] = bool(sb_cfg.get("emit_pca"))
+        cluster_cfg = sb_cfg.get("cluster") or {}
+        if "method" in cluster_cfg and cluster_cfg.get("method") is not None:
+            defaults["speaker_bank_cluster_method"] = cluster_cfg.get("method")
+        if "eps" in cluster_cfg and cluster_cfg.get("eps") is not None:
+            defaults["speaker_bank_cluster_eps"] = float(cluster_cfg.get("eps"))
+        if "min_samples" in cluster_cfg and cluster_cfg.get("min_samples") is not None:
+            defaults["speaker_bank_cluster_min_samples"] = int(cluster_cfg.get("min_samples"))
     ap.set_defaults(**defaults)
 
 def _load_yaml_or_json(path: str | None) -> Dict:
@@ -284,6 +340,319 @@ def _resolve_cache_root(explicit: str | None, cache_mode: str | None = None) -> 
     return str(Path.home() / "hf_cache")
 
 
+def _resolve_speaker_bank_paths(
+    cfg: SpeakerBankConfig,
+    root_override: str | None,
+    hf_cache_root: str | None,
+) -> Tuple[Path, str, Path]:
+    base_root: Path
+    if root_override:
+        base_root = Path(root_override).expanduser().resolve()
+    elif hf_cache_root:
+        base_root = Path(hf_cache_root).expanduser().resolve()
+    else:
+        base_root = (Path.home() / "hf_cache").resolve()
+    bank_root = base_root / "speaker_bank"
+    raw_path = Path(cfg.path or "default").expanduser()
+    if raw_path.is_absolute():
+        profile_dir = raw_path
+        profile = raw_path.name or "default"
+        root = raw_path.parent
+        return root, profile, profile_dir
+    rel = raw_path
+    if str(rel).strip() in ("", ".", "./"):
+        rel = Path("default")
+    if rel.parent != Path("."):
+        root = (bank_root / rel.parent).resolve()
+    else:
+        root = bank_root.resolve()
+    profile = rel.name or "default"
+    profile_dir = root / profile
+    return root, profile, profile_dir
+
+
+def _resolve_speaker_bank_settings(
+    cfg: Dict,
+    args: argparse.Namespace,
+) -> Tuple[Optional[SpeakerBankConfig], Optional[str]]:
+    config = SpeakerBankConfig()
+    if isinstance(cfg, dict):
+        sb_cfg = cfg.get("speaker_bank") or {}
+    else:
+        sb_cfg = {}
+    if isinstance(sb_cfg, dict) and sb_cfg:
+        if sb_cfg.get("enabled") is not None:
+            config.enabled = bool(sb_cfg.get("enabled"))
+        if sb_cfg.get("path"):
+            config.path = str(sb_cfg.get("path"))
+        if sb_cfg.get("threshold") is not None:
+            config.threshold = float(sb_cfg.get("threshold"))
+        if sb_cfg.get("radius_factor") is not None:
+            config.radius_factor = float(sb_cfg.get("radius_factor"))
+        if sb_cfg.get("use_existing") is not None:
+            config.use_existing = bool(sb_cfg.get("use_existing"))
+        if sb_cfg.get("train_from_stems") is not None:
+            config.train_from_stems = bool(sb_cfg.get("train_from_stems"))
+        if sb_cfg.get("emit_pca") is not None:
+            config.emit_pca = bool(sb_cfg.get("emit_pca"))
+        cluster_cfg = sb_cfg.get("cluster") or {}
+        if cluster_cfg.get("method"):
+            config.cluster_method = str(cluster_cfg.get("method"))
+        if cluster_cfg.get("eps") is not None:
+            config.cluster_eps = float(cluster_cfg.get("eps"))
+        if cluster_cfg.get("min_samples") is not None:
+            config.cluster_min_samples = int(cluster_cfg.get("min_samples"))
+
+    if getattr(args, "speaker_bank_enabled", None) is not None:
+        config.enabled = bool(args.speaker_bank_enabled)
+    if getattr(args, "speaker_bank_path", None):
+        config.path = str(args.speaker_bank_path)
+    if getattr(args, "speaker_bank_threshold", None) is not None:
+        config.threshold = float(args.speaker_bank_threshold)
+    if getattr(args, "speaker_bank_radius_factor", None) is not None:
+        config.radius_factor = float(args.speaker_bank_radius_factor)
+    if getattr(args, "speaker_bank_use_existing", None) is not None:
+        config.use_existing = bool(args.speaker_bank_use_existing)
+    if getattr(args, "speaker_bank_train_stems", None) is not None:
+        config.train_from_stems = bool(args.speaker_bank_train_stems)
+    if getattr(args, "speaker_bank_emit_pca", None) is not None:
+        config.emit_pca = bool(args.speaker_bank_emit_pca)
+    if getattr(args, "speaker_bank_cluster_method", None):
+        config.cluster_method = str(args.speaker_bank_cluster_method)
+    if getattr(args, "speaker_bank_cluster_eps", None) is not None:
+        config.cluster_eps = float(args.speaker_bank_cluster_eps)
+    if getattr(args, "speaker_bank_cluster_min_samples", None) is not None:
+        config.cluster_min_samples = int(args.speaker_bank_cluster_min_samples)
+
+    train_only = getattr(args, "speaker_bank_train_only", None)
+    if train_only:
+        train_only = str(train_only)
+
+    if not config.enabled and not train_only:
+        return None, train_only
+    return config, train_only
+
+
+def run_speaker_bank_training(
+    input_path: str,
+    hf_cache_root: str | None,
+    cache_mode: str | None,
+    local_files_only: bool,
+    backend: str,
+    model_name: str,
+    compute_type: str,
+    batch_size: int,
+    auto_batch: bool,
+    vad_on_cpu: bool,
+    pyannote_on_cpu: bool,
+    quiet: bool,
+    device: str | None,
+    speaker_bank_config: SpeakerBankConfig,
+    speaker_mapping_path: str | None = None,
+    speaker_bank_root_override: str | None = None,
+) -> None:
+    if backend != "whisperx":
+        raise SystemExit("Speaker bank training requires the whisperx backend")
+
+    from .whisperx_backend import extract_speaker_embeddings, _detect_device as _wx_detect_device
+
+    _ensure_cuda_libs_on_path()
+    _preload_cudnn_libs()
+    logger = logging.getLogger("transcriber")
+
+    cache_root_resolved = _resolve_cache_root(hf_cache_root, cache_mode)
+    if cache_root_resolved:
+        hub_dir = Path(os.path.expanduser(cache_root_resolved)).resolve()
+        hub_dir.mkdir(parents=True, exist_ok=True)
+        if hub_dir.name == "hub" and hub_dir.exists():
+            os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_dir)
+            os.environ["HF_HOME"] = str(hub_dir.parent)
+        else:
+            os.environ["HF_HOME"] = str(hub_dir)
+            os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_dir / "hub")
+        os.environ.setdefault("HF_DATASETS_CACHE", str(hub_dir / "datasets"))
+        os.environ.setdefault("TRANSFORMERS_CACHE", str(hub_dir / "transformers"))
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+    if local_files_only:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    files, tmp_root = gather_inputs(input_path)
+    if not files:
+        raise SystemExit(f"No audio files found in: {input_path}")
+
+    logger.warning(
+        "Speaker bank training start: %d file(s) from %s (cache=%s)",
+        len(files),
+        input_path,
+        cache_root_resolved or "default",
+    )
+
+    try:
+        mapping_pre = _load_yaml_or_json(speaker_mapping_path)
+    except BaseException as exc:  # noqa: PIE786
+        logger.error("Speaker bank training: failed to load mapping %s: %s", speaker_mapping_path, exc)
+        mapping_pre = {}
+
+    def _resolve_bank_profile_paths(cfg: SpeakerBankConfig) -> Tuple[Path, str, Path]:
+        base_cache = Path(cache_root_resolved).expanduser() if cache_root_resolved else Path.home() / "hf_cache"
+        bank_root = base_cache / "speaker_bank"
+        raw_path = Path(cfg.path or "default").expanduser()
+        if raw_path.is_absolute():
+            profile_dir = raw_path
+            profile = raw_path.name or "default"
+            root = raw_path.parent
+            return root, profile, profile_dir
+        rel = raw_path
+        if str(rel).strip() in ("", ".", "./"):
+            rel = Path("default")
+        if rel.parent != Path("."):
+            root = (bank_root / rel.parent).resolve()
+        else:
+            root = bank_root.resolve()
+        profile = rel.name or "default"
+        profile_dir = root / profile
+        return root, profile, profile_dir
+
+    bank_root, bank_profile, bank_profile_dir = _resolve_speaker_bank_paths(
+        speaker_bank_config,
+        speaker_bank_root_override,
+        cache_root_resolved,
+    )
+    logger.info(
+        "Speaker bank storage root: %s (profile=%s)",
+        bank_root,
+        bank_profile,
+    )
+    speaker_bank = SpeakerBank(
+        bank_root,
+        profile=bank_profile,
+        cluster_method=speaker_bank_config.cluster_method,
+        dbscan_eps=speaker_bank_config.cluster_eps,
+        dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+    )
+    summary = {
+        "profile": str(bank_profile_dir),
+        "initial": speaker_bank.summary(),
+        "files": {},
+    }
+
+    hf_token = (
+        os.getenv("HUGGING_FACE_HUB_TOKEN")
+        or os.getenv("HF_TOKEN")
+        or os.getenv("HUGGINGFACE_TOKEN")
+    )
+    device_guess = device if device in {"cpu", "cuda"} else _wx_detect_device()
+    try:
+        import torch  # type: ignore
+
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:  # noqa: BLE001
+        cuda_available = False
+        logger.debug("Speaker bank training: CUDA availability check failed: %s", exc)
+    if device == "cuda" and not cuda_available:
+        logger.warning(
+            "Speaker bank training requested CUDA but it is unavailable; falling back to CPU."
+        )
+        device_guess = "cpu"
+    logger.warning(
+        "Speaker bank training using device=%s (vad_on_cpu=%s, pyannote_on_cpu=%s)",
+        device_guess,
+        vad_on_cpu,
+        pyannote_on_cpu,
+    )
+
+    use_tqdm = _tqdm_enabled() and not quiet
+    iter_files = files
+    progress_bar = None
+    if use_tqdm:
+        from tqdm import tqdm as _tqdm
+
+        progress_bar = _tqdm(
+            files,
+            desc="Speaker bank training",
+            unit="file",
+            bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
+            dynamic_ncols=True,
+        )
+        iter_files = progress_bar
+
+    total_added = 0
+    for path in iter_files:
+        label, _matched = choose_speaker(path, mapping_pre, return_match=True)
+        logger.info("Training: extracting embeddings for %s (label=%s)", Path(path).name, label)
+        try:
+            embeddings, _ = extract_speaker_embeddings(
+                path,
+                hf_token=hf_token,
+                min_speakers=1,
+                max_speakers=1,
+                pyannote_on_cpu=pyannote_on_cpu,
+                force_device=device_guess,
+                quiet=quiet,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Speaker bank training: failed to extract embeddings for %s: %s", Path(path).name, exc)
+            continue
+        added = 0
+        for diar_label, vec in embeddings.items():
+            speaker_bank.extend(
+                [
+                    (
+                        label,
+                        np.asarray(vec, dtype=np.float32),
+                        Path(path).name,
+                        {"diar_label": diar_label, "mode": "train_command"},
+                    )
+                ]
+            )
+            added += 1
+            total_added += 1
+        summary["files"][Path(path).name] = {
+            "speaker": label,
+            "embeddings_added": added,
+        }
+        logger.info(
+            "Training: %s -> %d embedding(s) appended (total=%d)",
+            Path(path).name,
+            added,
+            total_added,
+        )
+        if progress_bar:
+            progress_bar.set_postfix_str(f"added={total_added}")
+
+    if progress_bar:
+        progress_bar.close()
+
+    if total_added:
+        speaker_bank.save()
+        summary["final"] = speaker_bank.summary()
+        if speaker_bank_config.emit_pca:
+            try:
+                pca_path = speaker_bank.render_pca(bank_profile_dir / "pca.png")
+                if pca_path:
+                    summary.setdefault("artifacts", {})
+                    summary["artifacts"]["pca"] = str(pca_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Speaker bank training: PCA render failed: %s", exc)
+        summary_path = bank_profile_dir / f"{bank_profile}.training_summary.json"
+        try:
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            logger.warning(
+                "Speaker bank training complete: %d embeddings added (summary at %s)",
+                total_added,
+                summary_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Speaker bank training: failed to persist summary %s: %s", summary_path, exc)
+    else:
+        logger.info("Speaker bank training: no embeddings extracted from %s", input_path)
+
+    cleanup_tmp(tmp_root)
+
+
 def run_transcribe(
     input_path: str,
     backend: str = "whisperx",
@@ -296,7 +665,8 @@ def run_transcribe(
     max_speakers: int | None = None,
     write_srt: bool = True,
     write_jsonl: bool = True,
-    cache_root: str | None = None,
+    hf_cache_root: str | None = None,
+    speaker_bank_root: str | None = None,
     local_files_only: bool = False,
     single_file_speaker: str | None = None,
     vad_on_cpu: bool = False,
@@ -305,20 +675,21 @@ def run_transcribe(
     auto_batch: bool = True,
     cache_mode: str | None = None,
     device: str | None = None,
+    speaker_bank_config: SpeakerBankConfig | None = None,
 ) -> None:
     # Ensure cuDNN/cuBLAS split libraries are visible to the loader
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
     logger = logging.getLogger("transcriber")
     # Track whether the user explicitly provided a cache root
-    user_provided_cache = bool(cache_root)
-    cache_root = _resolve_cache_root(cache_root, cache_mode)
+    user_provided_cache = bool(hf_cache_root)
+    hf_cache_root = _resolve_cache_root(hf_cache_root, cache_mode)
     # Avoid requiring hf_transfer across all environments by default. Users can override.
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     # Configure HF cache environment to ensure reuse and offline behavior for hub downloads
-    if cache_root:
+    if hf_cache_root:
         # Expand and normalize (~, symlinks)
-        hub_dir = Path(os.path.expanduser(cache_root)).resolve()
+        hub_dir = Path(os.path.expanduser(hf_cache_root)).resolve()
         hub_dir.mkdir(parents=True, exist_ok=True)
         # If a hub/ subfolder is provided, treat its parent as HF_HOME
         if hub_dir.name == "hub" and hub_dir.exists():
@@ -337,7 +708,7 @@ def run_transcribe(
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         logger.info("Running in local-files-only mode (offline).")
-    if cache_root:
+    if hf_cache_root:
         logger.info(
             "Using cache: HF_HOME=%s HUGGINGFACE_HUB_CACHE=%s",
             os.getenv("HF_HOME"),
@@ -354,8 +725,8 @@ def run_transcribe(
     diar_by_file: Dict[str, List[dict]] = {}
 
     # Compute sub-dirs for non-HF-hub model caches (faster-whisper/ctranslate2 + align models)
-    if cache_root:
-        root_path = Path(os.path.expanduser(cache_root)).resolve()
+    if hf_cache_root:
+        root_path = Path(os.path.expanduser(hf_cache_root)).resolve()
         model_cache_dir = str(root_path / "models")
         align_cache_dir = str(root_path / "align")
     else:
@@ -384,9 +755,144 @@ def run_transcribe(
             file_labels[f] = Path(f).stem
             mapping_hits[f] = False
 
+    speaker_bank: Optional[SpeakerBank] = None
+    speaker_bank_summary: Dict[str, object] = {}
+    speaker_bank_profile_dir: Optional[Path] = None
+    speaker_bank_training_entries: List[Tuple[str, object, Dict[str, object]]] = []
+    speaker_bank_modified = False
+    speaker_bank_debug_by_file: Dict[str, Dict[str, object]] = {}
+    rendered_pca_path: Optional[Path] = None
+
+    def _apply_speaker_bank(
+        segments: List[dict],
+        embeddings: Dict[str, np.ndarray],
+        file_key: str,
+    ) -> Dict[str, object]:
+        summary = {
+            "attempted": len(embeddings),
+            "matched": 0,
+            "matches": {},
+            "segment_counts": {"matched": 0, "unknown": 0},
+        }
+        if not speaker_bank or not speaker_bank_config or not embeddings:
+            return summary
+        if not speaker_bank_config.use_existing:
+            return summary
+
+        label_matches: Dict[str, Optional[Dict[str, object]]] = {}
+        for label, vector in embeddings.items():
+            try:
+                match = speaker_bank.match(
+                    vector,
+                    threshold=speaker_bank_config.threshold,
+                    radius_factor=speaker_bank_config.radius_factor,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger("transcriber").warning(
+                    "Speaker bank match failed for %s (%s): %s",
+                    Path(file_key).name,
+                    label,
+                    exc,
+                )
+                match = None
+            if match:
+                summary["matched"] += 1
+                label_matches[label] = match
+            else:
+                label_matches[label] = None
+            summary["matches"][label] = match
+
+        matched_segments = 0
+        unknown_segments = 0
+        for seg in segments:
+            raw_label = seg.get("speaker")
+            if raw_label is None:
+                continue
+            seg["speaker_raw"] = raw_label
+            if raw_label not in label_matches:
+                continue
+            match = label_matches[raw_label]
+            if match:
+                seg["speaker"] = match["speaker"]
+                seg["speaker_match"] = {
+                    "speaker": match["speaker"],
+                    "score": float(match["score"]),
+                    "cluster_id": match["cluster_id"],
+                    "distance": float(match["distance"]),
+                    "source": "speaker_bank",
+                    "label": raw_label,
+                }
+                seg["speaker_match_score"] = float(match["score"])
+                seg["speaker_match_distance"] = float(match["distance"])
+                seg["speaker_match_cluster"] = match["cluster_id"]
+                seg["speaker_match_source"] = "speaker_bank"
+                matched_segments += 1
+            else:
+                seg["speaker"] = "unknown"
+                seg["speaker_match"] = {
+                    "speaker": None,
+                    "score": None,
+                    "cluster_id": None,
+                    "distance": None,
+                    "source": "speaker_bank",
+                    "label": raw_label,
+                }
+                seg["speaker_match_score"] = None
+                seg["speaker_match_distance"] = None
+                seg["speaker_match_cluster"] = None
+                seg["speaker_match_source"] = "speaker_bank"
+                unknown_segments += 1
+        summary["segment_counts"]["matched"] = matched_segments
+        summary["segment_counts"]["unknown"] = unknown_segments
+        if summary["attempted"]:
+            logging.getLogger("transcriber").info(
+                "Speaker bank matched %d/%d diar speakers for %s",
+                summary["matched"],
+                summary["attempted"],
+                Path(file_key).name,
+            )
+        return summary
+
+    if speaker_bank_config:
+        bank_root, bank_profile, bank_profile_dir = _resolve_speaker_bank_paths(
+            speaker_bank_config,
+            speaker_bank_root,
+            hf_cache_root,
+        )
+        speaker_bank_profile_dir = bank_profile_dir
+        speaker_bank = SpeakerBank(
+            bank_root,
+            profile=bank_profile,
+            cluster_method=speaker_bank_config.cluster_method,
+            dbscan_eps=speaker_bank_config.cluster_eps,
+            dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+        )
+        bank_info = speaker_bank.summary()
+        speaker_bank_summary = {
+            "profile": str(bank_profile_dir),
+            "initial": bank_info,
+            "config": {
+                "threshold": speaker_bank_config.threshold,
+                "radius_factor": speaker_bank_config.radius_factor,
+                "use_existing": speaker_bank_config.use_existing,
+                "train_from_stems": speaker_bank_config.train_from_stems,
+            },
+            "files": {},
+        }
+        logging.getLogger("transcriber").info(
+            "Speaker bank profile=%s (entries=%s, speakers=%s)",
+            speaker_bank_profile_dir,
+            bank_info.get("entries"),
+            len(bank_info.get("speakers", [])),
+        )
+
     if backend == "whisperx":
         # Import after environment setup so Hugging Face picks up HF_* vars
-        from .whisperx_backend import transcribe_with_whisperx, _detect_device as _wx_detect_device
+        from .whisperx_backend import (
+            transcribe_with_whisperx,
+            extract_speaker_embeddings,
+            _detect_device as _wx_detect_device,
+        )
         # Accept common token env vars for gated models
         hf_token = (
             os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -397,6 +903,19 @@ def run_transcribe(
             logger.warning("HF_TOKEN not set — pyannote diarization models may fail if gated.")
         # Determine effective batch size (auto picks a conservative value by device/model)
         device_guess = device if device in {"cpu", "cuda"} else _wx_detect_device()
+        try:
+            import torch  # type: ignore
+
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception as exc:  # noqa: BLE001
+            cuda_available = False
+            logger.debug("CUDA availability check failed: %s", exc)
+        if device == "cuda" and not cuda_available:
+            logger.warning(
+                "CUDA requested but unavailable; falling back to CPU for transcription. "
+                "Check GPU drivers and visibility."
+            )
+            device_guess = "cpu"
         eff_bs = batch_size
         if auto_batch:
             eff_bs = _recommend_batch_size(device_guess, model_name, compute_type, user_hint=batch_size)
@@ -472,7 +991,7 @@ def run_transcribe(
                 compute_type,
                 Path(f).name,
             )
-            segs, diar = transcribe_with_whisperx(
+            segs, diar, speaker_embeddings = transcribe_with_whisperx(
                 f,
                 model_name=model_name,
                 compute_type=compute_type,
@@ -488,16 +1007,110 @@ def run_transcribe(
                 progress_cb=_progress_cb,
                 quiet=quiet,
                 force_device=device_guess,
-                strict_cuda=(device == "cuda"),
+                strict_cuda=(device == "cuda" and device_guess == "cuda"),
                 enable_diarization=enable_diarization,
             )
             if pbar is not None:
                 pbar.close()
             dur = int(time.time() - start_ts)
             logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
+            summary = {
+                "attempted": len(speaker_embeddings),
+                "matched": 0,
+                "matches": {},
+                "segment_counts": {"matched": 0, "unknown": 0},
+            }
+            if speaker_embeddings:
+                bank_summary = _apply_speaker_bank(segs, speaker_embeddings, f)
+                summary.update(bank_summary)
+            speaker_bank_debug_by_file[f] = summary
+            if speaker_bank_summary is not None and "files" in speaker_bank_summary:
+                speaker_bank_summary["files"][Path(f).name] = summary
+
+            if (
+                speaker_bank
+                and speaker_bank_config
+                and speaker_bank_config.train_from_stems
+                and multi_track_zip
+            ):
+                training_label = file_labels.get(f, Path(f).stem)
+                training_embeddings = speaker_embeddings
+                if not training_embeddings:
+                    try:
+                        training_embeddings, _ = extract_speaker_embeddings(
+                            f,
+                            hf_token=hf_token,
+                            min_speakers=1,
+                            max_speakers=1,
+                            pyannote_on_cpu=pyannote_on_cpu,
+                            force_device=device_guess,
+                            quiet=quiet,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Speaker bank training failed for %s: %s",
+                            Path(f).name,
+                            exc,
+                        )
+                        training_embeddings = {}
+                added = 0
+                for diar_label, vec in training_embeddings.items():
+                    speaker_bank_training_entries.append(
+                        (
+                            training_label,
+                            vec,
+                            {
+                                "file": str(Path(f).name),
+                                "diar_label": diar_label,
+                                "mode": "train_from_stems",
+                            },
+                        )
+                    )
+                    added += 1
+                if added:
+                    summary.setdefault("training", {})
+                    summary["training"]["embeddings_added"] = added
+                    summary["training"]["speaker"] = training_label
+                    speaker_bank_modified = True
+
             per_file_segments.append((f, segs))
             if diar:
                 diar_by_file[f] = diar
+
+        if speaker_bank and speaker_bank_training_entries:
+            enrollment: List[Tuple[str, np.ndarray, Optional[str], Dict[str, object]]] = []
+            for speaker_label, vec, meta in speaker_bank_training_entries:
+                vector = np.asarray(vec, dtype=np.float32)
+                source = meta.get("file") if isinstance(meta, dict) else None
+                enrollment.append((speaker_label, vector, source, meta if isinstance(meta, dict) else {}))
+            if enrollment:
+                speaker_bank.extend(enrollment)
+                speaker_bank_modified = True
+                speaker_bank_summary.setdefault("training", {})
+                speaker_bank_summary["training"]["embeddings_added"] = speaker_bank_summary.get("training", {}).get("embeddings_added", 0) + len(enrollment)
+
+        if speaker_bank and speaker_bank_modified:
+            try:
+                speaker_bank.save()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to save speaker bank profile %s: %s", speaker_bank_profile_dir, exc)
+
+        if speaker_bank and speaker_bank_summary is not None:
+            speaker_bank_summary["final"] = speaker_bank.summary()
+
+        if (
+            speaker_bank
+            and speaker_bank_config
+            and speaker_bank_config.emit_pca
+            and speaker_bank_summary
+        ):
+            try:
+                rendered_pca_path = speaker_bank.render_pca(speaker_bank_profile_dir / "pca.png")
+                if rendered_pca_path:
+                    speaker_bank_summary.setdefault("artifacts", {})
+                    speaker_bank_summary["artifacts"]["pca"] = str(rendered_pca_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Speaker bank PCA rendering failed: %s", exc)
     else:
         # faster-whisper only (no diarization)
         logger.info("Using faster-whisper backend.")
@@ -557,13 +1170,17 @@ def run_transcribe(
     mapping = mapping_pre
     if mapping:
         # If we have multiple input files (e.g., multi-track ZIP), enforce per-file labels
-        # regardless of diarization cluster names to match prototype behavior.
+        # when speaker bank matching is not overriding the diarization labels.
         multi_file = len(files) > 1
         for i, (fname, segs) in enumerate(per_file_segments):
             file_label = choose_speaker(fname, mapping)
             for s in segs:
                 if multi_file:
-                    # Always use the file-derived label for multi-file inputs
+                    matched_by_bank = s.get("speaker_match_source") == "speaker_bank"
+                    if matched_by_bank and s.get("speaker") not in (None, "unknown"):
+                        continue
+                    if matched_by_bank and s.get("speaker") == "unknown":
+                        continue
                     s["speaker"] = file_label
                 else:
                     # Single-file: only fill missing and allow cluster -> name override
@@ -607,6 +1224,26 @@ def run_transcribe(
         write_srt_file=write_srt,
         write_jsonl_file=write_jsonl,
     )
+
+    if speaker_bank_summary:
+        try:
+            speaker_bank_summary["files_debug"] = {
+                Path(fname).name: data for fname, data in speaker_bank_debug_by_file.items()
+            }
+        except Exception:
+            speaker_bank_summary.setdefault("files_debug", {})
+        debug_path = Path(final_out_dir) / f"{base}.speaker_bank.json"
+        try:
+            debug_path.write_text(json.dumps(speaker_bank_summary, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write speaker bank summary %s: %s", debug_path, exc)
+        if rendered_pca_path and rendered_pca_path.exists():
+            target_pca = Path(final_out_dir) / f"{base}.speaker_bank.pca.png"
+            try:
+                shutil.copy2(rendered_pca_path, target_pca)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to copy speaker bank PCA plot to %s: %s", target_pca, exc)
+
     # Clean up extracted ZIP contents (prototype parity)
     cleanup_tmp(tmp_root)
     logging.getLogger("transcriber").warning(
@@ -699,7 +1336,11 @@ def _file_is_stable(path: Path, stability_seconds: int) -> bool:
     return (time.time() - mtime) >= max(0, stability_seconds)
 
 
-def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
+def watch_and_transcribe(
+    args: argparse.Namespace,
+    cfg: Dict,
+    speaker_bank_config: Optional[SpeakerBankConfig],
+) -> None:
     """Continuously scan an input directory for new audio/ZIP files and transcribe them.
 
     A file is processed when its corresponding output TXT is missing and the file appears
@@ -788,7 +1429,8 @@ def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
                             max_speakers=args.max_speakers,
                             write_srt=not args.no_srt,
                             write_jsonl=not args.no_jsonl,
-                            cache_root=args.cache_root,
+                            hf_cache_root=args.hf_cache_root or args.cache_root,
+                            speaker_bank_root=args.speaker_bank_root,
                             cache_mode=args.cache_mode,
                             local_files_only=args.local_files_only,
                             single_file_speaker=args.single_file_speaker,
@@ -797,6 +1439,7 @@ def watch_and_transcribe(args: argparse.Namespace, cfg: Dict) -> None:
                             quiet=args.quiet,
                             auto_batch=args.auto_batch,
                             device=None if getattr(args, "device", "auto") == "auto" else args.device,
+                            speaker_bank_config=speaker_bank_config,
                         )
                     except BaseException as exc:  # noqa: PIE786
                         msg = str(exc)
@@ -861,6 +1504,16 @@ def main():
     ap.add_argument("--no-jsonl", action="store_true", help="Don't write JSONL")
     ap.add_argument("--cache-root", help="Directory to reuse for all model caches")
     ap.add_argument(
+        "--hf-cache-root",
+        dest="hf_cache_root",
+        help="Override Hugging Face model cache root (falls back to --cache-root)",
+    )
+    ap.add_argument(
+        "--speaker-bank-root",
+        dest="speaker_bank_root",
+        help="Base directory for storing speaker bank profiles",
+    )
+    ap.add_argument(
         "--cache-mode",
         choices=["home", "repo", "env"],
         default=cfg.get("cache_mode") if isinstance(cfg, dict) else None,
@@ -895,6 +1548,89 @@ def main():
         action="store_true",
         help="Force all pyannote stages (VAD + diarization) to run on CPU",
     )
+    ap.add_argument(
+        "--speaker-bank",
+        dest="speaker_bank_enabled",
+        action="store_true",
+        default=None,
+        help="Enable speaker bank matching (default: on when configured)",
+    )
+    ap.add_argument(
+        "--no-speaker-bank",
+        dest="speaker_bank_enabled",
+        action="store_false",
+        help="Disable speaker bank matching",
+    )
+    ap.add_argument("--speaker-bank-path", help="Speaker bank profile name or absolute path")
+    ap.add_argument(
+        "--speaker-bank-threshold",
+        type=float,
+        help="Cosine similarity threshold to accept a speaker match",
+    )
+    ap.add_argument(
+        "--speaker-bank-radius-factor",
+        type=float,
+        help="Radius multiplier used when validating cluster membership",
+    )
+    ap.add_argument(
+        "--speaker-bank-use-existing",
+        dest="speaker_bank_use_existing",
+        action="store_true",
+        default=None,
+        help="Apply existing speaker bank profiles without updating them",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-use-existing",
+        dest="speaker_bank_use_existing",
+        action="store_false",
+        help="Skip applying pre-trained speaker bank profiles",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-stems",
+        dest="speaker_bank_train_stems",
+        action="store_true",
+        default=None,
+        help="When inputs contain multi-track ZIPs, treat each track as training data",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-train-stems",
+        dest="speaker_bank_train_stems",
+        action="store_false",
+        help="Do not consume multi-track inputs as training data",
+    )
+    ap.add_argument(
+        "--speaker-bank-emit-pca",
+        dest="speaker_bank_emit_pca",
+        action="store_true",
+        default=None,
+        help="Export PCA scatter plots for debugging speaker clusters",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-pca",
+        dest="speaker_bank_emit_pca",
+        action="store_false",
+        help="Skip generating PCA scatter plots",
+    )
+    ap.add_argument(
+        "--speaker-bank-cluster-method",
+        choices=["dbscan"],
+        help="Clustering strategy to derive speaker personas (default: dbscan)",
+    )
+    ap.add_argument(
+        "--speaker-bank-cluster-eps",
+        type=float,
+        help="DBSCAN eps value used when clustering speaker embeddings",
+    )
+    ap.add_argument(
+        "--speaker-bank-cluster-min-samples",
+        type=int,
+        help="DBSCAN min_samples value for clustering speaker embeddings",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-only",
+        metavar="AUDIO_PATH",
+        help="Train or update the speaker bank using audio without running transcription",
+    )
 
     _apply_config_defaults(ap, cfg)
     args = ap.parse_args()
@@ -902,16 +1638,39 @@ def main():
     # Re-apply logging config in case config/CLI changed it
     _setup_logging_and_warnings(args.log_level, args.quiet)
 
+    speaker_bank_config, train_only_path = _resolve_speaker_bank_settings(cfg, args)
+
     # Input may come from config; ensure it exists
     effective_input = args.input or (cfg.get("input") if isinstance(cfg, dict) else None)
     if not effective_input and not args.watch:
         ap.error("Missing INPUT and no 'input' provided in config")
 
+    if train_only_path:
+        run_speaker_bank_training(
+            input_path=train_only_path,
+            hf_cache_root=args.hf_cache_root or args.cache_root,
+            cache_mode=args.cache_mode,
+            local_files_only=args.local_files_only,
+            backend=args.backend,
+            model_name=args.model,
+            compute_type=args.compute_type,
+            batch_size=args.batch_size,
+            auto_batch=args.auto_batch,
+            vad_on_cpu=args.vad_on_cpu,
+            pyannote_on_cpu=args.pyannote_on_cpu,
+            quiet=args.quiet,
+            device=None if args.device == "auto" else args.device,
+            speaker_bank_config=speaker_bank_config or SpeakerBankConfig(),
+            speaker_mapping_path=args.speaker_mapping,
+            speaker_bank_root_override=args.speaker_bank_root,
+        )
+        return
+
     if args.watch:
         # Keep the service resilient: never exit on uncaught exceptions
         while True:
             try:
-                watch_and_transcribe(args, cfg)
+                watch_and_transcribe(args, cfg, speaker_bank_config)
             except KeyboardInterrupt:
                 logging.getLogger("transcriber").warning("Watch mode interrupted by user; exiting.")
                 break
@@ -934,7 +1693,8 @@ def main():
         max_speakers=args.max_speakers,
         write_srt=not args.no_srt,
         write_jsonl=not args.no_jsonl,
-        cache_root=args.cache_root,
+        hf_cache_root=args.hf_cache_root or args.cache_root,
+        speaker_bank_root=args.speaker_bank_root,
         cache_mode=args.cache_mode,
         local_files_only=args.local_files_only,
         single_file_speaker=args.single_file_speaker,
@@ -942,6 +1702,7 @@ def main():
         pyannote_on_cpu=args.pyannote_on_cpu,
         quiet=args.quiet,
         device=None if args.device == "auto" else args.device,
+        speaker_bank_config=speaker_bank_config,
     )
 
 if __name__ == "__main__":

@@ -1,0 +1,57 @@
+{
+  "profile": "/home/rputn/hf_cache/speaker_bank/default",
+  "initial": {
+    "profile": "default",
+    "speakers": [],
+    "entries": 0,
+    "clusters": {}
+  },
+  "config": {
+    "threshold": 0.65,
+    "radius_factor": 2.5,
+    "use_existing": true,
+    "train_from_stems": false
+  },
+  "files": {
+    "session_15.m4a": {
+      "attempted": 6,
+      "matched": 0,
+      "matches": {
+        "SPEAKER_00": null,
+        "SPEAKER_01": null,
+        "SPEAKER_02": null,
+        "SPEAKER_03": null,
+        "SPEAKER_04": null,
+        "SPEAKER_05": null
+      },
+      "segment_counts": {
+        "matched": 0,
+        "unknown": 4679
+      }
+    }
+  },
+  "final": {
+    "profile": "default",
+    "speakers": [],
+    "entries": 0,
+    "clusters": {}
+  },
+  "files_debug": {
+    "session_15.m4a": {
+      "attempted": 6,
+      "matched": 0,
+      "matches": {
+        "SPEAKER_00": null,
+        "SPEAKER_01": null,
+        "SPEAKER_02": null,
+        "SPEAKER_03": null,
+        "SPEAKER_04": null,
+        "SPEAKER_05": null
+      },
+      "segment_counts": {
+        "matched": 0,
+        "unknown": 4679
+      }
+    }
+  }
+}
