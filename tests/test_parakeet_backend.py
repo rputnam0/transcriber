@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+import types
+
 from transcriber.parakeet_backend import DEFAULT_MODEL_NAME, resolve_model_name, transcribe_file
 
 
@@ -52,3 +55,21 @@ def test_transcribe_file_maps_sentences_to_repo_segments():
     ]
     assert model.calls[0][1]["chunk_duration"] == 120.0
     assert model.calls[0][1]["overlap_duration"] == 15.0
+
+
+def test_resolve_dtype_respects_float16_alias(monkeypatch):
+    fake_core = types.SimpleNamespace(
+        float16="float16-dtype",
+        float32="float32-dtype",
+        bfloat16="bfloat16-dtype",
+    )
+    fake_mlx = types.SimpleNamespace(core=fake_core)
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+
+    from transcriber import parakeet_backend
+
+    assert parakeet_backend._resolve_dtype("float16") == ("float16-dtype", "float16")
+    assert parakeet_backend._resolve_dtype("fp16") == ("float16-dtype", "float16")
+    assert parakeet_backend._resolve_dtype("float32") == ("float32-dtype", "float32")
+    assert parakeet_backend._resolve_dtype("int8") == ("bfloat16-dtype", "bfloat16")

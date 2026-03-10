@@ -1257,10 +1257,12 @@ def run_transcribe(
     # Prototype single-file behavior: allow forcing a generic label
     if single_file_speaker and len(files) == 1:
         target = files[0]
+        force_single_file_speaker = backend != "whisperx"
         for i, (fname, segs) in enumerate(per_file_segments):
             if fname == target:
                 for s in segs:
-                    s["speaker"] = single_file_speaker
+                    if force_single_file_speaker or not s.get("speaker"):
+                        s["speaker"] = single_file_speaker
                 per_file_segments[i] = (fname, segs)
 
     consolidated_pairs = consolidate(per_file_segments)

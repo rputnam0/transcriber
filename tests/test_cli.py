@@ -41,3 +41,45 @@ def test_single_file_speaker_overrides_backend_labels(monkeypatch, tmp_path):
 
     segs = captured["per_file_segments"][0][1]
     assert segs[0]["speaker"] == "Narrator"
+
+
+def test_single_file_speaker_preserves_whisperx_labels(monkeypatch, tmp_path):
+    captured: dict = {}
+
+    monkeypatch.setattr(cli, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli, "_preload_cudnn_libs", lambda: None)
+    monkeypatch.setattr(cli, "_resolve_cache_root", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "gather_inputs", lambda path: ([str(tmp_path / "input.wav")], None))
+
+    def fake_save_outputs(**kwargs):
+        captured["per_file_segments"] = kwargs["per_file_segments"]
+        out_dir = tmp_path / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    monkeypatch.setattr(cli, "save_outputs", fake_save_outputs)
+
+    def fake_transcribe_with_whisperx(*args, **kwargs):
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "hello world", "speaker": "SPEAKER_00"}],
+            [],
+            {},
+        )
+
+    monkeypatch.setattr(
+        __import__("transcriber.whisperx_backend", fromlist=["x"]),
+        "transcribe_with_whisperx",
+        fake_transcribe_with_whisperx,
+    )
+
+    cli.run_transcribe(
+        input_path=str(tmp_path / "input.wav"),
+        backend="whisperx",
+        output_dir=str(tmp_path / "outputs"),
+        single_file_speaker="Narrator",
+        quiet=True,
+        speaker_bank_config=None,
+    )
+
+    segs = captured["per_file_segments"][0][1]
+    assert segs[0]["speaker"] == "SPEAKER_00"

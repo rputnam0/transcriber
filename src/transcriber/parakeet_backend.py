@@ -36,6 +36,8 @@ def _resolve_dtype(compute_type: str) -> tuple[object, str]:
     compute = (compute_type or "").lower()
     if compute in {"float32", "fp32"}:
         return mx.float32, "float32"
+    if compute in {"float16", "fp16"}:
+        return mx.float16, "float16"
     return mx.bfloat16, "bfloat16"
 
 
@@ -48,6 +50,10 @@ def load_model(
 ):
     """Initialise a Parakeet MLX model for Apple Silicon."""
     resolved_model = resolve_model_name(model_name)
+    if local_files_only:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
     dtype, dtype_name = _resolve_dtype(compute_type)
     cache_key = (resolved_model, dtype_name, download_root)
     if cache_key in _MODEL_CACHE:
@@ -65,10 +71,6 @@ def load_model(
             platform.system(),
             platform.machine(),
         )
-
-    if local_files_only:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     try:
         from parakeet_mlx import from_pretrained  # type: ignore
