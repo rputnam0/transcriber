@@ -65,7 +65,6 @@ def _preload_cudnn_libs() -> None:
     """
     try:
         import ctypes
-        import glob
         import sys as _sys
         from pathlib import Path as _Path
 
@@ -681,8 +680,6 @@ def run_transcribe(
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
     logger = logging.getLogger("transcriber")
-    # Track whether the user explicitly provided a cache root
-    user_provided_cache = bool(hf_cache_root)
     hf_cache_root = _resolve_cache_root(hf_cache_root, cache_mode)
     # Avoid requiring hf_transfer across all environments by default. Users can override.
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
@@ -1111,6 +1108,67 @@ def run_transcribe(
                     speaker_bank_summary["artifacts"]["pca"] = str(rendered_pca_path)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Speaker bank PCA rendering failed: %s", exc)
+    elif backend == "parakeet":
+        logger.info("Using parakeet-mlx backend.")
+        from .parakeet_backend import (
+            load_model as parakeet_load,
+            resolve_model_name as parakeet_resolve_model_name,
+            transcribe_file as parakeet_transcribe,
+        )
+
+        if min_speakers is not None or max_speakers is not None:
+            logger.warning(
+                "Parakeet backend does not support diarization; ignoring min/max speaker hints."
+            )
+        if vad_on_cpu or pyannote_on_cpu:
+            logger.warning(
+                "Parakeet backend does not use WhisperX/pyannote VAD controls; ignoring those flags."
+            )
+
+        parakeet_model_name = parakeet_resolve_model_name(model_name)
+        if parakeet_model_name != model_name:
+            logger.warning(
+                "Parakeet backend remapped model=%s to %s.",
+                model_name,
+                parakeet_model_name,
+            )
+
+        logger.warning(
+            "ASR Backend (parakeet): model=%s compute=%s device=%s",
+            parakeet_model_name,
+            compute_type,
+            device or "auto",
+        )
+        model = parakeet_load(
+            parakeet_model_name,
+            compute_type=compute_type,
+            device=device or "auto",
+            download_root=hf_cache_root,
+            local_files_only=local_files_only,
+        )
+        use_tqdm = _tqdm_enabled()
+        iter_files = tqdm(
+            files,
+            desc="Transcribing (parakeet)",
+            unit="file",
+            bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
+            dynamic_ncols=True,
+        ) if use_tqdm else files
+        for f in iter_files:
+            label = file_labels.get(f, Path(f).stem)
+            logger.warning("Start: %s", Path(f).name)
+            start_ts = time.time()
+            if use_tqdm:
+                from tqdm import tqdm as _tqdm
+                with _tqdm(total=1, desc=f"{label}", leave=False, unit="phase") as pbar:
+                    segs = parakeet_transcribe(f, model, batch_size=batch_size)
+                    pbar.update(1)
+                    pbar.set_postfix_str("asr")
+            else:
+                segs = parakeet_transcribe(f, model, batch_size=batch_size)
+            dur = int(time.time() - start_ts)
+            logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
+            per_file_segments.append((f, segs))
     else:
         # faster-whisper only (no diarization)
         logger.info("Using faster-whisper backend.")
@@ -1202,8 +1260,7 @@ def run_transcribe(
         for i, (fname, segs) in enumerate(per_file_segments):
             if fname == target:
                 for s in segs:
-                    if not s.get("speaker"):
-                        s["speaker"] = single_file_speaker
+                    s["speaker"] = single_file_speaker
                 per_file_segments[i] = (fname, segs)
 
     consolidated_pairs = consolidate(per_file_segments)
@@ -1312,7 +1369,6 @@ def _expected_txt_path_for_input(input_path: str, output_dir: str) -> Path:
 
 
 def _iter_candidate_media(root_dir: Path) -> list[str]:
-    exts = {".zip"} | {e for e in getattr(__import__(__name__), 'AUDIO_EXTS', set())}  # fallback
     ignore_dirs = {"quarantine", ".cache", "outputs"}
     files: list[str] = []
     for f in root_dir.rglob("*"):
@@ -1482,7 +1538,7 @@ def main():
     # Phase 2: full parser with defaults from config
     ap = argparse.ArgumentParser(description="Transcription with alignment + diarization (WhisperX)")
     ap.add_argument("input", nargs="?", help="Path to audio file, directory, or .zip of audios")
-    ap.add_argument("--backend", choices=["whisperx", "faster"], default="whisperx")
+    ap.add_argument("--backend", choices=["whisperx", "faster", "parakeet"], default="whisperx")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default=cfg.get("device", "auto"), help="Force device selection (default: auto)")
     ap.add_argument("--model", default="large-v3", help="Model name (e.g., large-v3)")
     ap.add_argument("--compute-type", default="float16", help="Compute type (e.g., float16, int8_float16)")
