@@ -1,3 +1,6 @@
+# macOS / editor noise
+.DS_Store
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -5,14 +8,23 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
-.venv
+.venv/
 
-#cache file
+# Local caches
+.hf_cache/
 
-.hf_cache
-
-# audio files
+# Local inputs / outputs
+.audio/
 audio/
+.outputs/
 outputs/
+transcripts/
+
+# Local developer configs copied from examples
+config/speaker_mapping.yaml
+config/transcriber.yaml
+config/transcriber.watch.yaml

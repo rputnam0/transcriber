@@ -5,6 +5,7 @@ GPU‑accelerated speech transcription powered by Whisper/WhisperX with optional
 ## Features
 - WhisperX backend (ASR + alignment; diarization when available)
 - Faster‑Whisper backend (fast ASR only)
+- Parakeet backend (Apple Silicon local ASR with timestamps; no diarization)
 - Config‑driven runs with CLI override, clean progress bars, auto‑batching
 - Outputs: TXT (Speaker HH:MM:SS Text), SRT, JSONL; optional diarization JSON
 
@@ -16,6 +17,7 @@ GPU‑accelerated speech transcription powered by Whisper/WhisperX with optional
 - Setup: `make setup`
 - Config‑driven: `cp config/transcriber.example.yaml config/transcriber.yaml && uv run transcribe`
 - Direct CLI: `uv run transcribe audio/Session_32.zip --model large-v3 --speaker-mapping config/speaker_mapping.example.yaml`
+- Apple Silicon local run: `uv run transcribe audio/sample.wav --backend parakeet --model parakeet`
 - Docker (GPU): `make docker-build` then `HF_TOKEN=... make docker-run INPUT=audio/Session_32.zip MODEL=large-v3`
 
 ## Device Selection
@@ -31,11 +33,12 @@ export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.X/site-packages/nvidia/cudnn/lib:
 Verify: `uv run python -c "import torch;print('cuda',torch.cuda.is_available(),'cudnn',getattr(torch.backends.cudnn,'is_available',lambda:False)())"`
 
 ## CLI (Synopsis)
-- `uv run transcribe INPUT [--backend whisperx|faster] [options]`
+- `uv run transcribe INPUT [--backend whisperx|faster|parakeet] [options]`
 - Common options: `--model large-v3` `--compute-type float16|int8_float16` `--device auto|cuda|cpu` `--batch-size N` `--auto-batch/--no-auto-batch` `--speaker-mapping PATH` `--min-speakers/--max-speakers` `--output-dir outputs` `--cache-root PATH|--cache-mode home|repo|env` `--local-files-only` `--log-level INFO|WARNING` `--config PATH`
 
 ## Configuration
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.
+Local runtime configs copied from `config/*.example.yaml` are intentionally gitignored.
 
 ## Watch Mode
 - Keep two configs: `config/transcriber.yaml` for interactive CLI runs, and `config/transcriber.watch.yaml` (copy from `config/transcriber.watch.example.yaml`) for the background watcher.
@@ -53,6 +56,11 @@ travisaurus6985_0: "Cyrus Schwert"
 
 Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; for `x-foo_0`, `foo_0` is preferred.
 
+## Apple Silicon Parakeet
+- Use `--backend parakeet` to run the MLX Parakeet backend on Apple Silicon Macs.
+- Parakeet supports timestamps, TXT/SRT/JSONL output, and single-speaker label overrides.
+- Parakeet does not currently provide diarization, so `--min-speakers` and `--max-speakers` are ignored on that backend.
+
 ## Speaker Bank
 - Enable the speaker embedding bank to tag recurring players across sessions: `--speaker-bank` (default when configured) or `speaker_bank.enabled` in the config.
 - Profiles live under the cache root (`<cache>/speaker_bank/<profile>/` by default). Override with `--speaker-bank-path` or `speaker_bank.path`.
@@ -64,6 +72,7 @@ Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; f
 ## Inputs & Outputs
 - Inputs: single audio (.wav, .mp3, .ogg, .flac, .m4a), directory (recursive), or ZIP (multi-track safe extract)
 - Outputs in `outputs/<INPUT_BASE>/`: `.txt`, `.srt`, `.jsonl`, optional `.diarization.json`
+- Generated transcripts and evaluation artifacts are local-only and should live under `.outputs/` or `transcripts/`, both of which are gitignored.
 
 ## Caching
 Default root `~/hf_cache`: HF hub (`$HF_HOME/hub`), models (`$HF_HOME/models`), align (`$HF_HOME/align`). Configure with `--cache-root` or `--cache-mode home|repo|env`. Use `--hf-cache-root` to pin model caches independently, and `--speaker-bank-root` to relocate bank profiles (e.g., keep embeddings inside the repo while sharing models globally). Offline: `--local-files-only` (set `HF_TOKEN` for gated models).
