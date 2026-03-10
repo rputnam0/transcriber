@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, Iterable, List, Optional, Tuple, Callable
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import os
+import concurrent.futures
+import math
 
 import numpy as np
+
+from dataclasses import dataclass
 
 _MODEL_CACHE: Dict[Tuple[str, str, str, Optional[str], bool], object] = {}
 _ALIGN_CACHE: Dict[Tuple[str, str, Optional[str]], Tuple[object, object]] = {}
@@ -233,15 +237,275 @@ def _get_diar_pipeline(device: str, hf_token: Optional[str]):
 def _normalize_embeddings(payload) -> Dict[str, np.ndarray]:
     embeddings: Dict[str, np.ndarray] = {}
     if isinstance(payload, dict):
+        logger.debug(
+            "Normalizing %d speaker embedding(s) from payload keys=%s",
+            len(payload),
+            list(payload.keys()),
+        )
         for key, value in payload.items():
             vec = np.asarray(value, dtype=np.float32).flatten()
             if vec.size == 0:
+                logger.debug("Skipping empty embedding for label=%s", key)
                 continue
             norm = np.linalg.norm(vec)
             if norm == 0.0:
+                logger.debug("Skipping zero-norm embedding for label=%s", key)
                 continue
             embeddings[str(key)] = (vec / norm).astype(np.float32)
+            logger.debug(
+                "Normalised embedding label=%s dims=%d original_norm=%.4f",
+                key,
+                vec.size,
+                norm,
+            )
+    else:
+        logger.debug("Embedding payload type=%s is not a dict; skipping normalization.", type(payload).__name__)
     return embeddings
+
+
+@dataclass
+class SegmentDescriptor:
+    start: float
+    end: float
+    speaker: str
+    index: int
+
+
+@dataclass
+class SegmentEmbeddingResult:
+    speaker: str
+    start: float
+    end: float
+    index: int
+    embedding: np.ndarray
+
+
+def extract_embeddings_for_segments(
+    audio_path: str,
+    segments: Iterable[Tuple[float, float, str]],
+    hf_token: Optional[str],
+    *,
+    force_device: Optional[str] = None,
+    quiet: bool = True,
+    pre_pad: float = 0.15,
+    post_pad: float = 0.15,
+    batch_size: int = 16,
+    workers: int = 4,
+) -> Tuple[List[SegmentEmbeddingResult], Dict[str, object]]:
+    """Extract embeddings for pre-labelled segments from an audio file.
+
+    Returns (embeddings, summary) where embeddings is a list of SegmentEmbeddingResult
+    and summary contains diagnostic counts.
+    """
+
+    from whisperx.audio import load_audio, SAMPLE_RATE as WX_SAMPLE_RATE  # type: ignore
+
+    import torch
+
+    if batch_size <= 0:
+        batch_size = 1
+    if workers <= 0:
+        workers = 1
+
+    device = force_device if force_device in {"cpu", "cuda"} else _detect_device()
+    torch_device = torch.device(device)
+    segment_items = list(segments)
+    logger.debug(
+        "Segment embedding extraction start file=%s device=%s segments=%d",
+        audio_path,
+        device,
+        len(segment_items),
+    )
+
+    # Materialize segments once since we need multiple passes
+    seg_list: List[SegmentDescriptor] = [
+        SegmentDescriptor(start=float(s or 0.0), end=float(e or 0.0), speaker=str(label or ""), index=idx)
+        for idx, (s, e, label) in enumerate(segment_items)
+    ]
+    if not seg_list:
+        return [], {"embedded": 0, "skipped": 0, "total": 0}
+
+    diar_pipeline = _get_diar_pipeline(device, hf_token)
+
+    # Resolve embedder from pipeline (supports whisperx wrappers and pyannote pipeline)
+    embedder = None
+    attr_candidates = ("_embedding", "embedding_model")
+    for attr in attr_candidates:
+        embedder = getattr(diar_pipeline, attr, None)
+        if embedder is not None:
+            break
+    if embedder is None and hasattr(diar_pipeline, "model"):
+        for attr in attr_candidates:
+            embedder = getattr(diar_pipeline.model, attr, None)
+            if embedder is not None:
+                break
+
+    if embedder is None:
+        try:
+            from pyannote.audio.pipelines.speaker_verification import (
+                PretrainedSpeakerEmbedding,
+            )
+
+            embedding_name = getattr(diar_pipeline, "embedding", None)
+            if embedding_name is None and hasattr(diar_pipeline, "model"):
+                embedding_name = getattr(diar_pipeline.model, "embedding", None)
+            if embedding_name:
+                embedder = PretrainedSpeakerEmbedding(
+                    embedding_name,
+                    device=torch_device,
+                    use_auth_token=hf_token,
+                )
+        except Exception as exc:  # pragma: no cover - optional dependency path
+            logger.warning("Failed to instantiate standalone speaker embedder: %s", exc)
+            embedder = None
+
+    if embedder is None:
+        raise RuntimeError("Unable to resolve speaker embedding model from diarization pipeline")
+
+    try:
+        embedder = embedder.to(torch_device)  # type: ignore[attr-defined]
+    except Exception:
+        # embedder may not support to(); ignore
+        pass
+
+    sample_rate = getattr(embedder, "sample_rate", WX_SAMPLE_RATE)
+
+    base_waveform = load_audio(audio_path)
+    base_waveform = np.asarray(base_waveform, dtype=np.float32)
+    base_sr = WX_SAMPLE_RATE
+
+    if sample_rate != base_sr:
+        try:
+            import torchaudio.functional as AF  # type: ignore
+
+            waveform_t = torch.from_numpy(base_waveform).unsqueeze(0)
+            resampled = AF.resample(waveform_t, base_sr, sample_rate)
+            base_waveform = resampled.squeeze(0).numpy()
+            base_sr = sample_rate
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning(
+                "Failed to resample audio from %s Hz to %s Hz: %s (continuing with original rate)",
+                base_sr,
+                sample_rate,
+                exc,
+            )
+            sample_rate = base_sr
+
+    audio_total_samples = base_waveform.shape[0]
+    audio_duration = audio_total_samples / float(base_sr)
+
+    # Precompute crops (optionally in parallel)
+    def _crop_segment(seg: SegmentDescriptor) -> Optional[Tuple[SegmentDescriptor, np.ndarray]]:
+        if seg.end <= seg.start:
+            return None
+        start = max(seg.start - pre_pad, 0.0)
+        end = min(seg.end + post_pad, audio_duration)
+        if end <= start:
+            return None
+        start_idx = int(math.floor(start * base_sr))
+        end_idx = int(math.ceil(end * base_sr))
+        start_idx = max(start_idx, 0)
+        end_idx = min(end_idx, audio_total_samples)
+        if end_idx <= start_idx:
+            return None
+        segment_wave = base_waveform[start_idx:end_idx]
+        if segment_wave.size == 0:
+            return None
+        return seg, segment_wave
+
+    if workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            cropped = list(filter(None, pool.map(_crop_segment, seg_list)))
+    else:
+        cropped = []
+        for seg in seg_list:
+            item = _crop_segment(seg)
+            if item is not None:
+                cropped.append(item)
+
+    if not cropped:
+        logger.warning("No valid segments produced for %s", audio_path)
+        return [], {"embedded": 0, "skipped": len(seg_list), "total": len(seg_list)}
+
+    cropped.sort(key=lambda item: item[0].index)
+
+    embedded_results: List[SegmentEmbeddingResult] = []
+    skipped = len(seg_list) - len(cropped)
+
+    batch: List[Tuple[SegmentDescriptor, np.ndarray]] = []
+
+    def _flush_batch():
+        nonlocal embedded_results, skipped
+        if not batch:
+            return
+        lengths = [wave.shape[0] for _, wave in batch]
+        max_len = max(lengths)
+        if max_len == 0:
+            batch.clear()
+            return
+        import torch
+
+        wave_batch = torch.zeros((len(batch), 1, max_len), dtype=torch.float32, device=torch_device)
+        mask_batch = torch.zeros((len(batch), max_len), dtype=torch.float32, device=torch_device)
+        for i, (seg, wave) in enumerate(batch):
+            tensor = torch.from_numpy(wave.astype(np.float32))
+            wave_batch[i, 0, : tensor.shape[0]] = tensor
+            mask_batch[i, : tensor.shape[0]] = 1.0
+
+        with torch.no_grad():
+            try:
+                embedding_batch = embedder(wave_batch, masks=mask_batch)
+            except TypeError:
+                # Some embedders might not accept masks
+                embedding_batch = embedder(wave_batch)
+
+        if not isinstance(embedding_batch, np.ndarray):
+            embedding_batch = np.asarray(embedding_batch)
+
+        for (seg, _), vec in zip(batch, embedding_batch):
+            vec = np.asarray(vec, dtype=np.float32).flatten()
+            if not np.isfinite(vec).all():
+                skipped += 1
+                continue
+            norm = np.linalg.norm(vec)
+            if norm == 0.0:
+                skipped += 1
+                continue
+            vec = vec / norm
+            embedded_results.append(
+                SegmentEmbeddingResult(
+                    speaker=seg.speaker,
+                    start=seg.start,
+                    end=seg.end,
+                    index=seg.index,
+                    embedding=vec.astype(np.float32),
+                )
+            )
+        batch.clear()
+
+    for item in cropped:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            _flush_batch()
+    _flush_batch()
+
+    embedded_results.sort(key=lambda entry: entry.index)
+
+    summary = {
+        "embedded": len(embedded_results),
+        "skipped": skipped,
+        "total": len(seg_list),
+        "device": device,
+        "sample_rate": sample_rate,
+    }
+    logger.debug(
+        "Segment embedding extraction complete file=%s embedded=%d skipped=%d",
+        audio_path,
+        summary["embedded"],
+        summary["skipped"],
+    )
+
+    return embedded_results, summary
 
 
 def transcribe_with_whisperx(
@@ -382,6 +646,12 @@ def transcribe_with_whisperx(
                 "min_speakers": min_speakers,
                 "max_speakers": max_speakers,
             }
+            logger.debug(
+                "Invoking diarization pipeline device=%s kwargs=%s file=%s",
+                diar_device,
+                diar_kwargs,
+                audio_path,
+            )
             with _silence_stdio(quiet):
                 diar_pipeline = _get_diar_pipeline(diar_device, hf_token)
                 try:
@@ -433,9 +703,21 @@ def transcribe_with_whisperx(
             if isinstance(diar_result, tuple):
                 if diar_result:
                     assign_source = diar_result[0]
+                logger.debug(
+                    "Diarization result tuple(len=%d) types=%s for %s",
+                    len(diar_result),
+                    tuple(type(item).__name__ for item in diar_result),
+                    audio_path,
+                )
                 if len(diar_result) > 1 and isinstance(diar_result[1], dict):
                     speaker_embeddings = diar_result[1]
                     speaker_embedding_map = _normalize_embeddings(speaker_embeddings)
+                    logger.debug(
+                        "Diarization returned %d normalized embedding(s) for %s labels=%s",
+                        len(speaker_embedding_map),
+                        audio_path,
+                        list(speaker_embedding_map.keys()),
+                    )
 
             if _is_dataframe(assign_source):
                 diar_segments = _segments_from_dataframe(assign_source)
@@ -457,6 +739,11 @@ def transcribe_with_whisperx(
                 (diar_result, {"segments": aligned_segments}, diar_pipeline)
             )
             assign_candidates.append((diar_result, {"segments": aligned_segments}))
+            logger.debug(
+                "Prepared %d diarization assignment candidate(s) for %s",
+                len(assign_candidates),
+                audio_path,
+            )
 
             speaker_aligned = None
             for args in assign_candidates:
@@ -468,6 +755,16 @@ def transcribe_with_whisperx(
             if speaker_aligned:
                 aligned_segments = (
                     speaker_aligned.get("segments", aligned_segments) or aligned_segments
+                )
+                logger.debug(
+                    "Applied diarization word-speaker alignment for %s via payload type=%s",
+                    audio_path,
+                    type(speaker_aligned).__name__,
+                )
+            else:
+                logger.debug(
+                    "Word-speaker alignment did not modify segments for %s",
+                    audio_path,
                 )
     except Exception as exc:  # noqa: BLE001 - best effort diarization
         logger.warning("Diarization failed for %s: %s", audio_path, exc)
@@ -490,6 +787,13 @@ def transcribe_with_whisperx(
         )
 
     logger.info("Produced %d aligned segment(s) for %s", len(structured_segments), audio_path)
+    logger.debug(
+        "Returning from transcribe_with_whisperx file=%s segments=%d diar_segments=%d embeddings=%d",
+        audio_path,
+        len(structured_segments),
+        len(diar_segments or []),
+        len(speaker_embedding_map),
+    )
     return structured_segments, diar_segments, speaker_embedding_map
 
 

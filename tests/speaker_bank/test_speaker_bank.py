@@ -66,3 +66,73 @@ def test_resolve_speaker_bank_paths(tmp_path, monkeypatch):
     assert root == (override_root / "speaker_bank").resolve()
     assert profile == "default"
     assert profile_dir == root / "default"
+
+
+def test_match_with_single_embedding_relies_on_cosine(tmp_path):
+    bank = SpeakerBank(
+        tmp_path,
+        profile="solo",
+        cluster_method="dbscan",
+        dbscan_eps=0.3,
+        dbscan_min_samples=1,
+    )
+    anchor = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    bank.extend([("alice", anchor, "solo.wav", {"diar_label": "SPEAKER_00"})])
+    bank.save()
+
+    query = np.array([0.8, 0.6, 0.0], dtype=np.float32)
+    match = bank.match(query, threshold=0.7)
+    assert match is not None
+    assert match["speaker"] == "alice"
+
+
+def test_match_enforces_margin(tmp_path):
+    bank = SpeakerBank(
+        tmp_path,
+        profile="margin",
+        cluster_method="dbscan",
+        dbscan_eps=0.3,
+        dbscan_min_samples=1,
+        prototypes_enabled=True,
+        prototypes_per_cluster=1,
+    )
+    bank.extend(
+        [
+            ("alice", np.array([1.0, 0.0], dtype=np.float32), "a.wav", {}),
+            ("bob", np.array([0.95, 0.3], dtype=np.float32), "b.wav", {}),
+        ]
+    )
+    bank.save()
+
+    query = np.array([0.97, 0.24], dtype=np.float32)
+    loose = bank.match(query, threshold=0.5, margin=0.0)
+    assert loose is not None
+
+    strict = bank.match(query, threshold=0.5, margin=0.1)
+    assert strict is None
+
+
+def test_score_candidates_uses_prototypes(tmp_path):
+    bank = SpeakerBank(
+        tmp_path,
+        profile="proto",
+        cluster_method="dbscan",
+        dbscan_eps=1.2,
+        dbscan_min_samples=1,
+        prototypes_enabled=True,
+        prototypes_per_cluster=2,
+    )
+    bank.extend(
+        [
+            ("alice", np.array([1.0, 0.0], dtype=np.float32), "a1.wav", {}),
+            ("alice", np.array([0.0, 1.0], dtype=np.float32), "a2.wav", {}),
+        ]
+    )
+    bank.save()
+
+    results = bank.score_candidates(np.array([0.0, 1.0], dtype=np.float32))
+    assert results
+    top = results[0]
+    assert top["speaker"] == "alice"
+    assert top["source"] == "prototype"
+    assert top["score"] > 0.95
