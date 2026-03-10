@@ -68,6 +68,44 @@ def test_resolve_speaker_bank_paths(tmp_path, monkeypatch):
     assert profile_dir == root / "default"
 
 
+def test_resolve_speaker_bank_paths_prefers_existing_repo_bank(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    monkeypatch.chdir(repo_root)
+    (repo_root / ".hf_cache" / "speaker_bank" / "default").mkdir(parents=True)
+
+    cfg = SpeakerBankConfig()
+    root, profile, profile_dir = _resolve_speaker_bank_paths(
+        cfg,
+        root_override=None,
+        hf_cache_root=str(tmp_path / "model_cache"),
+    )
+
+    assert root == (repo_root / ".hf_cache" / "speaker_bank").resolve()
+    assert profile == "default"
+    assert profile_dir == root / "default"
+
+
+def test_resolve_speaker_bank_paths_normalizes_hub_root(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    monkeypatch.chdir(repo_root)
+    home_root = tmp_path / "hf_home"
+    (home_root / "speaker_bank" / "default").mkdir(parents=True)
+    (home_root / "hub").mkdir(parents=True)
+
+    cfg = SpeakerBankConfig()
+    root, profile, profile_dir = _resolve_speaker_bank_paths(
+        cfg,
+        root_override=None,
+        hf_cache_root=str(home_root / "hub"),
+    )
+
+    assert root == (home_root / "speaker_bank").resolve()
+    assert profile == "default"
+    assert profile_dir == root / "default"
+
+
 def test_match_with_single_embedding_relies_on_cosine(tmp_path):
     bank = SpeakerBank(
         tmp_path,

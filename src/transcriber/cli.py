@@ -10,7 +10,7 @@ import math
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 import time
@@ -405,35 +405,205 @@ def _resolve_cache_root(explicit: str | None, cache_mode: str | None = None) -> 
     return str(Path.home() / "hf_cache")
 
 
+def _normalize_speaker_bank_base_root(path_value: str | Path) -> Path:
+    resolved = Path(path_value).expanduser().resolve()
+    if resolved.name == "hub":
+        return resolved.parent
+    return resolved
+
+
 def _resolve_speaker_bank_paths(
     cfg: SpeakerBankConfig,
     root_override: str | None,
     hf_cache_root: str | None,
 ) -> Tuple[Path, str, Path]:
-    base_root: Path
-    if root_override:
-        base_root = Path(root_override).expanduser().resolve()
-    elif hf_cache_root:
-        base_root = Path(hf_cache_root).expanduser().resolve()
-    else:
-        base_root = (Path.home() / "hf_cache").resolve()
-    bank_root = base_root / "speaker_bank"
     raw_path = Path(cfg.path or "default").expanduser()
     if raw_path.is_absolute():
         profile_dir = raw_path
         profile = raw_path.name or "default"
         root = raw_path.parent
         return root, profile, profile_dir
+
+    candidate_base_roots: List[Path] = []
+    if root_override:
+        candidate_base_roots.append(Path(root_override).expanduser().resolve())
+    else:
+        repo_root = (Path.cwd() / ".hf_cache").resolve()
+        if (repo_root / "speaker_bank").exists():
+            candidate_base_roots.append(repo_root)
+        if hf_cache_root:
+            candidate_base_roots.append(_normalize_speaker_bank_base_root(hf_cache_root))
+        candidate_base_roots.append((Path.home() / "hf_cache").resolve())
+
+    deduped_roots: List[Path] = []
+    for candidate in candidate_base_roots:
+        if candidate not in deduped_roots:
+            deduped_roots.append(candidate)
+
     rel = raw_path
     if str(rel).strip() in ("", ".", "./"):
         rel = Path("default")
-    if rel.parent != Path("."):
-        root = (bank_root / rel.parent).resolve()
-    else:
-        root = bank_root.resolve()
     profile = rel.name or "default"
+    resolved_candidates: List[Tuple[Path, Path]] = []
+    for base_root in deduped_roots:
+        bank_root = base_root / "speaker_bank"
+        if rel.parent != Path("."):
+            root = (bank_root / rel.parent).resolve()
+        else:
+            root = bank_root.resolve()
+        profile_dir = root / profile
+        resolved_candidates.append((root, profile_dir))
+
+    for root, profile_dir in resolved_candidates:
+        if profile_dir.exists():
+            return root, profile, profile_dir
+
+    if resolved_candidates:
+        root, profile_dir = resolved_candidates[0]
+        return root, profile, profile_dir
+
+    bank_root = ((Path.home() / "hf_cache").resolve()) / "speaker_bank"
+    root = (bank_root / rel.parent).resolve() if rel.parent != Path(".") else bank_root.resolve()
     profile_dir = root / profile
     return root, profile, profile_dir
+
+
+def _aggregate_segment_label_candidates(
+    segment_indices: List[int],
+    seg_matches: Dict[int, Dict[str, object]],
+    *,
+    aggregation: str,
+    margin_required: float,
+    min_segments_per_label: int,
+) -> Tuple[Optional[Dict[str, object]], Dict[str, object]]:
+    stats: Dict[str, object] = {
+        "segments_embedded": 0,
+        "segments_matched": 0,
+        "means": {},
+        "means_supported": {},
+        "vote_counts": {},
+        "best_ratio": None,
+        "second_ratio": None,
+        "margin": None,
+        "second_metric": None,
+        "score_metric": None,
+        "selection": None,
+    }
+
+    embedded_total = 0
+    candidate_totals: Dict[str, float] = defaultdict(float)
+    candidate_support: Dict[str, int] = defaultdict(int)
+    vote_counts: Dict[str, int] = defaultdict(int)
+    best_candidate_by_speaker: Dict[str, Dict[str, object]] = {}
+
+    for seg_idx in segment_indices:
+        seg_info = seg_matches.get(seg_idx) or {}
+        candidates = seg_info.get("candidates") or []
+        if not candidates:
+            continue
+        embedded_total += 1
+        top_candidate = candidates[0]
+        top_speaker = str(top_candidate.get("speaker") or "")
+        if top_speaker:
+            vote_counts[top_speaker] += 1
+        for candidate in candidates:
+            speaker = str(candidate.get("speaker") or "")
+            if not speaker:
+                continue
+            score = float(candidate.get("score") or 0.0)
+            candidate_totals[speaker] += score
+            candidate_support[speaker] += 1
+            existing = best_candidate_by_speaker.get(speaker)
+            if existing is None or score > float(existing.get("score") or 0.0):
+                best_candidate_by_speaker[speaker] = {
+                    "segment_index": seg_idx,
+                    **candidate,
+                }
+
+    stats["segments_embedded"] = embedded_total
+    stats["segments_matched"] = sum(
+        1 for seg_idx in segment_indices if (seg_matches.get(seg_idx) or {}).get("accepted")
+    )
+
+    if embedded_total:
+        stats["means"] = {
+            speaker: total / embedded_total
+            for speaker, total in sorted(candidate_totals.items(), key=lambda item: item[1], reverse=True)
+        }
+    stats["means_supported"] = {
+        speaker: candidate_totals[speaker] / candidate_support[speaker]
+        for speaker in sorted(candidate_support)
+        if candidate_support[speaker]
+    }
+    stats["vote_counts"] = dict(sorted(vote_counts.items(), key=lambda item: item[1], reverse=True))
+
+    if embedded_total < max(1, min_segments_per_label) or not candidate_totals:
+        return None, stats
+
+    selection: Optional[Dict[str, object]] = None
+    aggregation_name = (aggregation or "mean").lower()
+    if aggregation_name == "vote":
+        ordered_counts = sorted(
+            vote_counts.items(),
+            key=lambda item: (item[1], stats["means"].get(item[0], 0.0)),  # type: ignore[union-attr]
+            reverse=True,
+        )
+        if ordered_counts:
+            best_speaker, best_count = ordered_counts[0]
+            second_count = ordered_counts[1][1] if len(ordered_counts) > 1 else 0
+            ratio_best = best_count / embedded_total if embedded_total else 0.0
+            ratio_second = second_count / embedded_total if embedded_total else 0.0
+            margin_value = ratio_best - ratio_second
+            stats["best_ratio"] = ratio_best
+            stats["second_ratio"] = ratio_second
+            stats["margin"] = margin_value
+            stats["second_metric"] = ratio_second
+            score_metric = float((stats["means"] or {}).get(best_speaker, 0.0))
+            stats["score_metric"] = score_metric
+            if margin_value >= margin_required:
+                best_candidate = best_candidate_by_speaker.get(best_speaker)
+                if best_candidate:
+                    selection = {
+                        "speaker": best_speaker,
+                        "cluster_id": best_candidate.get("cluster_id"),
+                        "score": score_metric,
+                        "score_max": best_candidate.get("score"),
+                        "distance": best_candidate.get("distance"),
+                        "margin": margin_value,
+                        "second_best": ratio_second,
+                        "source": "segment_vote",
+                        "segments_count": best_count,
+                    }
+    else:
+        ordered_means = sorted(
+            ((speaker, float(score)) for speaker, score in (stats["means"] or {}).items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if ordered_means:
+            best_speaker, best_mean = ordered_means[0]
+            second_mean = ordered_means[1][1] if len(ordered_means) > 1 else 0.0
+            margin_value = best_mean - second_mean
+            stats["margin"] = margin_value
+            stats["second_metric"] = second_mean
+            stats["score_metric"] = best_mean
+            if margin_value >= margin_required:
+                best_candidate = best_candidate_by_speaker.get(best_speaker)
+                if best_candidate:
+                    selection = {
+                        "speaker": best_speaker,
+                        "cluster_id": best_candidate.get("cluster_id"),
+                        "score": best_mean,
+                        "score_max": best_candidate.get("score"),
+                        "distance": best_candidate.get("distance"),
+                        "margin": margin_value,
+                        "second_best": second_mean,
+                        "source": "segment_mean",
+                        "segments_count": candidate_support.get(best_speaker, 0),
+                    }
+
+    stats["selection"] = selection
+    return selection, stats
 
 
 def _resolve_speaker_bank_settings(
@@ -1235,8 +1405,7 @@ def run_transcribe(
 
         if speaker_bank_config.match_per_segment and segments:
             def _segment_level_match() -> Tuple[Dict[int, Dict[str, object]], Dict[str, Dict[str, object]], Dict[str, object]]:
-                payload: List[Tuple[float, float, str]] = []
-                index_map: List[int] = []
+                payload_by_label: Dict[str, List[Tuple[int, float, float, str]]] = defaultdict(list)
                 label_stats_local: Dict[str, Dict[str, object]] = {}
                 for idx, seg in enumerate(segments):
                     raw_label = segment_labels[idx]
@@ -1246,8 +1415,7 @@ def run_transcribe(
                     end = float(seg.get("end") or 0.0)
                     if end <= start:
                         continue
-                    payload.append((start, end, raw_label))
-                    index_map.append(idx)
+                    payload_by_label[raw_label].append((idx, start, end, raw_label))
                     stats = label_stats_local.setdefault(
                         raw_label,
                         {
@@ -1260,182 +1428,119 @@ def run_transcribe(
                     stats["segments_total"] += 1
                     stats["segments_indices"].append(idx)
 
-                if not payload:
+                if not payload_by_label:
                     return {}, {}, {"embedded": 0, "skipped": 0, "total": 0}
 
-                try:
-                    embed_results, embed_summary = extract_embeddings_for_segments(
-                        file_key,
-                        payload,
-                        hf_token=hf_token,
-                        force_device=device_guess,
-                        quiet=quiet,
-                        pre_pad=speaker_bank_config.pre_pad,
-                        post_pad=speaker_bank_config.post_pad,
-                        batch_size=speaker_bank_config.embed_batch_size,
-                        workers=speaker_bank_config.embed_workers,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Segment embedding extraction failed for %s: %s",
-                        file_name,
-                        exc,
-                    )
-                    return {}, {}, {"error": str(exc)}
-
                 seg_matches: Dict[int, Dict[str, object]] = {}
-                for idx in index_map:
-                    seg_matches[idx] = {
-                        "accepted": False,
-                        "match": None,
-                        "top_score": None,
-                        "second_best": None,
-                        "margin": None,
-                        "candidates": [],
-                    }
-
-                for result in embed_results:
-                    if result.index >= len(index_map):
-                        continue
-                    seg_idx = index_map[result.index]
-                    raw_label = segment_labels.get(seg_idx)
-                    if not raw_label:
-                        continue
-                    candidates = speaker_bank.score_candidates(
-                        result.embedding,
-                        radius_factor=radius_factor,
-                    )
-                    top1 = candidates[0] if candidates else None
-                    top2_score = candidates[1]["score"] if len(candidates) > 1 else None
-                    margin_value = (
-                        (top1["score"] - top2_score)
-                        if top1 and top2_score is not None
-                        else (top1["score"] if top1 else None)
-                    )
-                    accepted = bool(
-                        top1
-                        and top1["score"] >= threshold
-                        and (margin_value if margin_value is not None else 0.0) >= margin_required
-                    )
-                    match_payload = None
-                    if accepted and top1:
-                        match_payload = {
-                            "speaker": top1["speaker"],
-                            "cluster_id": top1["cluster_id"],
-                            "score": top1["score"],
-                            "distance": top1["distance"],
-                            "margin": margin_value,
-                            "second_best": top2_score,
-                            "source": f"segment_{top1.get('source', 'centroid')}",
+                for payload_items in payload_by_label.values():
+                    for idx, *_ in payload_items:
+                        seg_matches[idx] = {
+                            "accepted": False,
+                            "match": None,
+                            "top_score": None,
+                            "second_best": None,
+                            "margin": None,
+                            "candidates": [],
                         }
-                        stats = label_stats_local.setdefault(
-                            raw_label,
-                            {
-                                "segments_total": 0,
-                                "segments_indices": [],
-                                "matches_by_speaker": defaultdict(list),
-                                "aggregation": speaker_bank_config.match_aggregation.lower(),
-                            },
+
+                embed_summary: Dict[str, object] = {
+                    "embedded": 0,
+                    "skipped": 0,
+                    "total": 0,
+                    "labels": {},
+                }
+                for raw_label, payload_items in payload_by_label.items():
+                    payload = [(start, end, label) for _, start, end, label in payload_items]
+                    label_index_map = [idx for idx, *_ in payload_items]
+                    try:
+                        embed_results, label_summary = extract_embeddings_for_segments(
+                            file_key,
+                            payload,
+                            hf_token=hf_token,
+                            force_device=device_guess,
+                            quiet=quiet,
+                            pre_pad=speaker_bank_config.pre_pad,
+                            post_pad=speaker_bank_config.post_pad,
+                            batch_size=speaker_bank_config.embed_batch_size,
+                            workers=speaker_bank_config.embed_workers,
                         )
-                        stats["matches_by_speaker"][top1["speaker"]].append(seg_idx)
-                    seg_matches[seg_idx] = {
-                        "accepted": accepted,
-                        "match": match_payload,
-                        "top_score": top1["score"] if top1 else None,
-                        "second_best": top2_score,
-                        "margin": margin_value,
-                        "candidates": candidates[:3],
-                    }
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Segment embedding extraction failed for %s (%s): %s",
+                            file_name,
+                            raw_label,
+                            exc,
+                        )
+                        embed_summary.setdefault("errors", {})[raw_label] = str(exc)
+                        continue
+
+                    for field in ("embedded", "skipped", "total"):
+                        embed_summary[field] = int(embed_summary.get(field, 0)) + int(
+                            label_summary.get(field, 0)
+                        )
+                    for field in ("device", "sample_rate"):
+                        if field in label_summary and field not in embed_summary:
+                            embed_summary[field] = label_summary[field]
+                    embed_summary["labels"][raw_label] = label_summary
+
+                    for result in embed_results:
+                        if result.index >= len(label_index_map):
+                            continue
+                        seg_idx = label_index_map[result.index]
+                        candidates = speaker_bank.score_candidates(
+                            result.embedding,
+                            radius_factor=radius_factor,
+                        )
+                        top1 = candidates[0] if candidates else None
+                        top2_score = candidates[1]["score"] if len(candidates) > 1 else None
+                        margin_value = (
+                            (top1["score"] - top2_score)
+                            if top1 and top2_score is not None
+                            else (top1["score"] if top1 else None)
+                        )
+                        accepted = bool(
+                            top1
+                            and top1["score"] >= threshold
+                            and (margin_value if margin_value is not None else 0.0) >= margin_required
+                        )
+                        match_payload = None
+                        if accepted and top1:
+                            match_payload = {
+                                "speaker": top1["speaker"],
+                                "cluster_id": top1["cluster_id"],
+                                "score": top1["score"],
+                                "distance": top1["distance"],
+                                "margin": margin_value,
+                                "second_best": top2_score,
+                                "source": f"segment_{top1.get('source', 'centroid')}",
+                            }
+                        seg_matches[seg_idx] = {
+                            "accepted": accepted,
+                            "match": match_payload,
+                            "top_score": top1["score"] if top1 else None,
+                            "second_best": top2_score,
+                            "margin": margin_value,
+                            "candidates": candidates,
+                        }
 
                 # Aggregation per label
                 for label, stats in label_stats_local.items():
-                    matches_by_speaker = stats.setdefault("matches_by_speaker", defaultdict(list))
-                    matched_total = sum(len(v) for v in matches_by_speaker.values())
-                    stats["segments_matched"] = matched_total
-                    aggregation = stats.get("aggregation", "mean").lower()
-                    selection = None
-                    margin_label = None
-                    second_metric = None
-                    score_metric = None
-                    if matched_total >= max(1, speaker_bank_config.min_segments_per_label):
-                        if aggregation == "vote":
-                            counts = {spk: len(idxs) for spk, idxs in matches_by_speaker.items()}
-                            if counts:
-                                sorted_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
-                                best_speaker, best_count = sorted_counts[0]
-                                second_count = sorted_counts[1][1] if len(sorted_counts) > 1 else 0
-                                total = float(matched_total)
-                                ratio_best = best_count / total if total else 0.0
-                                ratio_second = second_count / total if total else 0.0
-                                margin_label = ratio_best - ratio_second
-                                second_metric = ratio_second
-                                if margin_label >= margin_required:
-                                    # representative segment: highest score for this speaker
-                                    best_indices = matches_by_speaker[best_speaker]
-                                    best_idx = max(
-                                        best_indices,
-                                        key=lambda i: seg_matches[i]["match"]["score"],  # type: ignore[index]
-                                    )
-                                    best_match = seg_matches[best_idx]["match"]
-                                    score_metric = float(np.mean([seg_matches[i]["match"]["score"] for i in best_indices]))  # type: ignore[index]
-                                    selection = {
-                                        "speaker": best_speaker,
-                                        "cluster_id": best_match.get("cluster_id") if best_match else None,
-                                        "score": score_metric,
-                                        "score_max": best_match.get("score") if best_match else None,
-                                        "distance": best_match.get("distance") if best_match else None,
-                                        "margin": margin_label,
-                                        "second_best": ratio_second,
-                                        "source": f"segment_vote",
-                                        "segments_count": len(best_indices),
-                                    }
-                            stats["vote_counts"] = counts if counts else {}
-                            stats["best_ratio"] = ratio_best if counts else None
-                            stats["second_ratio"] = ratio_second if counts else None
-                        else:
-                            speaker_means: Dict[str, float] = {}
-                            speaker_best_index: Dict[str, int] = {}
-                            for spk, idxs in matches_by_speaker.items():
-                                scores = [seg_matches[i]["match"]["score"] for i in idxs if seg_matches[i]["match"]]
-                                if not scores:
-                                    continue
-                                mean_score = float(np.mean(scores))
-                                speaker_means[spk] = mean_score
-                                speaker_best_index[spk] = max(
-                                    idxs,
-                                    key=lambda i: seg_matches[i]["match"]["score"],  # type: ignore[index]
-                                )
-                            if speaker_means:
-                                sorted_means = sorted(speaker_means.items(), key=lambda item: item[1], reverse=True)
-                                best_speaker, best_mean = sorted_means[0]
-                                second_mean = sorted_means[1][1] if len(sorted_means) > 1 else 0.0
-                                margin_label = best_mean - second_mean
-                                second_metric = second_mean
-                                if margin_label >= margin_required:
-                                    best_idx = speaker_best_index[best_speaker]
-                                    best_match = seg_matches[best_idx]["match"]
-                                    selection = {
-                                        "speaker": best_speaker,
-                                        "cluster_id": best_match.get("cluster_id") if best_match else None,
-                                        "score": best_mean,
-                                        "score_max": best_match.get("score") if best_match else None,
-                                        "distance": best_match.get("distance") if best_match else None,
-                                        "margin": margin_label,
-                                        "second_best": second_mean,
-                                        "source": "segment_mean",
-                                        "segments_count": len(matches_by_speaker[best_speaker]),
-                                    }
-                            stats["means"] = speaker_means
+                    selection, aggregate_stats = _aggregate_segment_label_candidates(
+                        stats.get("segments_indices", []),
+                        seg_matches,
+                        aggregation=str(stats.get("aggregation") or "mean"),
+                        margin_required=margin_required,
+                        min_segments_per_label=speaker_bank_config.min_segments_per_label,
+                    )
+                    stats.update(aggregate_stats)
                     stats["selection"] = selection
-                    stats["margin"] = margin_label
-                    stats["second_metric"] = second_metric
-                    stats["score_metric"] = score_metric
 
                 debug_payload = {
                     "embedding": embed_summary,
                     "labels": {
                         label: {
                             "segments_total": stats.get("segments_total"),
+                            "segments_embedded": stats.get("segments_embedded"),
                             "segments_matched": stats.get("segments_matched"),
                             "aggregation": stats.get("aggregation"),
                             "margin": stats.get("margin"),
@@ -1481,6 +1586,8 @@ def run_transcribe(
         for label, vector in embeddings.items():
             if label in label_matches and label_matches[label]:
                 continue
+            if (label_stats.get(label) or {}).get("segments_matched", 0):
+                continue
             try:
                 match = speaker_bank.match(
                     vector,
@@ -1525,30 +1632,28 @@ def run_transcribe(
             for idx in segment_indices:
                 seg = segments[idx]
                 seg_match_info = segment_matches.get(idx)
-                if match:
-                    seg["speaker"] = match["speaker"]
-                    if (
-                        seg_match_info
-                        and seg_match_info.get("accepted")
-                        and seg_match_info["match"]
-                        and seg_match_info["match"]["speaker"] == match["speaker"]
-                    ):
-                        seg_details = dict(seg_match_info["match"])
-                        seg_details["label"] = label
-                        seg["speaker_match"] = seg_details
-                        seg["speaker_match_source"] = seg_details.get("source", "speaker_bank_segment")
-                    else:
-                        seg["speaker_match"] = {
-                            "speaker": match["speaker"],
-                            "score": match.get("score"),
-                            "cluster_id": match.get("cluster_id"),
-                            "distance": match.get("distance"),
-                            "margin": match.get("margin"),
-                            "second_best": match.get("second_best"),
-                            "source": match.get("source") or "speaker_bank",
-                            "label": label,
-                        }
-                        seg["speaker_match_source"] = match.get("source") or "speaker_bank"
+                segment_level_match = None
+                if seg_match_info and seg_match_info.get("accepted") and seg_match_info.get("match"):
+                    segment_level_match = dict(seg_match_info["match"])
+                    segment_level_match["label"] = label
+
+                effective_match = segment_level_match
+                if not effective_match and match:
+                    effective_match = {
+                        "speaker": match["speaker"],
+                        "score": match.get("score"),
+                        "cluster_id": match.get("cluster_id"),
+                        "distance": match.get("distance"),
+                        "margin": match.get("margin"),
+                        "second_best": match.get("second_best"),
+                        "source": match.get("source") or "speaker_bank",
+                        "label": label,
+                    }
+
+                if effective_match:
+                    seg["speaker"] = effective_match["speaker"]
+                    seg["speaker_match"] = effective_match
+                    seg["speaker_match_source"] = effective_match.get("source", "speaker_bank")
                     seg["speaker_match_score"] = seg["speaker_match"].get("score")
                     seg["speaker_match_distance"] = seg["speaker_match"].get("distance")
                     seg["speaker_match_cluster"] = seg["speaker_match"].get("cluster_id")
