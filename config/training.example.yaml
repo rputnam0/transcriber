@@ -1,0 +1,47 @@
+backend: whisperx
+device: auto
+model: large-v3
+compute_type: float16
+batch_size: 16
+auto_batch: true
+
+# Directory or file to train on when invoking
+input: audio/Session_XX.zip
+output_dir: .outputs
+
+speaker_mapping: config/speaker_mapping.yaml
+
+speaker_bank:
+  enabled: true
+  path: default
+  threshold: 0.60
+  scoring_margin: 0.03
+  radius_factor: 2.5
+  use_existing: true
+  train_from_stems: false
+  match_per_segment: true
+  match_aggregation: mean
+  min_segments_per_label: 3
+  emit_pca: true
+  train:
+    from_segments: true
+    segment_source: auto        # auto | session_jsonl | diarization_json
+    min_segment_dur: 6.0        # seconds
+    max_segment_dur: 30.0       # seconds (<=0 disables)
+    window_size: 15.0           # seconds (<=0 use raw segment)
+    window_stride: 7.5          # seconds (<=0 == window_size)
+    max_embeddings_per_speaker: 300
+    vad_chunk_stems: true
+    pre_pad: 0.15
+    post_pad: 0.15
+    embed_workers: 4
+    embed_batch_size: 16
+    segments_path: .outputs     # optional override (file or directory)
+
+hf_cache_root: ./.hf_cache
+speaker_bank_root: ./.hf_cache
+cache_mode: repo
+local_files_only: false
+
+log_level: INFO
+quiet: false

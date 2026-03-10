@@ -6,9 +6,11 @@ import sys
 import logging
 import os
 import shutil
+import math
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 import time
@@ -17,6 +19,12 @@ from tqdm import tqdm
 from .audio import gather_inputs, cleanup_tmp, is_audio_file
 from .consolidate import consolidate, save_outputs, choose_speaker
 from .speaker_bank import SpeakerBank, SpeakerBankConfig
+from .segments import (
+    SegmentWindow,
+    TrainingSegment,
+    generate_windows_for_segments,
+    load_segments_file,
+)
 
 # Keep global references to preloaded CUDA libraries so they aren't dlclosed
 _CUDA_PRELOAD_HANDLES: list = []
@@ -284,6 +292,14 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
             defaults["speaker_bank_train_stems"] = bool(sb_cfg.get("train_from_stems"))
         if "emit_pca" in sb_cfg:
             defaults["speaker_bank_emit_pca"] = bool(sb_cfg.get("emit_pca"))
+        if "scoring_margin" in sb_cfg and sb_cfg.get("scoring_margin") is not None:
+            defaults["speaker_bank_margin"] = float(sb_cfg.get("scoring_margin"))
+        if "match_per_segment" in sb_cfg:
+            defaults["speaker_bank_match_per_segment"] = bool(sb_cfg.get("match_per_segment"))
+        if "match_aggregation" in sb_cfg and sb_cfg.get("match_aggregation") is not None:
+            defaults["speaker_bank_match_aggregation"] = sb_cfg.get("match_aggregation")
+        if "min_segments_per_label" in sb_cfg and sb_cfg.get("min_segments_per_label") is not None:
+            defaults["speaker_bank_min_segments_per_label"] = int(sb_cfg.get("min_segments_per_label"))
         cluster_cfg = sb_cfg.get("cluster") or {}
         if "method" in cluster_cfg and cluster_cfg.get("method") is not None:
             defaults["speaker_bank_cluster_method"] = cluster_cfg.get("method")
@@ -291,6 +307,56 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
             defaults["speaker_bank_cluster_eps"] = float(cluster_cfg.get("eps"))
         if "min_samples" in cluster_cfg and cluster_cfg.get("min_samples") is not None:
             defaults["speaker_bank_cluster_min_samples"] = int(cluster_cfg.get("min_samples"))
+        scoring_cfg = sb_cfg.get("scoring") or {}
+        if isinstance(scoring_cfg, dict):
+            if scoring_cfg.get("threshold") is not None:
+                defaults["speaker_bank_threshold"] = float(scoring_cfg.get("threshold"))
+            if scoring_cfg.get("margin") is not None:
+                defaults["speaker_bank_margin"] = float(scoring_cfg.get("margin"))
+            as_norm_cfg = scoring_cfg.get("as_norm") or {}
+            if isinstance(as_norm_cfg, dict):
+                if as_norm_cfg.get("enabled") is not None:
+                    defaults["speaker_bank_as_norm"] = bool(as_norm_cfg.get("enabled"))
+                if as_norm_cfg.get("cohort_size") is not None:
+                    defaults["speaker_bank_as_norm_cohort_size"] = int(as_norm_cfg.get("cohort_size"))
+            if scoring_cfg.get("whiten") is not None:
+                defaults["speaker_bank_whiten"] = bool(scoring_cfg.get("whiten"))
+        proto_cfg = sb_cfg.get("prototypes") or {}
+        if isinstance(proto_cfg, dict):
+            if proto_cfg.get("enabled") is not None:
+                defaults["speaker_bank_prototypes"] = bool(proto_cfg.get("enabled"))
+            if proto_cfg.get("per_cluster") is not None:
+                defaults["speaker_bank_prototypes_per_cluster"] = int(proto_cfg.get("per_cluster"))
+            if proto_cfg.get("method") is not None:
+                defaults["speaker_bank_prototypes_method"] = proto_cfg.get("method")
+        train_cfg = sb_cfg.get("train") or {}
+        if isinstance(train_cfg, dict):
+            if "from_segments" in train_cfg:
+                defaults["speaker_bank_train_from_segments"] = bool(train_cfg.get("from_segments"))
+            if "segment_source" in train_cfg and train_cfg.get("segment_source") is not None:
+                defaults["speaker_bank_train_segment_source"] = train_cfg.get("segment_source")
+            if "min_segment_dur" in train_cfg and train_cfg.get("min_segment_dur") is not None:
+                defaults["speaker_bank_min_segment_dur"] = float(train_cfg.get("min_segment_dur"))
+            if "max_segment_dur" in train_cfg and train_cfg.get("max_segment_dur") is not None:
+                defaults["speaker_bank_max_segment_dur"] = float(train_cfg.get("max_segment_dur"))
+            if "window_size" in train_cfg and train_cfg.get("window_size") is not None:
+                defaults["speaker_bank_window_size"] = float(train_cfg.get("window_size"))
+            if "window_stride" in train_cfg and train_cfg.get("window_stride") is not None:
+                defaults["speaker_bank_window_stride"] = float(train_cfg.get("window_stride"))
+            if "max_embeddings_per_speaker" in train_cfg and train_cfg.get("max_embeddings_per_speaker") is not None:
+                defaults["speaker_bank_max_embeddings"] = int(train_cfg.get("max_embeddings_per_speaker"))
+            if "vad_chunk_stems" in train_cfg:
+                defaults["speaker_bank_vad_chunk_stems"] = bool(train_cfg.get("vad_chunk_stems"))
+            if "pre_pad" in train_cfg and train_cfg.get("pre_pad") is not None:
+                defaults["speaker_bank_pre_pad"] = float(train_cfg.get("pre_pad"))
+            if "post_pad" in train_cfg and train_cfg.get("post_pad") is not None:
+                defaults["speaker_bank_post_pad"] = float(train_cfg.get("post_pad"))
+            if "embed_workers" in train_cfg and train_cfg.get("embed_workers") is not None:
+                defaults["speaker_bank_embed_workers"] = int(train_cfg.get("embed_workers"))
+            if "embed_batch_size" in train_cfg and train_cfg.get("embed_batch_size") is not None:
+                defaults["speaker_bank_embed_batch_size"] = int(train_cfg.get("embed_batch_size"))
+            if "segments_path" in train_cfg and train_cfg.get("segments_path") is not None:
+                defaults["speaker_bank_segments_json"] = train_cfg.get("segments_path")
     ap.set_defaults(**defaults)
 
 def _load_yaml_or_json(path: str | None) -> Dict:
@@ -395,6 +461,14 @@ def _resolve_speaker_bank_settings(
             config.train_from_stems = bool(sb_cfg.get("train_from_stems"))
         if sb_cfg.get("emit_pca") is not None:
             config.emit_pca = bool(sb_cfg.get("emit_pca"))
+        if sb_cfg.get("scoring_margin") is not None:
+            config.scoring_margin = float(sb_cfg.get("scoring_margin"))
+        if sb_cfg.get("match_per_segment") is not None:
+            config.match_per_segment = bool(sb_cfg.get("match_per_segment"))
+        if sb_cfg.get("match_aggregation") is not None:
+            config.match_aggregation = str(sb_cfg.get("match_aggregation"))
+        if sb_cfg.get("min_segments_per_label") is not None:
+            config.min_segments_per_label = int(sb_cfg.get("min_segments_per_label"))
         cluster_cfg = sb_cfg.get("cluster") or {}
         if cluster_cfg.get("method"):
             config.cluster_method = str(cluster_cfg.get("method"))
@@ -402,6 +476,56 @@ def _resolve_speaker_bank_settings(
             config.cluster_eps = float(cluster_cfg.get("eps"))
         if cluster_cfg.get("min_samples") is not None:
             config.cluster_min_samples = int(cluster_cfg.get("min_samples"))
+        scoring_cfg = sb_cfg.get("scoring") or {}
+        if isinstance(scoring_cfg, dict) and scoring_cfg:
+            if scoring_cfg.get("threshold") is not None:
+                config.threshold = float(scoring_cfg.get("threshold"))
+            if scoring_cfg.get("margin") is not None:
+                config.scoring_margin = float(scoring_cfg.get("margin"))
+            if scoring_cfg.get("whiten") is not None:
+                config.scoring_whiten = bool(scoring_cfg.get("whiten"))
+            as_norm_cfg = scoring_cfg.get("as_norm") or {}
+            if isinstance(as_norm_cfg, dict) and as_norm_cfg:
+                if as_norm_cfg.get("enabled") is not None:
+                    config.scoring_as_norm_enabled = bool(as_norm_cfg.get("enabled"))
+                if as_norm_cfg.get("cohort_size") is not None:
+                    config.scoring_as_norm_cohort_size = int(as_norm_cfg.get("cohort_size"))
+        proto_cfg = sb_cfg.get("prototypes") or {}
+        if isinstance(proto_cfg, dict) and proto_cfg:
+            if proto_cfg.get("enabled") is not None:
+                config.prototypes_enabled = bool(proto_cfg.get("enabled"))
+            if proto_cfg.get("per_cluster") is not None:
+                config.prototypes_per_cluster = int(proto_cfg.get("per_cluster"))
+            if proto_cfg.get("method"):
+                config.prototypes_method = str(proto_cfg.get("method"))
+        train_cfg = sb_cfg.get("train") or {}
+        if isinstance(train_cfg, dict) and train_cfg:
+            if train_cfg.get("from_segments") is not None:
+                config.train_from_segments = bool(train_cfg.get("from_segments"))
+            if train_cfg.get("segment_source") is not None:
+                config.train_segment_source = str(train_cfg.get("segment_source"))
+            if train_cfg.get("min_segment_dur") is not None:
+                config.min_segment_dur = float(train_cfg.get("min_segment_dur"))
+            if train_cfg.get("max_segment_dur") is not None:
+                config.max_segment_dur = float(train_cfg.get("max_segment_dur"))
+            if train_cfg.get("window_size") is not None:
+                config.window_size = float(train_cfg.get("window_size"))
+            if train_cfg.get("window_stride") is not None:
+                config.window_stride = float(train_cfg.get("window_stride"))
+            if train_cfg.get("max_embeddings_per_speaker") is not None:
+                config.max_embeddings_per_speaker = int(train_cfg.get("max_embeddings_per_speaker"))
+            if train_cfg.get("vad_chunk_stems") is not None:
+                config.vad_chunk_stems = bool(train_cfg.get("vad_chunk_stems"))
+            if train_cfg.get("pre_pad") is not None:
+                config.pre_pad = float(train_cfg.get("pre_pad"))
+            if train_cfg.get("post_pad") is not None:
+                config.post_pad = float(train_cfg.get("post_pad"))
+            if train_cfg.get("embed_workers") is not None:
+                config.embed_workers = int(train_cfg.get("embed_workers"))
+            if train_cfg.get("embed_batch_size") is not None:
+                config.embed_batch_size = int(train_cfg.get("embed_batch_size"))
+            if train_cfg.get("segments_path"):
+                config.segments_path = str(train_cfg.get("segments_path"))
 
     if getattr(args, "speaker_bank_enabled", None) is not None:
         config.enabled = bool(args.speaker_bank_enabled)
@@ -423,6 +547,49 @@ def _resolve_speaker_bank_settings(
         config.cluster_eps = float(args.speaker_bank_cluster_eps)
     if getattr(args, "speaker_bank_cluster_min_samples", None) is not None:
         config.cluster_min_samples = int(args.speaker_bank_cluster_min_samples)
+    if getattr(args, "speaker_bank_margin", None) is not None:
+        config.scoring_margin = float(args.speaker_bank_margin)
+    if getattr(args, "speaker_bank_train_from_segments", None) is not None:
+        config.train_from_segments = bool(args.speaker_bank_train_from_segments)
+    if getattr(args, "speaker_bank_train_segment_source", None):
+        config.train_segment_source = str(args.speaker_bank_train_segment_source)
+    if getattr(args, "speaker_bank_min_segment_dur", None) is not None:
+        config.min_segment_dur = float(args.speaker_bank_min_segment_dur)
+    if getattr(args, "speaker_bank_max_segment_dur", None) is not None:
+        config.max_segment_dur = float(args.speaker_bank_max_segment_dur)
+    if getattr(args, "speaker_bank_window_size", None) is not None:
+        config.window_size = float(args.speaker_bank_window_size)
+    if getattr(args, "speaker_bank_window_stride", None) is not None:
+        config.window_stride = float(args.speaker_bank_window_stride)
+    if getattr(args, "speaker_bank_max_embeddings", None) is not None:
+        config.max_embeddings_per_speaker = int(args.speaker_bank_max_embeddings)
+    if getattr(args, "speaker_bank_vad_chunk_stems", None) is not None:
+        config.vad_chunk_stems = bool(args.speaker_bank_vad_chunk_stems)
+    if getattr(args, "speaker_bank_pre_pad", None) is not None:
+        config.pre_pad = float(args.speaker_bank_pre_pad)
+    if getattr(args, "speaker_bank_post_pad", None) is not None:
+        config.post_pad = float(args.speaker_bank_post_pad)
+    if getattr(args, "speaker_bank_embed_workers", None) is not None:
+        config.embed_workers = int(args.speaker_bank_embed_workers)
+    if getattr(args, "speaker_bank_embed_batch_size", None) is not None:
+        config.embed_batch_size = int(args.speaker_bank_embed_batch_size)
+    if getattr(args, "speaker_bank_segments_json", None):
+        config.segments_path = str(args.speaker_bank_segments_json)
+    if getattr(args, "speaker_bank_match_per_segment", None) is not None:
+        config.match_per_segment = bool(args.speaker_bank_match_per_segment)
+    if getattr(args, "speaker_bank_match_aggregation", None):
+        config.match_aggregation = str(args.speaker_bank_match_aggregation)
+    if getattr(args, "speaker_bank_min_segments_per_label", None) is not None:
+        config.min_segments_per_label = int(args.speaker_bank_min_segments_per_label)
+    if getattr(args, "speaker_bank_prototypes", None) is not None:
+        config.prototypes_enabled = bool(args.speaker_bank_prototypes)
+    if getattr(args, "speaker_bank_prototypes_per_cluster", None) is not None:
+        config.prototypes_per_cluster = int(args.speaker_bank_prototypes_per_cluster)
+    if getattr(args, "speaker_bank_prototypes_method", None):
+        config.prototypes_method = str(args.speaker_bank_prototypes_method)
+
+    config.match_aggregation = (config.match_aggregation or "mean").lower()
+    config.prototypes_method = (config.prototypes_method or "central").lower()
 
     train_only = getattr(args, "speaker_bank_train_only", None)
     if train_only:
@@ -450,11 +617,16 @@ def run_speaker_bank_training(
     speaker_bank_config: SpeakerBankConfig,
     speaker_mapping_path: str | None = None,
     speaker_bank_root_override: str | None = None,
+    segments_json: str | None = None,
 ) -> None:
     if backend != "whisperx":
         raise SystemExit("Speaker bank training requires the whisperx backend")
 
-    from .whisperx_backend import extract_speaker_embeddings, _detect_device as _wx_detect_device
+    from .whisperx_backend import (
+        extract_embeddings_for_segments,
+        extract_speaker_embeddings,
+        _detect_device as _wx_detect_device,
+    )
 
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
@@ -531,6 +703,9 @@ def run_speaker_bank_training(
         cluster_method=speaker_bank_config.cluster_method,
         dbscan_eps=speaker_bank_config.cluster_eps,
         dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+        prototypes_enabled=speaker_bank_config.prototypes_enabled,
+        prototypes_per_cluster=speaker_bank_config.prototypes_per_cluster,
+        prototypes_method=speaker_bank_config.prototypes_method,
     )
     summary = {
         "profile": str(bank_profile_dir),
@@ -579,9 +754,239 @@ def run_speaker_bank_training(
         iter_files = progress_bar
 
     total_added = 0
+    segments_override_raw = segments_json or speaker_bank_config.segments_path
+    segments_override_path: Optional[Path] = None
+    if segments_override_raw:
+        candidate = Path(segments_override_raw).expanduser()
+        if candidate.exists():
+            segments_override_path = candidate
+        else:
+            logger.warning(
+                "Speaker bank training: segments path %s not found; ignoring",
+                candidate,
+            )
+
+    segment_source_pref = (speaker_bank_config.train_segment_source or "auto").lower()
+
+    from whisperx.audio import load_audio as _wx_load_audio, SAMPLE_RATE as _WX_SR  # local import
+
+    def _segment_filename_candidates(base: str) -> List[str]:
+        return [
+            f"{base}.jsonl",
+            f"{base}.json",
+            f"{base}.segments.json",
+            f"{base}.diarization.json",
+        ]
+
+    def _discover_segment_artifact(audio_file: Path) -> Optional[Path]:
+        seen: set[Path] = set()
+        candidates: List[Path] = []
+        if segments_override_path is not None:
+            if segments_override_path.is_file():
+                candidates.append(segments_override_path)
+            elif segments_override_path.is_dir():
+                for name in _segment_filename_candidates(audio_file.stem):
+                    candidates.append(segments_override_path / name)
+        outputs_dir = Path(".outputs") / audio_file.stem
+        if segment_source_pref in {"auto", "session_jsonl"}:
+            candidates.append(outputs_dir / f"{audio_file.stem}.jsonl")
+        if segment_source_pref in {"auto", "diarization_json"}:
+            candidates.append(outputs_dir / f"{audio_file.stem}.diarization.json")
+            candidates.append(outputs_dir / f"{audio_file.stem}.json")
+        for candidate in candidates:
+            expanded = candidate.expanduser()
+            if expanded in seen:
+                continue
+            seen.add(expanded)
+            if expanded.exists():
+                return expanded
+        return None
+
+    def _segment_matches(seg: TrainingSegment, audio_file: Path) -> bool:
+        seg_name = Path(seg.audio_file).name
+        if not seg_name:
+            return False
+        return (
+            seg_name == audio_file.name
+            or Path(seg_name).stem == audio_file.stem
+            or seg.audio_file == audio_file.name
+            or seg.audio_file == audio_file.stem
+        )
+
     for path in iter_files:
-        label, _matched = choose_speaker(path, mapping_pre, return_match=True)
-        logger.info("Training: extracting embeddings for %s (label=%s)", Path(path).name, label)
+        audio_path = Path(path)
+        audio_name = audio_path.name
+        file_summary: Dict[str, object] = {
+            "mode": "legacy",
+            "segments_source": None,
+            "windows_total": 0,
+        }
+
+        use_segments = speaker_bank_config.train_from_segments or segments_override_path is not None
+        segment_artifact: Optional[Path] = None
+        windows: List[SegmentWindow] = []
+
+        if use_segments:
+            segment_artifact = _discover_segment_artifact(audio_path)
+            if segment_artifact:
+                try:
+                    loaded_segments = load_segments_file(segment_artifact, mapping_pre or {})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Speaker bank training: failed to load segments from %s: %s",
+                        segment_artifact,
+                        exc,
+                    )
+                    loaded_segments = []
+                matching_segments = [
+                    seg for seg in loaded_segments if _segment_matches(seg, audio_path)
+                ]
+                if matching_segments:
+                    windows = generate_windows_for_segments(
+                        matching_segments,
+                        min_duration=speaker_bank_config.min_segment_dur,
+                        max_duration=speaker_bank_config.max_segment_dur,
+                        window_size=speaker_bank_config.window_size,
+                        window_stride=speaker_bank_config.window_stride,
+                    )
+                    file_summary["mode"] = "segments"
+                    file_summary["segments_source"] = str(segment_artifact)
+                else:
+                    logger.debug(
+                        "Speaker bank training: no matching segments for %s in %s",
+                        audio_name,
+                        segment_artifact,
+                    )
+            elif speaker_bank_config.train_from_segments:
+                logger.warning(
+                    "Speaker bank training: segment metadata not found for %s (source=%s)",
+                    audio_name,
+                    segment_source_pref,
+                )
+
+        if not windows and speaker_bank_config.vad_chunk_stems:
+            fallback_label, _ = choose_speaker(audio_name, mapping_pre, return_match=True)
+            if fallback_label:
+                try:
+                    waveform = _wx_load_audio(path)
+                    duration = len(waveform) / _WX_SR
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Speaker bank training: failed to load audio %s for chunking: %s",
+                        audio_name,
+                        exc,
+                    )
+                    duration = 0.0
+                if duration >= speaker_bank_config.min_segment_dur:
+                    base_segment = TrainingSegment(
+                        audio_file=audio_name,
+                        start=0.0,
+                        end=duration,
+                        speaker=fallback_label,
+                        speaker_raw=fallback_label,
+                    )
+                    windows = generate_windows_for_segments(
+                        [base_segment],
+                        min_duration=speaker_bank_config.min_segment_dur,
+                        max_duration=speaker_bank_config.max_segment_dur,
+                        window_size=speaker_bank_config.window_size,
+                        window_stride=speaker_bank_config.window_stride,
+                    )
+                    if windows:
+                        file_summary["mode"] = "segments"
+
+        windows_by_speaker: Dict[str, List[SegmentWindow]] = defaultdict(list)
+        for win in windows:
+            windows_by_speaker[win.speaker].append(win)
+
+        selected_windows: List[SegmentWindow] = []
+        limit = speaker_bank_config.max_embeddings_per_speaker
+        for speaker_label, win_list in windows_by_speaker.items():
+            win_list.sort(key=lambda w: (w.start, w.segment_index, w.window_index))
+            if limit and limit > 0 and len(win_list) > limit:
+                step = max(1, math.ceil(len(win_list) / limit))
+                sampled = win_list[::step]
+                if len(sampled) > limit:
+                    sampled = sampled[:limit]
+                selected_windows.extend(sampled)
+            else:
+                selected_windows.extend(win_list)
+
+        selected_windows.sort(key=lambda w: (w.start, w.segment_index, w.window_index))
+        file_summary["windows_total"] = len(selected_windows)
+
+        if selected_windows:
+            payload: List[Tuple[float, float, str]] = []
+            window_lookup: Dict[int, SegmentWindow] = {}
+            for idx, win in enumerate(selected_windows):
+                payload.append((win.start, win.end, win.speaker))
+                window_lookup[idx] = win
+
+            embed_results, embed_summary = extract_embeddings_for_segments(
+                path,
+                payload,
+                hf_token=hf_token,
+                force_device=device_guess,
+                quiet=quiet,
+                pre_pad=speaker_bank_config.pre_pad,
+                post_pad=speaker_bank_config.post_pad,
+                batch_size=speaker_bank_config.embed_batch_size,
+                workers=speaker_bank_config.embed_workers,
+            )
+
+            speaker_counts: Dict[str, int] = defaultdict(int)
+            added = 0
+            for result in embed_results:
+                win = window_lookup.get(result.index)
+                if win is None:
+                    continue
+                vector = np.asarray(result.embedding, dtype=np.float32)
+                speaker_bank.extend(
+                    [
+                        (
+                            win.speaker,
+                            vector,
+                            audio_name,
+                            {
+                                "mode": "train_from_segments",
+                                "segment_index": win.segment_index,
+                                "window_index": win.window_index,
+                                "start": win.start,
+                                "end": win.end,
+                                "speaker_raw": win.speaker_raw,
+                                "segments_source": file_summary["segments_source"],
+                            },
+                        )
+                    ]
+                )
+                speaker_counts[win.speaker] += 1
+                added += 1
+                total_added += 1
+
+            file_summary.update(
+                {
+                    "embeddings_added": added,
+                    "embedded": embed_summary.get("embedded"),
+                    "skipped": embed_summary.get("skipped"),
+                    "total_requests": embed_summary.get("total"),
+                    "speakers": dict(speaker_counts),
+                }
+            )
+
+            logger.info(
+                "Training: %s -> %d segment embedding(s) appended (total=%d)",
+                audio_name,
+                added,
+                total_added,
+            )
+            summary["files"][audio_name] = file_summary
+            if progress_bar:
+                progress_bar.set_postfix_str(f"added={total_added}")
+            continue
+
+        # Fallback legacy single-embedding path
+        label, _ = choose_speaker(path, mapping_pre, return_match=True)
+        logger.info("Training: extracting fallback embeddings for %s (label=%s)", audio_name, label)
         try:
             embeddings, _ = extract_speaker_embeddings(
                 path,
@@ -593,29 +998,47 @@ def run_speaker_bank_training(
                 quiet=quiet,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Speaker bank training: failed to extract embeddings for %s: %s", Path(path).name, exc)
+            logger.warning(
+                "Speaker bank training: failed to extract fallback embeddings for %s: %s",
+                audio_name,
+                exc,
+            )
+            summary["files"][audio_name] = file_summary
             continue
+
         added = 0
+        speaker_counts: Dict[str, int] = defaultdict(int)
         for diar_label, vec in embeddings.items():
+            target_speaker, _ = choose_speaker(diar_label, mapping_pre, return_match=True)
+            vector = np.asarray(vec, dtype=np.float32)
             speaker_bank.extend(
                 [
                     (
-                        label,
-                        np.asarray(vec, dtype=np.float32),
-                        Path(path).name,
+                        target_speaker,
+                        vector,
+                        audio_name,
                         {"diar_label": diar_label, "mode": "train_command"},
                     )
                 ]
             )
+            speaker_counts[target_speaker] += 1
             added += 1
             total_added += 1
-        summary["files"][Path(path).name] = {
-            "speaker": label,
-            "embeddings_added": added,
-        }
+
+        file_summary.update(
+            {
+                "embeddings_added": added,
+                "embedded": added,
+                "skipped": 0,
+                "total_requests": len(embeddings),
+                "speakers": dict(speaker_counts),
+                "speaker": label,
+            }
+        )
+        summary["files"][audio_name] = file_summary
         logger.info(
             "Training: %s -> %d embedding(s) appended (total=%d)",
-            Path(path).name,
+            audio_name,
             added,
             total_added,
         )
@@ -768,89 +1191,422 @@ def run_transcribe(
         embeddings: Dict[str, np.ndarray],
         file_key: str,
     ) -> Dict[str, object]:
-        summary = {
-            "attempted": len(embeddings),
+        file_path = Path(file_key)
+        file_name = file_path.name
+        summary: Dict[str, object] = {
+            "attempted": 0,
             "matched": 0,
             "matches": {},
             "segment_counts": {"matched": 0, "unknown": 0},
         }
-        if not speaker_bank or not speaker_bank_config or not embeddings:
+        logger.debug(
+            "Speaker bank apply start file=%s embeddings=%d labels=%s",
+            file_name,
+            len(embeddings),
+            list(embeddings.keys()),
+        )
+
+        if not speaker_bank or not speaker_bank_config:
+            logger.debug(
+                "No speaker bank configured for %s",
+                file_name,
+            )
             return summary
         if not speaker_bank_config.use_existing:
+            logger.debug(
+                "Speaker bank configured to skip existing matches for %s",
+                file_name,
+            )
             return summary
 
+        threshold = float(speaker_bank_config.threshold)
+        margin_required = max(float(speaker_bank_config.scoring_margin), 0.0)
+        radius_factor = float(speaker_bank_config.radius_factor)
+
+        # Track raw diarization labels per segment
+        label_to_segments: Dict[str, List[int]] = defaultdict(list)
+        segment_labels: Dict[int, Optional[str]] = {}
+        for idx, seg in enumerate(segments):
+            raw_label = seg.get("speaker")
+            seg["speaker_raw"] = raw_label
+            segment_labels[idx] = raw_label
+            if raw_label:
+                label_to_segments[raw_label].append(idx)
+
+        segment_matches: Dict[int, Dict[str, object]] = {}
+        label_stats: Dict[str, Dict[str, object]] = {}
+
+        if speaker_bank_config.match_per_segment and segments:
+            def _segment_level_match() -> Tuple[Dict[int, Dict[str, object]], Dict[str, Dict[str, object]], Dict[str, object]]:
+                payload: List[Tuple[float, float, str]] = []
+                index_map: List[int] = []
+                label_stats_local: Dict[str, Dict[str, object]] = {}
+                for idx, seg in enumerate(segments):
+                    raw_label = segment_labels[idx]
+                    if not raw_label:
+                        continue
+                    start = float(seg.get("start") or 0.0)
+                    end = float(seg.get("end") or 0.0)
+                    if end <= start:
+                        continue
+                    payload.append((start, end, raw_label))
+                    index_map.append(idx)
+                    stats = label_stats_local.setdefault(
+                        raw_label,
+                        {
+                            "segments_total": 0,
+                            "segments_indices": [],
+                            "matches_by_speaker": defaultdict(list),
+                            "aggregation": speaker_bank_config.match_aggregation.lower(),
+                        },
+                    )
+                    stats["segments_total"] += 1
+                    stats["segments_indices"].append(idx)
+
+                if not payload:
+                    return {}, {}, {"embedded": 0, "skipped": 0, "total": 0}
+
+                try:
+                    embed_results, embed_summary = extract_embeddings_for_segments(
+                        file_key,
+                        payload,
+                        hf_token=hf_token,
+                        force_device=device_guess,
+                        quiet=quiet,
+                        pre_pad=speaker_bank_config.pre_pad,
+                        post_pad=speaker_bank_config.post_pad,
+                        batch_size=speaker_bank_config.embed_batch_size,
+                        workers=speaker_bank_config.embed_workers,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Segment embedding extraction failed for %s: %s",
+                        file_name,
+                        exc,
+                    )
+                    return {}, {}, {"error": str(exc)}
+
+                seg_matches: Dict[int, Dict[str, object]] = {}
+                for idx in index_map:
+                    seg_matches[idx] = {
+                        "accepted": False,
+                        "match": None,
+                        "top_score": None,
+                        "second_best": None,
+                        "margin": None,
+                        "candidates": [],
+                    }
+
+                for result in embed_results:
+                    if result.index >= len(index_map):
+                        continue
+                    seg_idx = index_map[result.index]
+                    raw_label = segment_labels.get(seg_idx)
+                    if not raw_label:
+                        continue
+                    candidates = speaker_bank.score_candidates(
+                        result.embedding,
+                        radius_factor=radius_factor,
+                    )
+                    top1 = candidates[0] if candidates else None
+                    top2_score = candidates[1]["score"] if len(candidates) > 1 else None
+                    margin_value = (
+                        (top1["score"] - top2_score)
+                        if top1 and top2_score is not None
+                        else (top1["score"] if top1 else None)
+                    )
+                    accepted = bool(
+                        top1
+                        and top1["score"] >= threshold
+                        and (margin_value if margin_value is not None else 0.0) >= margin_required
+                    )
+                    match_payload = None
+                    if accepted and top1:
+                        match_payload = {
+                            "speaker": top1["speaker"],
+                            "cluster_id": top1["cluster_id"],
+                            "score": top1["score"],
+                            "distance": top1["distance"],
+                            "margin": margin_value,
+                            "second_best": top2_score,
+                            "source": f"segment_{top1.get('source', 'centroid')}",
+                        }
+                        stats = label_stats_local.setdefault(
+                            raw_label,
+                            {
+                                "segments_total": 0,
+                                "segments_indices": [],
+                                "matches_by_speaker": defaultdict(list),
+                                "aggregation": speaker_bank_config.match_aggregation.lower(),
+                            },
+                        )
+                        stats["matches_by_speaker"][top1["speaker"]].append(seg_idx)
+                    seg_matches[seg_idx] = {
+                        "accepted": accepted,
+                        "match": match_payload,
+                        "top_score": top1["score"] if top1 else None,
+                        "second_best": top2_score,
+                        "margin": margin_value,
+                        "candidates": candidates[:3],
+                    }
+
+                # Aggregation per label
+                for label, stats in label_stats_local.items():
+                    matches_by_speaker = stats.setdefault("matches_by_speaker", defaultdict(list))
+                    matched_total = sum(len(v) for v in matches_by_speaker.values())
+                    stats["segments_matched"] = matched_total
+                    aggregation = stats.get("aggregation", "mean").lower()
+                    selection = None
+                    margin_label = None
+                    second_metric = None
+                    score_metric = None
+                    if matched_total >= max(1, speaker_bank_config.min_segments_per_label):
+                        if aggregation == "vote":
+                            counts = {spk: len(idxs) for spk, idxs in matches_by_speaker.items()}
+                            if counts:
+                                sorted_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+                                best_speaker, best_count = sorted_counts[0]
+                                second_count = sorted_counts[1][1] if len(sorted_counts) > 1 else 0
+                                total = float(matched_total)
+                                ratio_best = best_count / total if total else 0.0
+                                ratio_second = second_count / total if total else 0.0
+                                margin_label = ratio_best - ratio_second
+                                second_metric = ratio_second
+                                if margin_label >= margin_required:
+                                    # representative segment: highest score for this speaker
+                                    best_indices = matches_by_speaker[best_speaker]
+                                    best_idx = max(
+                                        best_indices,
+                                        key=lambda i: seg_matches[i]["match"]["score"],  # type: ignore[index]
+                                    )
+                                    best_match = seg_matches[best_idx]["match"]
+                                    score_metric = float(np.mean([seg_matches[i]["match"]["score"] for i in best_indices]))  # type: ignore[index]
+                                    selection = {
+                                        "speaker": best_speaker,
+                                        "cluster_id": best_match.get("cluster_id") if best_match else None,
+                                        "score": score_metric,
+                                        "score_max": best_match.get("score") if best_match else None,
+                                        "distance": best_match.get("distance") if best_match else None,
+                                        "margin": margin_label,
+                                        "second_best": ratio_second,
+                                        "source": f"segment_vote",
+                                        "segments_count": len(best_indices),
+                                    }
+                            stats["vote_counts"] = counts if counts else {}
+                            stats["best_ratio"] = ratio_best if counts else None
+                            stats["second_ratio"] = ratio_second if counts else None
+                        else:
+                            speaker_means: Dict[str, float] = {}
+                            speaker_best_index: Dict[str, int] = {}
+                            for spk, idxs in matches_by_speaker.items():
+                                scores = [seg_matches[i]["match"]["score"] for i in idxs if seg_matches[i]["match"]]
+                                if not scores:
+                                    continue
+                                mean_score = float(np.mean(scores))
+                                speaker_means[spk] = mean_score
+                                speaker_best_index[spk] = max(
+                                    idxs,
+                                    key=lambda i: seg_matches[i]["match"]["score"],  # type: ignore[index]
+                                )
+                            if speaker_means:
+                                sorted_means = sorted(speaker_means.items(), key=lambda item: item[1], reverse=True)
+                                best_speaker, best_mean = sorted_means[0]
+                                second_mean = sorted_means[1][1] if len(sorted_means) > 1 else 0.0
+                                margin_label = best_mean - second_mean
+                                second_metric = second_mean
+                                if margin_label >= margin_required:
+                                    best_idx = speaker_best_index[best_speaker]
+                                    best_match = seg_matches[best_idx]["match"]
+                                    selection = {
+                                        "speaker": best_speaker,
+                                        "cluster_id": best_match.get("cluster_id") if best_match else None,
+                                        "score": best_mean,
+                                        "score_max": best_match.get("score") if best_match else None,
+                                        "distance": best_match.get("distance") if best_match else None,
+                                        "margin": margin_label,
+                                        "second_best": second_mean,
+                                        "source": "segment_mean",
+                                        "segments_count": len(matches_by_speaker[best_speaker]),
+                                    }
+                            stats["means"] = speaker_means
+                    stats["selection"] = selection
+                    stats["margin"] = margin_label
+                    stats["second_metric"] = second_metric
+                    stats["score_metric"] = score_metric
+
+                debug_payload = {
+                    "embedding": embed_summary,
+                    "labels": {
+                        label: {
+                            "segments_total": stats.get("segments_total"),
+                            "segments_matched": stats.get("segments_matched"),
+                            "aggregation": stats.get("aggregation"),
+                            "margin": stats.get("margin"),
+                        }
+                        for label, stats in label_stats_local.items()
+                    },
+                }
+                return seg_matches, label_stats_local, debug_payload
+
+            segment_matches, label_stats, segment_debug = _segment_level_match()
+            if segment_debug:
+                summary["segment_debug"] = segment_debug
+        else:
+            for label, indices in label_to_segments.items():
+                label_stats[label] = {
+                    "segments_total": len(indices),
+                    "segments_matched": 0,
+                    "aggregation": speaker_bank_config.match_aggregation.lower(),
+                    "matches_by_speaker": {},
+                    "selection": None,
+                }
+
+        # Begin determining label-level matches
         label_matches: Dict[str, Optional[Dict[str, object]]] = {}
+        for label, stats in label_stats.items():
+            selection = stats.get("selection")
+            if selection:
+                match_dict = {
+                    "speaker": selection.get("speaker"),
+                    "cluster_id": selection.get("cluster_id"),
+                    "score": selection.get("score"),
+                    "score_max": selection.get("score_max"),
+                    "distance": selection.get("distance"),
+                    "margin": selection.get("margin"),
+                    "second_best": selection.get("second_best"),
+                    "source": selection.get("source"),
+                }
+                label_matches[label] = match_dict
+            else:
+                label_matches[label] = None
+
+        # Fallback to diar-label embeddings for any remaining labels
         for label, vector in embeddings.items():
+            if label in label_matches and label_matches[label]:
+                continue
             try:
                 match = speaker_bank.match(
                     vector,
-                    threshold=speaker_bank_config.threshold,
-                    radius_factor=speaker_bank_config.radius_factor,
+                    threshold=threshold,
+                    radius_factor=radius_factor,
+                    margin=margin_required,
                 )
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger("transcriber").warning(
                     "Speaker bank match failed for %s (%s): %s",
-                    Path(file_key).name,
+                    file_name,
                     label,
                     exc,
                 )
                 match = None
             if match:
-                summary["matched"] += 1
-                label_matches[label] = match
-            else:
-                label_matches[label] = None
-            summary["matches"][label] = match
+                match["source"] = "label_vector"
+            label_matches[label] = match
+
+        summary["attempted"] = len(label_matches)
+        summary["matched"] = sum(1 for match in label_matches.values() if match)
 
         matched_segments = 0
         unknown_segments = 0
-        for seg in segments:
-            raw_label = seg.get("speaker")
-            if raw_label is None:
-                continue
-            seg["speaker_raw"] = raw_label
-            if raw_label not in label_matches:
-                continue
-            match = label_matches[raw_label]
-            if match:
-                seg["speaker"] = match["speaker"]
-                seg["speaker_match"] = {
-                    "speaker": match["speaker"],
-                    "score": float(match["score"]),
-                    "cluster_id": match["cluster_id"],
-                    "distance": float(match["distance"]),
-                    "source": "speaker_bank",
-                    "label": raw_label,
+
+        for label, match in label_matches.items():
+            # Record label stats for summary
+            if label in label_stats:
+                stats = label_stats[label]
+                summary.setdefault("label_stats", {})[label] = {
+                    "segments_total": stats.get("segments_total"),
+                    "segments_matched": stats.get("segments_matched"),
+                    "aggregation": stats.get("aggregation"),
+                    "margin": stats.get("margin"),
                 }
-                seg["speaker_match_score"] = float(match["score"])
-                seg["speaker_match_distance"] = float(match["distance"])
-                seg["speaker_match_cluster"] = match["cluster_id"]
-                seg["speaker_match_source"] = "speaker_bank"
-                matched_segments += 1
             else:
-                seg["speaker"] = "unknown"
-                seg["speaker_match"] = {
+                summary.setdefault("label_stats", {})[label] = {}
+
+            summary["matches"][label] = match
+
+            segment_indices = label_to_segments.get(label, [])
+            for idx in segment_indices:
+                seg = segments[idx]
+                seg_match_info = segment_matches.get(idx)
+                if match:
+                    seg["speaker"] = match["speaker"]
+                    if (
+                        seg_match_info
+                        and seg_match_info.get("accepted")
+                        and seg_match_info["match"]
+                        and seg_match_info["match"]["speaker"] == match["speaker"]
+                    ):
+                        seg_details = dict(seg_match_info["match"])
+                        seg_details["label"] = label
+                        seg["speaker_match"] = seg_details
+                        seg["speaker_match_source"] = seg_details.get("source", "speaker_bank_segment")
+                    else:
+                        seg["speaker_match"] = {
+                            "speaker": match["speaker"],
+                            "score": match.get("score"),
+                            "cluster_id": match.get("cluster_id"),
+                            "distance": match.get("distance"),
+                            "margin": match.get("margin"),
+                            "second_best": match.get("second_best"),
+                            "source": match.get("source") or "speaker_bank",
+                            "label": label,
+                        }
+                        seg["speaker_match_source"] = match.get("source") or "speaker_bank"
+                    seg["speaker_match_score"] = seg["speaker_match"].get("score")
+                    seg["speaker_match_distance"] = seg["speaker_match"].get("distance")
+                    seg["speaker_match_cluster"] = seg["speaker_match"].get("cluster_id")
+                    matched_segments += 1
+                else:
+                    seg["speaker"] = "unknown"
+                    seg["speaker_match"] = {
+                        "speaker": None,
+                        "score": None,
+                        "cluster_id": None,
+                        "distance": None,
+                        "source": "speaker_bank",
+                        "label": label,
+                    }
+                    seg["speaker_match_score"] = None
+                    seg["speaker_match_distance"] = None
+                    seg["speaker_match_cluster"] = None
+                    seg["speaker_match_source"] = "speaker_bank"
+                    unknown_segments += 1
+
+        # Segments without labels default to unknown
+        for idx, seg in enumerate(segments):
+            if segment_labels.get(idx) is None:
+                if not seg.get("speaker"):
+                    seg["speaker"] = "unknown"
+                    unknown_segments += 1
+                seg.setdefault("speaker_match", {
                     "speaker": None,
                     "score": None,
                     "cluster_id": None,
                     "distance": None,
                     "source": "speaker_bank",
-                    "label": raw_label,
-                }
-                seg["speaker_match_score"] = None
-                seg["speaker_match_distance"] = None
-                seg["speaker_match_cluster"] = None
-                seg["speaker_match_source"] = "speaker_bank"
-                unknown_segments += 1
+                    "label": None,
+                })
+                seg.setdefault("speaker_match_source", "speaker_bank")
+                seg.setdefault("speaker_match_score", None)
+                seg.setdefault("speaker_match_distance", None)
+                seg.setdefault("speaker_match_cluster", None)
+
         summary["segment_counts"]["matched"] = matched_segments
         summary["segment_counts"]["unknown"] = unknown_segments
+
         if summary["attempted"]:
             logging.getLogger("transcriber").info(
                 "Speaker bank matched %d/%d diar speakers for %s",
                 summary["matched"],
                 summary["attempted"],
-                Path(file_key).name,
+                file_name,
             )
+        logger.debug(
+            "Speaker bank apply complete file=%s matched_segments=%d unknown_segments=%d",
+            file_name,
+            matched_segments,
+            unknown_segments,
+        )
         return summary
 
     if speaker_bank_config:
@@ -866,8 +1622,16 @@ def run_transcribe(
             cluster_method=speaker_bank_config.cluster_method,
             dbscan_eps=speaker_bank_config.cluster_eps,
             dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+            prototypes_enabled=speaker_bank_config.prototypes_enabled,
+            prototypes_per_cluster=speaker_bank_config.prototypes_per_cluster,
+            prototypes_method=speaker_bank_config.prototypes_method,
         )
         bank_info = speaker_bank.summary()
+        logger.debug(
+            "Speaker bank summary initial profile=%s data=%s",
+            speaker_bank_profile_dir,
+            bank_info,
+        )
         speaker_bank_summary = {
             "profile": str(bank_profile_dir),
             "initial": bank_info,
@@ -876,6 +1640,13 @@ def run_transcribe(
                 "radius_factor": speaker_bank_config.radius_factor,
                 "use_existing": speaker_bank_config.use_existing,
                 "train_from_stems": speaker_bank_config.train_from_stems,
+                "margin": speaker_bank_config.scoring_margin,
+                "match_per_segment": speaker_bank_config.match_per_segment,
+                "match_aggregation": speaker_bank_config.match_aggregation,
+                "min_segments_per_label": speaker_bank_config.min_segments_per_label,
+                "prototypes_enabled": speaker_bank_config.prototypes_enabled,
+                "prototypes_per_cluster": speaker_bank_config.prototypes_per_cluster,
+                "prototypes_method": speaker_bank_config.prototypes_method,
             },
             "files": {},
         }
@@ -891,6 +1662,7 @@ def run_transcribe(
         from .whisperx_backend import (
             transcribe_with_whisperx,
             extract_speaker_embeddings,
+            extract_embeddings_for_segments,
             _detect_device as _wx_detect_device,
         )
         # Accept common token env vars for gated models
@@ -1014,6 +1786,13 @@ def run_transcribe(
                 pbar.close()
             dur = int(time.time() - start_ts)
             logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
+            logger.debug(
+                "WhisperX result file=%s diar_segments=%d embeddings=%d labels=%s",
+                Path(f).name,
+                len(diar or []),
+                len(speaker_embeddings),
+                list(speaker_embeddings.keys()),
+            )
             summary = {
                 "attempted": len(speaker_embeddings),
                 "matched": 0,
@@ -1164,6 +1943,109 @@ def run_transcribe(
             per_file_segments.append((f, segs))
 
     base = Path(input_path).stem
+
+    def _normalise_per_file_segments(
+        payload: List[Tuple[str, List[dict]]]
+    ) -> Tuple[List[Tuple[str, List[dict]]], set[str]]:
+        normalised: List[Tuple[str, List[dict]]] = []
+        kept: set[str] = set()
+        for idx, entry in enumerate(payload):
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                fname, segs_obj = entry
+            elif isinstance(entry, dict) and len(entry) == 1:
+                (fname, segs_obj), = entry.items()
+            else:
+                logger.warning(
+                    "Unexpected segment payload at index %d: %r (skipping)",
+                    idx,
+                    entry,
+                )
+                continue
+
+            fname_str = str(fname)
+            seg_iterable: List[dict] = []
+            if isinstance(segs_obj, dict) and "segments" in segs_obj:
+                candidate = segs_obj.get("segments") or []
+                if isinstance(candidate, (list, tuple)):
+                    seg_iterable = list(candidate)
+                elif hasattr(candidate, "__iter__") and not isinstance(candidate, (str, bytes)):
+                    seg_iterable = list(candidate)
+            elif isinstance(segs_obj, (list, tuple)):
+                seg_iterable = list(segs_obj)
+            elif hasattr(segs_obj, "__iter__") and not isinstance(segs_obj, (str, bytes)):
+                seg_iterable = list(segs_obj)
+            else:
+                logger.warning(
+                    "Unsupported segment container for %s (type=%s); skipping file.",
+                    fname_str,
+                    type(segs_obj).__name__,
+                )
+                continue
+
+            cleaned_segments: List[dict] = []
+            for seg in seg_iterable:
+                if isinstance(seg, dict):
+                    cleaned_segments.append(seg)
+                elif hasattr(seg, "to_dict"):
+                    try:
+                        cleaned_segments.append(seg.to_dict())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "Failed to convert segment to dict for %s: %s", fname_str, exc
+                        )
+                else:
+                    logger.debug(
+                        "Dropping non-dict segment for %s: %r", fname_str, seg
+                    )
+            normalised.append((fname_str, cleaned_segments))
+            kept.add(fname_str)
+        return normalised, kept
+
+    per_file_segments, _kept_files = _normalise_per_file_segments(per_file_segments)
+
+    def _normalise_diarization(
+        payload: Dict[str, List[dict]] | Dict[str, object] | None,
+        kept: set[str],
+    ) -> Dict[str, List[dict]]:
+        if not payload:
+            return {}
+        normalised: Dict[str, List[dict]] = {}
+        for key, value in payload.items():
+            fname = str(key)
+            if fname not in kept:
+                continue
+            entries: List[dict] = []
+            candidates: List[object] = []
+            if isinstance(value, dict) and "segments" in value:
+                segment_block = value.get("segments") or []
+                if isinstance(segment_block, (list, tuple)):
+                    candidates = list(segment_block)
+                elif hasattr(segment_block, "__iter__") and not isinstance(segment_block, (str, bytes)):
+                    candidates = list(segment_block)
+            elif isinstance(value, (list, tuple)):
+                candidates = list(value)
+            elif hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+                candidates = list(value)
+            else:
+                logger.debug(
+                    "Unsupported diarization payload for %s (type=%s); skipping.",
+                    fname,
+                    type(value).__name__,
+                )
+                continue
+            for item in candidates:
+                if isinstance(item, dict):
+                    entries.append(item)
+                elif hasattr(item, "to_dict"):
+                    try:
+                        entries.append(item.to_dict())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Failed to convert diarization entry for %s: %s", fname, exc)
+            if entries:
+                normalised[fname] = entries
+        return normalised
+
+    diar_by_file = _normalise_diarization(diar_by_file, _kept_files)
 
     # Optional speaker renaming and filename-based labeling (prototype parity)
     # Reload mapping after transcription for application (kept separate from progress labels)
@@ -1568,6 +2450,12 @@ def main():
         help="Cosine similarity threshold to accept a speaker match",
     )
     ap.add_argument(
+        "--speaker-bank-margin",
+        dest="speaker_bank_margin",
+        type=float,
+        help="Minimum margin between top-1 and top-2 scores to accept a speaker match.",
+    )
+    ap.add_argument(
         "--speaker-bank-radius-factor",
         type=float,
         help="Radius multiplier used when validating cluster membership",
@@ -1627,9 +2515,150 @@ def main():
         help="DBSCAN min_samples value for clustering speaker embeddings",
     )
     ap.add_argument(
+        "--speaker-bank-prototypes",
+        dest="speaker_bank_prototypes",
+        action="store_true",
+        default=None,
+        help="Enable prototype-based speaker matching (in addition to cluster centroids).",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-prototypes",
+        dest="speaker_bank_prototypes",
+        action="store_false",
+        help="Disable prototype-based speaker matching.",
+    )
+    ap.add_argument(
+        "--speaker-bank-prototypes-per-cluster",
+        dest="speaker_bank_prototypes_per_cluster",
+        type=int,
+        help="Number of prototype embeddings to retain per speaker cluster.",
+    )
+    ap.add_argument(
+        "--speaker-bank-prototypes-method",
+        dest="speaker_bank_prototypes_method",
+        choices=["central", "kmeans"],
+        help="Prototype selection strategy (default: central).",
+    )
+    ap.add_argument(
         "--speaker-bank-train-only",
         metavar="AUDIO_PATH",
         help="Train or update the speaker bank using audio without running transcription",
+    )
+    ap.add_argument(
+        "--segments-json",
+        dest="speaker_bank_segments_json",
+        help="JSON/JSONL file or directory containing labeled segments for speaker-bank training",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-from-segments",
+        dest="speaker_bank_train_from_segments",
+        action="store_true",
+        default=None,
+        help="Enable training from pre-computed segments (JSON/JSONL).",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-train-from-segments",
+        dest="speaker_bank_train_from_segments",
+        action="store_false",
+        help="Disable training from pre-computed segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-segment-source",
+        dest="speaker_bank_train_segment_source",
+        choices=["auto", "session_jsonl", "diarization_json"],
+        help="Preferred artifact when auto-discovering segment metadata (default: auto).",
+    )
+    ap.add_argument(
+        "--speaker-bank-min-segment-dur",
+        dest="speaker_bank_min_segment_dur",
+        type=float,
+        help="Minimum segment/window duration in seconds when training from segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-max-segment-dur",
+        dest="speaker_bank_max_segment_dur",
+        type=float,
+        help="Maximum segment/window duration in seconds when training from segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-window-size",
+        dest="speaker_bank_window_size",
+        type=float,
+        help="Sliding window size in seconds for segment chunking (<=0 uses the full segment).",
+    )
+    ap.add_argument(
+        "--speaker-bank-window-stride",
+        dest="speaker_bank_window_stride",
+        type=float,
+        help="Stride in seconds between sliding windows (<=0 defaults to the window size).",
+    )
+    ap.add_argument(
+        "--speaker-bank-max-embeddings",
+        dest="speaker_bank_max_embeddings",
+        type=int,
+        help="Maximum number of embeddings to retain per speaker during training (<=0 = unlimited).",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-chunk-stems",
+        dest="speaker_bank_vad_chunk_stems",
+        action="store_true",
+        default=None,
+        help="Chunk single-speaker stems into windows when segment metadata is unavailable.",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-train-chunk-stems",
+        dest="speaker_bank_vad_chunk_stems",
+        action="store_false",
+        help="Do not chunk stems when segment metadata is unavailable.",
+    )
+    ap.add_argument(
+        "--speaker-bank-pre-pad",
+        dest="speaker_bank_pre_pad",
+        type=float,
+        help="Seconds of audio to prepend to each training window when extracting embeddings.",
+    )
+    ap.add_argument(
+        "--speaker-bank-post-pad",
+        dest="speaker_bank_post_pad",
+        type=float,
+        help="Seconds of audio to append to each training window when extracting embeddings.",
+    )
+    ap.add_argument(
+        "--speaker-bank-embed-workers",
+        dest="speaker_bank_embed_workers",
+        type=int,
+        help="Number of CPU workers used to crop training segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-embed-batch-size",
+        dest="speaker_bank_embed_batch_size",
+        type=int,
+        help="Number of segment windows to embed per GPU forward batch.",
+    )
+    ap.add_argument(
+        "--speaker-bank-match-per-segment",
+        dest="speaker_bank_match_per_segment",
+        action="store_true",
+        default=None,
+        help="Match each diarization segment against the speaker bank and aggregate per label.",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-match-per-segment",
+        dest="speaker_bank_match_per_segment",
+        action="store_false",
+        help="Disable per-segment speaker-bank matching.",
+    )
+    ap.add_argument(
+        "--speaker-bank-match-aggregation",
+        dest="speaker_bank_match_aggregation",
+        choices=["mean", "vote"],
+        help="Aggregation strategy for segment-level matches (default: mean).",
+    )
+    ap.add_argument(
+        "--speaker-bank-min-segments-per-label",
+        dest="speaker_bank_min_segments_per_label",
+        type=int,
+        help="Minimum number of matched segments required before assigning a speaker to a diar label.",
     )
 
     _apply_config_defaults(ap, cfg)
@@ -1663,6 +2692,7 @@ def main():
             speaker_bank_config=speaker_bank_config or SpeakerBankConfig(),
             speaker_mapping_path=args.speaker_mapping,
             speaker_bank_root_override=args.speaker_bank_root,
+            segments_json=args.speaker_bank_segments_json,
         )
         return
 

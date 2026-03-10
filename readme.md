@@ -58,6 +58,10 @@ Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; f
 - Profiles live under the cache root (`<cache>/speaker_bank/<profile>/` by default). Override with `--speaker-bank-path` or `speaker_bank.path`.
 - Store bank data separately from Hugging Face caches by combining `--speaker-bank-root` with `--hf-cache-root`; useful when models are shared globally but embeddings stay project-local.
 - Train incrementally from single-speaker stems with `--speaker-bank-train-stems`; updates are persisted automatically and a PCA snapshot is stored alongside debug summaries.
+- Chunked training from labelled segments (`--segments-json` or `speaker_bank.train.from_segments`) generates dozens of embeddings per speaker. Segment artifacts are auto-discovered from `.outputs/<session>/<session>.jsonl` or `.diarization.json`; control with `speaker_bank.train.segment_source`.
+- Configure chunk sizing via `speaker_bank.train.window_size`/`window_stride`, limit samples per speaker with `speaker_bank.train.max_embeddings_per_speaker`, and pad windows using `speaker_bank.train.pre_pad`/`post_pad` to absorb alignment drift.
+- Use `--speaker-bank-train-only PATH --segments-json DIR` to regenerate the bank from processed sessions, then run transcription normally to apply the refreshed clusters.
+- For matching, enable per-segment aggregation (`speaker_bank.match_per_segment: true`), adjust acceptance with `speaker_bank.scoring_margin`, and tune prototype density with `speaker_bank.prototypes_per_cluster` to increase recall on cross-domain audio while preserving precision.
 - Match mixed files against the bank during transcription; unmatched segments are labelled `unknown` and retain their raw diarization label in `speaker_raw` for inspection.
 - Run offline training on processed audio with `--speaker-bank-train-only PATH` to ingest new voices without triggering transcription.
 
