@@ -14,12 +14,12 @@ lint:
 test:
 	uv run pytest -q
 
-# Local GPU run (WhisperX backend by default)
+# Local GPU run (faster-whisper + direct pyannote by default)
 run:
-	uv run transcribe $(INPUT) --model $(MODEL) --output-dir outputs --backend whisperx \
+	uv run transcribe $(INPUT) --model $(MODEL) --output-dir outputs --backend faster \
 	--device $(DEVICE) --min-speakers $(MIN) --max-speakers $(MAX)
 
-# Container build and run (GPU): adjust CUDA/torch channel via ARGs if needed
+# Container build and run (GPU)
 docker-build:
 	docker build -t transcriber:gpu .
 
@@ -31,7 +31,7 @@ docker-run:
 	  -e HF_TOKEN=$$HF_TOKEN \
 	  -w /app \
 	  transcriber:gpu \
-	  "uv run transcribe $(INPUT) --model $(MODEL) --output-dir /app/outputs --backend whisperx --device $(DEVICE) --min-speakers $(MIN) --max-speakers $(MAX)"
+	  "uv run transcribe $(INPUT) --model $(MODEL) --output-dir /app/outputs --backend faster --device $(DEVICE) --min-speakers $(MIN) --max-speakers $(MAX)"
 
 docker-run-watch:
 	docker run --rm --gpus all \

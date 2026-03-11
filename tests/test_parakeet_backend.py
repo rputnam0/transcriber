@@ -19,6 +19,11 @@ class _FakeResult:
         self.text = text
 
 
+class _FakeNemoResult:
+    def __init__(self, segments) -> None:
+        self.timestamp = {"segment": segments}
+
+
 class _FakeModel:
     def __init__(self, result) -> None:
         self.result = result
@@ -34,6 +39,7 @@ def test_resolve_model_name_maps_default_whisper_aliases():
     assert resolve_model_name("large-v3") == DEFAULT_MODEL_NAME
     assert resolve_model_name("medium.en") == DEFAULT_MODEL_NAME
     assert resolve_model_name("parakeet-tdt-0.6b-v3") == DEFAULT_MODEL_NAME
+    assert resolve_model_name("mlx-community/parakeet-tdt-0.6b-v3") == DEFAULT_MODEL_NAME
     assert resolve_model_name("custom/model") == "custom/model"
 
 
@@ -55,6 +61,23 @@ def test_transcribe_file_maps_sentences_to_repo_segments():
     ]
     assert model.calls[0][1]["chunk_duration"] == 120.0
     assert model.calls[0][1]["overlap_duration"] == 15.0
+
+
+def test_transcribe_file_maps_nemo_timestamps_to_repo_segments():
+    result = _FakeNemoResult(
+        [
+            {"start": 0.1, "end": 0.9, "segment": "Hello there"},
+            {"start": 1.2, "end": 1.8, "segment": "General Kenobi"},
+        ]
+    )
+    handle = types.SimpleNamespace(runtime="nemo", model=_FakeModel([result]))
+
+    segs = transcribe_file("sample.wav", handle)
+
+    assert segs == [
+        {"start": 0.1, "end": 0.9, "text": "Hello there", "speaker": None},
+        {"start": 1.2, "end": 1.8, "text": "General Kenobi", "speaker": None},
+    ]
 
 
 def test_resolve_dtype_respects_float16_alias(monkeypatch):

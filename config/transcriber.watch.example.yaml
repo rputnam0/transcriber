@@ -1,4 +1,4 @@
-backend: whisperx
+backend: faster
 device: auto
 model: large-v3
 compute_type: float16

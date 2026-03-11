@@ -79,11 +79,7 @@ def choose_speaker(
                 result = value
                 return (result, True) if return_match else result
             key_simple = key_simplified.get(key)
-            if (
-                simplified
-                and key_simple
-                and (simplified in key_simple or key_simple in simplified)
-            ):
+            if simplified and key_simple and (simplified in key_simple or key_simple in simplified):
                 result = value
                 return (result, True) if return_match else result
 
@@ -113,6 +109,7 @@ def save_outputs(
     per_file_segments: List[Tuple[str, List[dict]]],
     consolidated_pairs: List[Tuple[str, str, str]],
     diar_by_file: Dict[str, List[dict]] | None,
+    exclusive_diar_by_file: Dict[str, List[dict]] | None = None,
     write_srt_file: bool = True,
     write_jsonl_file: bool = True,
 ) -> Path:
@@ -155,6 +152,8 @@ def save_outputs(
                             record[meta_key] = segment.get(meta_key)
                     if "speaker_match" in segment:
                         record["speaker_match"] = segment["speaker_match"]
+                    if "words" in segment:
+                        record["words"] = segment["words"]
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     if write_srt_file:
@@ -191,5 +190,20 @@ def save_outputs(
             for filename, entries in diar_by_file.items()
         }
         diar_path.write_text(json.dumps(serialisable, indent=2), encoding="utf-8")
+
+    if exclusive_diar_by_file:
+        exclusive_path = out_dir / f"{base_stem}.exclusive_diarization.json"
+        serialisable = {
+            Path(filename).name: [
+                {
+                    "start": float(entry.get("start") or 0.0),
+                    "end": float(entry.get("end") or 0.0),
+                    "speaker": entry.get("speaker"),
+                }
+                for entry in entries
+            ]
+            for filename, entries in exclusive_diar_by_file.items()
+        }
+        exclusive_path.write_text(json.dumps(serialisable, indent=2), encoding="utf-8")
 
     return out_dir

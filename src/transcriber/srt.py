@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Tuple
 
+
 def _fmt_srt_ts(seconds: float) -> str:
     """Format seconds as SRT timestamp with correct rounding and carry.
 
@@ -13,6 +14,7 @@ def _fmt_srt_ts(seconds: float) -> str:
     m, rem = divmod(rem, 60_000)
     s, ms = divmod(rem, 1_000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
 
 def write_srt(path: Path, items: Iterable[Tuple[int, float, float, str]]) -> None:
     """Write a basic SRT file.

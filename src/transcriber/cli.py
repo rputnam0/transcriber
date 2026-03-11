@@ -6,20 +6,35 @@ import sys
 import logging
 import os
 import shutil
+import math
+import platform
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import yaml
 import time
 from tqdm import tqdm
 
-from .audio import gather_inputs, cleanup_tmp, is_audio_file
+from .audio import cleanup_tmp, gather_inputs, is_audio_file, load_audio_mono
+from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
 from .consolidate import consolidate, save_outputs, choose_speaker
+from .segment_classifier import (
+    load_segment_classifier,
+    train_segment_classifier_from_multitrack,
+)
 from .speaker_bank import SpeakerBank, SpeakerBankConfig
+from .segments import (
+    SegmentWindow,
+    TrainingSegment,
+    generate_windows_for_segments,
+    load_segments_file,
+)
 
 # Keep global references to preloaded CUDA libraries so they aren't dlclosed
 _CUDA_PRELOAD_HANDLES: list = []
+
 
 def _ensure_cuda_libs_on_path() -> None:
     """Expose bundled CUDA libraries (cudnn/cublas) to the dynamic loader.
@@ -55,6 +70,7 @@ def _ensure_cuda_libs_on_path() -> None:
     except Exception:
         # Best-effort; don't crash CLI on path adjustments
         pass
+
 
 def _preload_cudnn_libs() -> None:
     """Attempt to preload cuDNN split libraries to avoid lazy loader issues.
@@ -95,6 +111,7 @@ def _preload_cudnn_libs() -> None:
         # Ignore preload failures
         pass
 
+
 def _setup_logging_and_warnings(log_level: str, quiet: bool) -> None:
     """Configure logging and warnings to reduce noise by default.
 
@@ -133,7 +150,6 @@ def _setup_logging_and_warnings(log_level: str, quiet: bool) -> None:
 
     # Always clamp a few very chatty libraries
     noisy_loggers = [
-        "whisperx",
         "pyannote",
         "pyannote.audio",
         "speechbrain",
@@ -183,6 +199,47 @@ def _tqdm_enabled() -> bool:
     if os.getenv("INVOCATION_ID"):
         return False
     return sys.stderr.isatty()
+
+
+def _is_apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+
+
+def _supports_parakeet_cpu_runtime() -> bool:
+    return _is_apple_silicon() or sys.platform == "linux"
+
+
+def _resolve_backend_choice(
+    backend: str,
+    *,
+    files: List[str],
+    tmp_root: str | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    single_file_speaker: str | None,
+    device: str | None,
+    speaker_bank_config: SpeakerBankConfig | None,
+) -> str:
+    requested = (backend or "auto").lower()
+    if requested != "auto":
+        return requested
+
+    explicit_multi_speaker = min_speakers is not None or max_speakers is not None
+    multi_track_zip_input = tmp_root is not None and len(files) > 1
+    speaker_aware_run = bool(
+        speaker_bank_config and speaker_bank_config.enabled and not single_file_speaker
+    )
+
+    if explicit_multi_speaker or speaker_aware_run:
+        return "faster"
+
+    if device == "cuda":
+        return "faster"
+
+    if _supports_parakeet_cpu_runtime() and (multi_track_zip_input or bool(single_file_speaker)):
+        return "parakeet"
+
+    return "faster"
 
 
 def _find_config_path(explicit: str | None) -> str | None:
@@ -240,7 +297,6 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         "cache_mode": "cache_mode",
         "local_files_only": "local_files_only",
         "single_file_speaker": "single_file_speaker",
-        "vad_on_cpu": "vad_on_cpu",
         "pyannote_on_cpu": "pyannote_on_cpu",
         "log_level": "log_level",
         "quiet": "quiet",
@@ -267,6 +323,8 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         defaults.setdefault("hf_cache_root", cfg["cache_root"])
     sb_cfg = {}
     if isinstance(cfg, dict):
+        if cfg.get("diarization_model") is not None:
+            defaults["diarization_model"] = cfg.get("diarization_model")
         sb_cfg = cfg.get("speaker_bank") or {}
     if isinstance(sb_cfg, dict):
         if "enabled" in sb_cfg:
@@ -283,6 +341,16 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
             defaults["speaker_bank_train_stems"] = bool(sb_cfg.get("train_from_stems"))
         if "emit_pca" in sb_cfg:
             defaults["speaker_bank_emit_pca"] = bool(sb_cfg.get("emit_pca"))
+        if "scoring_margin" in sb_cfg and sb_cfg.get("scoring_margin") is not None:
+            defaults["speaker_bank_margin"] = float(sb_cfg.get("scoring_margin"))
+        if "match_per_segment" in sb_cfg:
+            defaults["speaker_bank_match_per_segment"] = bool(sb_cfg.get("match_per_segment"))
+        if "match_aggregation" in sb_cfg and sb_cfg.get("match_aggregation") is not None:
+            defaults["speaker_bank_match_aggregation"] = sb_cfg.get("match_aggregation")
+        if "min_segments_per_label" in sb_cfg and sb_cfg.get("min_segments_per_label") is not None:
+            defaults["speaker_bank_min_segments_per_label"] = int(
+                sb_cfg.get("min_segments_per_label")
+            )
         cluster_cfg = sb_cfg.get("cluster") or {}
         if "method" in cluster_cfg and cluster_cfg.get("method") is not None:
             defaults["speaker_bank_cluster_method"] = cluster_cfg.get("method")
@@ -290,7 +358,135 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
             defaults["speaker_bank_cluster_eps"] = float(cluster_cfg.get("eps"))
         if "min_samples" in cluster_cfg and cluster_cfg.get("min_samples") is not None:
             defaults["speaker_bank_cluster_min_samples"] = int(cluster_cfg.get("min_samples"))
+        scoring_cfg = sb_cfg.get("scoring") or {}
+        if isinstance(scoring_cfg, dict):
+            if scoring_cfg.get("threshold") is not None:
+                defaults["speaker_bank_threshold"] = float(scoring_cfg.get("threshold"))
+            if scoring_cfg.get("margin") is not None:
+                defaults["speaker_bank_margin"] = float(scoring_cfg.get("margin"))
+            as_norm_cfg = scoring_cfg.get("as_norm") or {}
+            if isinstance(as_norm_cfg, dict):
+                if as_norm_cfg.get("enabled") is not None:
+                    defaults["speaker_bank_as_norm"] = bool(as_norm_cfg.get("enabled"))
+                if as_norm_cfg.get("cohort_size") is not None:
+                    defaults["speaker_bank_as_norm_cohort_size"] = int(
+                        as_norm_cfg.get("cohort_size")
+                    )
+            if scoring_cfg.get("whiten") is not None:
+                defaults["speaker_bank_whiten"] = bool(scoring_cfg.get("whiten"))
+        proto_cfg = sb_cfg.get("prototypes") or {}
+        if isinstance(proto_cfg, dict):
+            if proto_cfg.get("enabled") is not None:
+                defaults["speaker_bank_prototypes"] = bool(proto_cfg.get("enabled"))
+            if proto_cfg.get("per_cluster") is not None:
+                defaults["speaker_bank_prototypes_per_cluster"] = int(proto_cfg.get("per_cluster"))
+            if proto_cfg.get("method") is not None:
+                defaults["speaker_bank_prototypes_method"] = proto_cfg.get("method")
+        classifier_cfg = sb_cfg.get("classifier") or {}
+        if isinstance(classifier_cfg, dict):
+            if classifier_cfg.get("min_confidence") is not None:
+                defaults["speaker_bank_classifier_min_confidence"] = float(
+                    classifier_cfg.get("min_confidence")
+                )
+            if classifier_cfg.get("min_margin") is not None:
+                defaults["speaker_bank_classifier_min_margin"] = float(
+                    classifier_cfg.get("min_margin")
+                )
+            fusion_cfg = classifier_cfg.get("fusion") or {}
+            if isinstance(fusion_cfg, dict):
+                if fusion_cfg.get("mode") is not None:
+                    defaults["speaker_bank_classifier_fusion_mode"] = str(fusion_cfg.get("mode"))
+                if fusion_cfg.get("classifier_weight") is not None:
+                    defaults["speaker_bank_classifier_fusion_weight"] = float(
+                        fusion_cfg.get("classifier_weight")
+                    )
+                if fusion_cfg.get("bank_weight") is not None:
+                    defaults["speaker_bank_classifier_bank_weight"] = float(
+                        fusion_cfg.get("bank_weight")
+                    )
+            if classifier_cfg.get("model") is not None:
+                defaults["speaker_bank_classifier_model"] = classifier_cfg.get("model")
+            if classifier_cfg.get("c") is not None:
+                defaults["speaker_bank_classifier_c"] = float(classifier_cfg.get("c"))
+            if classifier_cfg.get("n_neighbors") is not None:
+                defaults["speaker_bank_classifier_n_neighbors"] = int(
+                    classifier_cfg.get("n_neighbors")
+                )
+            if classifier_cfg.get("training_mode") is not None:
+                defaults["speaker_bank_classifier_training_mode"] = classifier_cfg.get(
+                    "training_mode"
+                )
+            if classifier_cfg.get("train_enabled") is not None:
+                defaults["speaker_bank_classifier_train_enabled"] = bool(
+                    classifier_cfg.get("train_enabled")
+                )
+            if classifier_cfg.get("excluded_speakers") is not None:
+                defaults["speaker_bank_classifier_excluded_speakers"] = classifier_cfg.get(
+                    "excluded_speakers"
+                )
+            augmentation_cfg = classifier_cfg.get("augmentation") or {}
+            if isinstance(augmentation_cfg, dict):
+                if augmentation_cfg.get("profile") is not None:
+                    defaults["speaker_bank_classifier_augmentation_profile"] = augmentation_cfg.get(
+                        "profile"
+                    )
+                if augmentation_cfg.get("copies") is not None:
+                    defaults["speaker_bank_classifier_augmentation_copies"] = int(
+                        augmentation_cfg.get("copies")
+                    )
+                if augmentation_cfg.get("seed") is not None:
+                    defaults["speaker_bank_classifier_augmentation_seed"] = int(
+                        augmentation_cfg.get("seed")
+                    )
+            if classifier_cfg.get("clean_max_records_per_speaker_per_session") is not None:
+                defaults["speaker_bank_classifier_clean_max_records_per_speaker_per_session"] = int(
+                    classifier_cfg.get("clean_max_records_per_speaker_per_session")
+                )
+            if classifier_cfg.get("dataset_cache_dir") is not None:
+                defaults["speaker_bank_classifier_dataset_cache_dir"] = classifier_cfg.get(
+                    "dataset_cache_dir"
+                )
+            if classifier_cfg.get("input_paths") is not None:
+                defaults["speaker_bank_classifier_input_paths"] = classifier_cfg.get("input_paths")
+            if classifier_cfg.get("transcript_roots") is not None:
+                defaults["speaker_bank_classifier_transcript_roots"] = classifier_cfg.get(
+                    "transcript_roots"
+                )
+        train_cfg = sb_cfg.get("train") or {}
+        if isinstance(train_cfg, dict):
+            if "from_segments" in train_cfg:
+                defaults["speaker_bank_train_from_segments"] = bool(train_cfg.get("from_segments"))
+            if "segment_source" in train_cfg and train_cfg.get("segment_source") is not None:
+                defaults["speaker_bank_train_segment_source"] = train_cfg.get("segment_source")
+            if "min_segment_dur" in train_cfg and train_cfg.get("min_segment_dur") is not None:
+                defaults["speaker_bank_min_segment_dur"] = float(train_cfg.get("min_segment_dur"))
+            if "max_segment_dur" in train_cfg and train_cfg.get("max_segment_dur") is not None:
+                defaults["speaker_bank_max_segment_dur"] = float(train_cfg.get("max_segment_dur"))
+            if "window_size" in train_cfg and train_cfg.get("window_size") is not None:
+                defaults["speaker_bank_window_size"] = float(train_cfg.get("window_size"))
+            if "window_stride" in train_cfg and train_cfg.get("window_stride") is not None:
+                defaults["speaker_bank_window_stride"] = float(train_cfg.get("window_stride"))
+            if (
+                "max_embeddings_per_speaker" in train_cfg
+                and train_cfg.get("max_embeddings_per_speaker") is not None
+            ):
+                defaults["speaker_bank_max_embeddings"] = int(
+                    train_cfg.get("max_embeddings_per_speaker")
+                )
+            if "vad_chunk_stems" in train_cfg:
+                defaults["speaker_bank_vad_chunk_stems"] = bool(train_cfg.get("vad_chunk_stems"))
+            if "pre_pad" in train_cfg and train_cfg.get("pre_pad") is not None:
+                defaults["speaker_bank_pre_pad"] = float(train_cfg.get("pre_pad"))
+            if "post_pad" in train_cfg and train_cfg.get("post_pad") is not None:
+                defaults["speaker_bank_post_pad"] = float(train_cfg.get("post_pad"))
+            if "embed_workers" in train_cfg and train_cfg.get("embed_workers") is not None:
+                defaults["speaker_bank_embed_workers"] = int(train_cfg.get("embed_workers"))
+            if "embed_batch_size" in train_cfg and train_cfg.get("embed_batch_size") is not None:
+                defaults["speaker_bank_embed_batch_size"] = int(train_cfg.get("embed_batch_size"))
+            if "segments_path" in train_cfg and train_cfg.get("segments_path") is not None:
+                defaults["speaker_bank_segments_json"] = train_cfg.get("segments_path")
     ap.set_defaults(**defaults)
+
 
 def _load_yaml_or_json(path: str | None) -> Dict:
     """Load a mapping from YAML or JSON, returning an empty mapping when absent.
@@ -310,6 +506,7 @@ def _load_yaml_or_json(path: str | None) -> Dict:
         return data or {}
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Failed to parse mapping file {p}: {exc}") from exc
+
 
 def _resolve_cache_root(explicit: str | None, cache_mode: str | None = None) -> str | None:
     """Return a base cache directory depending on config/environment.
@@ -339,35 +536,263 @@ def _resolve_cache_root(explicit: str | None, cache_mode: str | None = None) -> 
     return str(Path.home() / "hf_cache")
 
 
+def _normalize_speaker_bank_base_root(path_value: str | Path) -> Path:
+    resolved = Path(path_value).expanduser().resolve()
+    if resolved.name == "hub":
+        return resolved.parent
+    if resolved.name == "speaker_bank":
+        return resolved.parent
+    return resolved
+
+
 def _resolve_speaker_bank_paths(
     cfg: SpeakerBankConfig,
     root_override: str | None,
     hf_cache_root: str | None,
 ) -> Tuple[Path, str, Path]:
-    base_root: Path
-    if root_override:
-        base_root = Path(root_override).expanduser().resolve()
-    elif hf_cache_root:
-        base_root = Path(hf_cache_root).expanduser().resolve()
-    else:
-        base_root = (Path.home() / "hf_cache").resolve()
-    bank_root = base_root / "speaker_bank"
     raw_path = Path(cfg.path or "default").expanduser()
     if raw_path.is_absolute():
         profile_dir = raw_path
         profile = raw_path.name or "default"
         root = raw_path.parent
         return root, profile, profile_dir
+
+    candidate_base_roots: List[Path] = []
+    if root_override:
+        candidate_base_roots.append(_normalize_speaker_bank_base_root(root_override))
+    else:
+        repo_root = (Path.cwd() / ".hf_cache").resolve()
+        if (repo_root / "speaker_bank").exists():
+            candidate_base_roots.append(repo_root)
+        if hf_cache_root:
+            candidate_base_roots.append(_normalize_speaker_bank_base_root(hf_cache_root))
+        candidate_base_roots.append((Path.home() / "hf_cache").resolve())
+
+    deduped_roots: List[Path] = []
+    for candidate in candidate_base_roots:
+        if candidate not in deduped_roots:
+            deduped_roots.append(candidate)
+
     rel = raw_path
     if str(rel).strip() in ("", ".", "./"):
         rel = Path("default")
-    if rel.parent != Path("."):
-        root = (bank_root / rel.parent).resolve()
-    else:
-        root = bank_root.resolve()
     profile = rel.name or "default"
+    resolved_candidates: List[Tuple[Path, Path]] = []
+    for base_root in deduped_roots:
+        bank_root = base_root / "speaker_bank"
+        if rel.parent != Path("."):
+            root = (bank_root / rel.parent).resolve()
+        else:
+            root = bank_root.resolve()
+        profile_dir = root / profile
+        resolved_candidates.append((root, profile_dir))
+
+    for root, profile_dir in resolved_candidates:
+        if profile_dir.exists():
+            return root, profile, profile_dir
+
+    if resolved_candidates:
+        root, profile_dir = resolved_candidates[0]
+        return root, profile, profile_dir
+
+    bank_root = ((Path.home() / "hf_cache").resolve()) / "speaker_bank"
+    root = (bank_root / rel.parent).resolve() if rel.parent != Path(".") else bank_root.resolve()
     profile_dir = root / profile
     return root, profile, profile_dir
+
+
+def _aggregate_segment_label_candidates(
+    segment_indices: List[int],
+    seg_matches: Dict[int, Dict[str, object]],
+    *,
+    aggregation: str,
+    threshold: float,
+    margin_required: float,
+    min_segments_per_label: int,
+) -> Tuple[Optional[Dict[str, object]], Dict[str, object]]:
+    stats: Dict[str, object] = {
+        "segments_embedded": 0,
+        "segments_matched": 0,
+        "means": {},
+        "means_supported": {},
+        "vote_counts": {},
+        "best_ratio": None,
+        "second_ratio": None,
+        "margin": None,
+        "second_metric": None,
+        "score_metric": None,
+        "selection": None,
+    }
+
+    embedded_total = 0
+    candidate_totals: Dict[str, float] = defaultdict(float)
+    candidate_support: Dict[str, int] = defaultdict(int)
+    vote_counts: Dict[str, int] = defaultdict(int)
+    best_candidate_by_speaker: Dict[str, Dict[str, object]] = {}
+
+    for seg_idx in segment_indices:
+        seg_info = seg_matches.get(seg_idx) or {}
+        candidates = seg_info.get("candidates") or []
+        if not candidates:
+            continue
+        embedded_total += 1
+        top_candidate = candidates[0]
+        top_speaker = str(top_candidate.get("speaker") or "")
+        if top_speaker:
+            vote_counts[top_speaker] += 1
+        for candidate in candidates:
+            speaker = str(candidate.get("speaker") or "")
+            if not speaker:
+                continue
+            score = float(candidate.get("score") or 0.0)
+            candidate_totals[speaker] += score
+            candidate_support[speaker] += 1
+            existing = best_candidate_by_speaker.get(speaker)
+            if existing is None or score > float(existing.get("score") or 0.0):
+                best_candidate_by_speaker[speaker] = {
+                    "segment_index": seg_idx,
+                    **candidate,
+                }
+
+    stats["segments_embedded"] = embedded_total
+    stats["segments_matched"] = sum(
+        1 for seg_idx in segment_indices if (seg_matches.get(seg_idx) or {}).get("accepted")
+    )
+
+    if embedded_total:
+        stats["means"] = {
+            speaker: total / embedded_total
+            for speaker, total in sorted(
+                candidate_totals.items(), key=lambda item: item[1], reverse=True
+            )
+        }
+    stats["means_supported"] = {
+        speaker: candidate_totals[speaker] / candidate_support[speaker]
+        for speaker in sorted(candidate_support)
+        if candidate_support[speaker]
+    }
+    stats["vote_counts"] = dict(sorted(vote_counts.items(), key=lambda item: item[1], reverse=True))
+
+    if embedded_total < max(1, min_segments_per_label) or not candidate_totals:
+        return None, stats
+
+    selection: Optional[Dict[str, object]] = None
+    aggregation_name = (aggregation or "mean").lower()
+    if aggregation_name == "vote":
+        ordered_counts = sorted(
+            vote_counts.items(),
+            key=lambda item: (item[1], stats["means"].get(item[0], 0.0)),  # type: ignore[union-attr]
+            reverse=True,
+        )
+        if ordered_counts:
+            best_speaker, best_count = ordered_counts[0]
+            second_count = ordered_counts[1][1] if len(ordered_counts) > 1 else 0
+            ratio_best = best_count / embedded_total if embedded_total else 0.0
+            ratio_second = second_count / embedded_total if embedded_total else 0.0
+            margin_value = ratio_best - ratio_second
+            stats["best_ratio"] = ratio_best
+            stats["second_ratio"] = ratio_second
+            stats["margin"] = margin_value
+            stats["second_metric"] = ratio_second
+            score_metric = float((stats["means"] or {}).get(best_speaker, 0.0))
+            stats["score_metric"] = score_metric
+            if score_metric >= threshold and margin_value >= margin_required:
+                best_candidate = best_candidate_by_speaker.get(best_speaker)
+                if best_candidate:
+                    selection = {
+                        "speaker": best_speaker,
+                        "cluster_id": best_candidate.get("cluster_id"),
+                        "score": score_metric,
+                        "score_max": best_candidate.get("score"),
+                        "distance": best_candidate.get("distance"),
+                        "margin": margin_value,
+                        "second_best": ratio_second,
+                        "source": "segment_vote",
+                        "segments_count": best_count,
+                    }
+    else:
+        ordered_means = sorted(
+            ((speaker, float(score)) for speaker, score in (stats["means"] or {}).items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if ordered_means:
+            best_speaker, best_mean = ordered_means[0]
+            second_mean = ordered_means[1][1] if len(ordered_means) > 1 else 0.0
+            margin_value = best_mean - second_mean
+            stats["margin"] = margin_value
+            stats["second_metric"] = second_mean
+            stats["score_metric"] = best_mean
+            if best_mean >= threshold and margin_value >= margin_required:
+                best_candidate = best_candidate_by_speaker.get(best_speaker)
+                if best_candidate:
+                    selection = {
+                        "speaker": best_speaker,
+                        "cluster_id": best_candidate.get("cluster_id"),
+                        "score": best_mean,
+                        "score_max": best_candidate.get("score"),
+                        "distance": best_candidate.get("distance"),
+                        "margin": margin_value,
+                        "second_best": second_mean,
+                        "source": "segment_mean",
+                        "segments_count": candidate_support.get(best_speaker, 0),
+                    }
+
+    stats["selection"] = selection
+    return selection, stats
+
+
+def _segment_classifier_thresholds(
+    *,
+    duration: float,
+    base_confidence: float,
+    base_margin: float,
+) -> Tuple[float, float]:
+    min_confidence = float(base_confidence)
+    min_margin = float(base_margin)
+    if duration < 0.75:
+        min_confidence = max(min_confidence, 0.60)
+        min_margin = max(min_margin, 0.20)
+    elif duration < 1.25:
+        min_confidence = max(min_confidence, 0.50)
+        min_margin = max(min_margin, 0.14)
+    elif duration < 2.0:
+        min_confidence = max(min_confidence, 0.35)
+        min_margin = max(min_margin, 0.08)
+    return min_confidence, min_margin
+
+
+def _label_classifier_thresholds(
+    *,
+    segment_count: int,
+    base_confidence: float,
+    base_margin: float,
+) -> Tuple[float, float]:
+    min_confidence = float(base_confidence)
+    min_margin = float(base_margin)
+    if segment_count >= 6:
+        min_confidence = max(min_confidence, 0.50)
+        min_margin = max(min_margin, 0.14)
+    elif segment_count >= 3:
+        min_confidence = max(min_confidence, 0.55)
+        min_margin = max(min_margin, 0.16)
+    else:
+        min_confidence = max(min_confidence, 0.60)
+        min_margin = max(min_margin, 0.18)
+    return min_confidence, min_margin
+
+
+def _set_segment_speaker_label(segment: Dict[str, object], speaker: str | None) -> None:
+    segment["speaker"] = speaker
+    words = segment.get("words")
+    if not isinstance(words, list):
+        return
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        if "speaker_raw" not in word and word.get("speaker") is not None:
+            word["speaker_raw"] = word.get("speaker")
+        word["speaker"] = speaker
 
 
 def _resolve_speaker_bank_settings(
@@ -380,6 +805,8 @@ def _resolve_speaker_bank_settings(
     else:
         sb_cfg = {}
     if isinstance(sb_cfg, dict) and sb_cfg:
+        if sb_cfg.get("diarization_model") is not None:
+            config.diarization_model = str(sb_cfg.get("diarization_model"))
         if sb_cfg.get("enabled") is not None:
             config.enabled = bool(sb_cfg.get("enabled"))
         if sb_cfg.get("path"):
@@ -394,6 +821,14 @@ def _resolve_speaker_bank_settings(
             config.train_from_stems = bool(sb_cfg.get("train_from_stems"))
         if sb_cfg.get("emit_pca") is not None:
             config.emit_pca = bool(sb_cfg.get("emit_pca"))
+        if sb_cfg.get("scoring_margin") is not None:
+            config.scoring_margin = float(sb_cfg.get("scoring_margin"))
+        if sb_cfg.get("match_per_segment") is not None:
+            config.match_per_segment = bool(sb_cfg.get("match_per_segment"))
+        if sb_cfg.get("match_aggregation") is not None:
+            config.match_aggregation = str(sb_cfg.get("match_aggregation"))
+        if sb_cfg.get("min_segments_per_label") is not None:
+            config.min_segments_per_label = int(sb_cfg.get("min_segments_per_label"))
         cluster_cfg = sb_cfg.get("cluster") or {}
         if cluster_cfg.get("method"):
             config.cluster_method = str(cluster_cfg.get("method"))
@@ -401,6 +836,113 @@ def _resolve_speaker_bank_settings(
             config.cluster_eps = float(cluster_cfg.get("eps"))
         if cluster_cfg.get("min_samples") is not None:
             config.cluster_min_samples = int(cluster_cfg.get("min_samples"))
+        scoring_cfg = sb_cfg.get("scoring") or {}
+        if isinstance(scoring_cfg, dict) and scoring_cfg:
+            if scoring_cfg.get("threshold") is not None:
+                config.threshold = float(scoring_cfg.get("threshold"))
+            if scoring_cfg.get("margin") is not None:
+                config.scoring_margin = float(scoring_cfg.get("margin"))
+            if scoring_cfg.get("whiten") is not None:
+                config.scoring_whiten = bool(scoring_cfg.get("whiten"))
+            as_norm_cfg = scoring_cfg.get("as_norm") or {}
+            if isinstance(as_norm_cfg, dict) and as_norm_cfg:
+                if as_norm_cfg.get("enabled") is not None:
+                    config.scoring_as_norm_enabled = bool(as_norm_cfg.get("enabled"))
+                if as_norm_cfg.get("cohort_size") is not None:
+                    config.scoring_as_norm_cohort_size = int(as_norm_cfg.get("cohort_size"))
+        proto_cfg = sb_cfg.get("prototypes") or {}
+        if isinstance(proto_cfg, dict) and proto_cfg:
+            if proto_cfg.get("enabled") is not None:
+                config.prototypes_enabled = bool(proto_cfg.get("enabled"))
+            if proto_cfg.get("per_cluster") is not None:
+                config.prototypes_per_cluster = int(proto_cfg.get("per_cluster"))
+            if proto_cfg.get("method"):
+                config.prototypes_method = str(proto_cfg.get("method"))
+        classifier_cfg = sb_cfg.get("classifier") or {}
+        if isinstance(classifier_cfg, dict) and classifier_cfg:
+            if classifier_cfg.get("min_confidence") is not None:
+                config.classifier_min_confidence = float(classifier_cfg.get("min_confidence"))
+            if classifier_cfg.get("min_margin") is not None:
+                config.classifier_min_margin = float(classifier_cfg.get("min_margin"))
+            fusion_cfg = classifier_cfg.get("fusion") or {}
+            if isinstance(fusion_cfg, dict) and fusion_cfg:
+                if fusion_cfg.get("mode") is not None:
+                    config.classifier_fusion_mode = str(fusion_cfg.get("mode"))
+                if fusion_cfg.get("classifier_weight") is not None:
+                    config.classifier_fusion_weight = float(fusion_cfg.get("classifier_weight"))
+                if fusion_cfg.get("bank_weight") is not None:
+                    config.classifier_bank_weight = float(fusion_cfg.get("bank_weight"))
+            if classifier_cfg.get("model") is not None:
+                config.classifier_model = str(classifier_cfg.get("model"))
+            if classifier_cfg.get("c") is not None:
+                config.classifier_c = float(classifier_cfg.get("c"))
+            if classifier_cfg.get("n_neighbors") is not None:
+                config.classifier_n_neighbors = int(classifier_cfg.get("n_neighbors"))
+            if classifier_cfg.get("training_mode") is not None:
+                config.classifier_training_mode = str(classifier_cfg.get("training_mode"))
+            if classifier_cfg.get("train_enabled") is not None:
+                config.classifier_train_enabled = bool(classifier_cfg.get("train_enabled"))
+            if classifier_cfg.get("excluded_speakers") is not None:
+                config.classifier_excluded_speakers = [
+                    str(item)
+                    for item in (classifier_cfg.get("excluded_speakers") or [])
+                    if item is not None
+                ]
+            augmentation_cfg = classifier_cfg.get("augmentation") or {}
+            if isinstance(augmentation_cfg, dict) and augmentation_cfg:
+                if augmentation_cfg.get("profile") is not None:
+                    config.classifier_augmentation_profile = str(augmentation_cfg.get("profile"))
+                if augmentation_cfg.get("copies") is not None:
+                    config.classifier_augmentation_copies = int(augmentation_cfg.get("copies"))
+                if augmentation_cfg.get("seed") is not None:
+                    config.classifier_augmentation_seed = int(augmentation_cfg.get("seed"))
+            if classifier_cfg.get("clean_max_records_per_speaker_per_session") is not None:
+                config.classifier_clean_max_records_per_speaker_per_session = int(
+                    classifier_cfg.get("clean_max_records_per_speaker_per_session")
+                )
+            if classifier_cfg.get("dataset_cache_dir") is not None:
+                cache_dir = classifier_cfg.get("dataset_cache_dir")
+                config.classifier_dataset_cache_dir = str(cache_dir) if cache_dir else None
+            if classifier_cfg.get("input_paths") is not None:
+                config.classifier_input_paths = [
+                    str(item)
+                    for item in (classifier_cfg.get("input_paths") or [])
+                    if item is not None
+                ]
+            if classifier_cfg.get("transcript_roots") is not None:
+                config.classifier_transcript_roots = [
+                    str(item)
+                    for item in (classifier_cfg.get("transcript_roots") or [])
+                    if item is not None
+                ]
+        train_cfg = sb_cfg.get("train") or {}
+        if isinstance(train_cfg, dict) and train_cfg:
+            if train_cfg.get("from_segments") is not None:
+                config.train_from_segments = bool(train_cfg.get("from_segments"))
+            if train_cfg.get("segment_source") is not None:
+                config.train_segment_source = str(train_cfg.get("segment_source"))
+            if train_cfg.get("min_segment_dur") is not None:
+                config.min_segment_dur = float(train_cfg.get("min_segment_dur"))
+            if train_cfg.get("max_segment_dur") is not None:
+                config.max_segment_dur = float(train_cfg.get("max_segment_dur"))
+            if train_cfg.get("window_size") is not None:
+                config.window_size = float(train_cfg.get("window_size"))
+            if train_cfg.get("window_stride") is not None:
+                config.window_stride = float(train_cfg.get("window_stride"))
+            if train_cfg.get("max_embeddings_per_speaker") is not None:
+                config.max_embeddings_per_speaker = int(train_cfg.get("max_embeddings_per_speaker"))
+            if train_cfg.get("vad_chunk_stems") is not None:
+                config.vad_chunk_stems = bool(train_cfg.get("vad_chunk_stems"))
+            if train_cfg.get("pre_pad") is not None:
+                config.pre_pad = float(train_cfg.get("pre_pad"))
+            if train_cfg.get("post_pad") is not None:
+                config.post_pad = float(train_cfg.get("post_pad"))
+            if train_cfg.get("embed_workers") is not None:
+                config.embed_workers = int(train_cfg.get("embed_workers"))
+            if train_cfg.get("embed_batch_size") is not None:
+                config.embed_batch_size = int(train_cfg.get("embed_batch_size"))
+            if train_cfg.get("segments_path"):
+                config.segments_path = str(train_cfg.get("segments_path"))
 
     if getattr(args, "speaker_bank_enabled", None) is not None:
         config.enabled = bool(args.speaker_bank_enabled)
@@ -422,6 +964,49 @@ def _resolve_speaker_bank_settings(
         config.cluster_eps = float(args.speaker_bank_cluster_eps)
     if getattr(args, "speaker_bank_cluster_min_samples", None) is not None:
         config.cluster_min_samples = int(args.speaker_bank_cluster_min_samples)
+    if getattr(args, "speaker_bank_margin", None) is not None:
+        config.scoring_margin = float(args.speaker_bank_margin)
+    if getattr(args, "speaker_bank_train_from_segments", None) is not None:
+        config.train_from_segments = bool(args.speaker_bank_train_from_segments)
+    if getattr(args, "speaker_bank_train_segment_source", None):
+        config.train_segment_source = str(args.speaker_bank_train_segment_source)
+    if getattr(args, "speaker_bank_min_segment_dur", None) is not None:
+        config.min_segment_dur = float(args.speaker_bank_min_segment_dur)
+    if getattr(args, "speaker_bank_max_segment_dur", None) is not None:
+        config.max_segment_dur = float(args.speaker_bank_max_segment_dur)
+    if getattr(args, "speaker_bank_window_size", None) is not None:
+        config.window_size = float(args.speaker_bank_window_size)
+    if getattr(args, "speaker_bank_window_stride", None) is not None:
+        config.window_stride = float(args.speaker_bank_window_stride)
+    if getattr(args, "speaker_bank_max_embeddings", None) is not None:
+        config.max_embeddings_per_speaker = int(args.speaker_bank_max_embeddings)
+    if getattr(args, "speaker_bank_vad_chunk_stems", None) is not None:
+        config.vad_chunk_stems = bool(args.speaker_bank_vad_chunk_stems)
+    if getattr(args, "speaker_bank_pre_pad", None) is not None:
+        config.pre_pad = float(args.speaker_bank_pre_pad)
+    if getattr(args, "speaker_bank_post_pad", None) is not None:
+        config.post_pad = float(args.speaker_bank_post_pad)
+    if getattr(args, "speaker_bank_embed_workers", None) is not None:
+        config.embed_workers = int(args.speaker_bank_embed_workers)
+    if getattr(args, "speaker_bank_embed_batch_size", None) is not None:
+        config.embed_batch_size = int(args.speaker_bank_embed_batch_size)
+    if getattr(args, "speaker_bank_segments_json", None):
+        config.segments_path = str(args.speaker_bank_segments_json)
+    if getattr(args, "speaker_bank_match_per_segment", None) is not None:
+        config.match_per_segment = bool(args.speaker_bank_match_per_segment)
+    if getattr(args, "speaker_bank_match_aggregation", None):
+        config.match_aggregation = str(args.speaker_bank_match_aggregation)
+    if getattr(args, "speaker_bank_min_segments_per_label", None) is not None:
+        config.min_segments_per_label = int(args.speaker_bank_min_segments_per_label)
+    if getattr(args, "speaker_bank_prototypes", None) is not None:
+        config.prototypes_enabled = bool(args.speaker_bank_prototypes)
+    if getattr(args, "speaker_bank_prototypes_per_cluster", None) is not None:
+        config.prototypes_per_cluster = int(args.speaker_bank_prototypes_per_cluster)
+    if getattr(args, "speaker_bank_prototypes_method", None):
+        config.prototypes_method = str(args.speaker_bank_prototypes_method)
+
+    config.match_aggregation = (config.match_aggregation or "mean").lower()
+    config.prototypes_method = (config.prototypes_method or "central").lower()
 
     train_only = getattr(args, "speaker_bank_train_only", None)
     if train_only:
@@ -437,23 +1022,24 @@ def run_speaker_bank_training(
     hf_cache_root: str | None,
     cache_mode: str | None,
     local_files_only: bool,
-    backend: str,
     model_name: str,
     compute_type: str,
     batch_size: int,
     auto_batch: bool,
-    vad_on_cpu: bool,
     pyannote_on_cpu: bool,
+    diarization_model: str | None,
     quiet: bool,
     device: str | None,
     speaker_bank_config: SpeakerBankConfig,
     speaker_mapping_path: str | None = None,
     speaker_bank_root_override: str | None = None,
+    segments_json: str | None = None,
 ) -> None:
-    if backend != "whisperx":
-        raise SystemExit("Speaker bank training requires the whisperx backend")
-
-    from .whisperx_backend import extract_speaker_embeddings, _detect_device as _wx_detect_device
+    from .diarization import (
+        _detect_device as _diar_detect_device,
+        extract_embeddings_for_segments,
+        extract_speaker_embeddings,
+    )
 
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
@@ -491,11 +1077,17 @@ def run_speaker_bank_training(
     try:
         mapping_pre = _load_yaml_or_json(speaker_mapping_path)
     except BaseException as exc:  # noqa: PIE786
-        logger.error("Speaker bank training: failed to load mapping %s: %s", speaker_mapping_path, exc)
+        logger.error(
+            "Speaker bank training: failed to load mapping %s: %s", speaker_mapping_path, exc
+        )
         mapping_pre = {}
 
     def _resolve_bank_profile_paths(cfg: SpeakerBankConfig) -> Tuple[Path, str, Path]:
-        base_cache = Path(cache_root_resolved).expanduser() if cache_root_resolved else Path.home() / "hf_cache"
+        base_cache = (
+            Path(cache_root_resolved).expanduser()
+            if cache_root_resolved
+            else Path.home() / "hf_cache"
+        )
         bank_root = base_cache / "speaker_bank"
         raw_path = Path(cfg.path or "default").expanduser()
         if raw_path.is_absolute():
@@ -530,6 +1122,10 @@ def run_speaker_bank_training(
         cluster_method=speaker_bank_config.cluster_method,
         dbscan_eps=speaker_bank_config.cluster_eps,
         dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+        prototypes_enabled=speaker_bank_config.prototypes_enabled,
+        prototypes_per_cluster=speaker_bank_config.prototypes_per_cluster,
+        prototypes_method=speaker_bank_config.prototypes_method,
+        scoring_whiten=speaker_bank_config.scoring_whiten,
     )
     summary = {
         "profile": str(bank_profile_dir),
@@ -542,7 +1138,7 @@ def run_speaker_bank_training(
         or os.getenv("HF_TOKEN")
         or os.getenv("HUGGINGFACE_TOKEN")
     )
-    device_guess = device if device in {"cpu", "cuda"} else _wx_detect_device()
+    device_guess = device if device in {"cpu", "cuda"} else _diar_detect_device()
     try:
         import torch  # type: ignore
 
@@ -556,10 +1152,7 @@ def run_speaker_bank_training(
         )
         device_guess = "cpu"
     logger.warning(
-        "Speaker bank training using device=%s (vad_on_cpu=%s, pyannote_on_cpu=%s)",
-        device_guess,
-        vad_on_cpu,
-        pyannote_on_cpu,
+        "Speaker bank training using device=%s (pyannote_on_cpu=%s)", device_guess, pyannote_on_cpu
     )
 
     use_tqdm = _tqdm_enabled() and not quiet
@@ -578,9 +1171,321 @@ def run_speaker_bank_training(
         iter_files = progress_bar
 
     total_added = 0
+    segments_override_raw = segments_json or speaker_bank_config.segments_path
+    segments_override_path: Optional[Path] = None
+    if segments_override_raw:
+        candidate = Path(segments_override_raw).expanduser()
+        if candidate.exists():
+            segments_override_path = candidate
+        else:
+            logger.warning(
+                "Speaker bank training: segments path %s not found; ignoring",
+                candidate,
+            )
+
+    segment_source_pref = (speaker_bank_config.train_segment_source or "auto").lower()
+
+    excluded_speakers = {
+        str(item).strip()
+        for item in speaker_bank_config.classifier_excluded_speakers
+        if str(item).strip()
+    }
+    augmentation_config = AudioAugmentationConfig(
+        profile=speaker_bank_config.classifier_augmentation_profile,
+        copies=max(int(speaker_bank_config.classifier_augmentation_copies or 0), 0),
+        seed=int(speaker_bank_config.classifier_augmentation_seed),
+    )
+
+    def _segment_filename_candidates(base: str) -> List[str]:
+        return [
+            f"{base}.jsonl",
+            f"{base}.json",
+            f"{base}.segments.json",
+            f"{base}.diarization.json",
+        ]
+
+    def _discover_segment_artifact(audio_file: Path) -> Optional[Path]:
+        seen: set[Path] = set()
+        candidates: List[Path] = []
+        if segments_override_path is not None:
+            if segments_override_path.is_file():
+                candidates.append(segments_override_path)
+            elif segments_override_path.is_dir():
+                for name in _segment_filename_candidates(audio_file.stem):
+                    candidates.append(segments_override_path / name)
+        outputs_dir = Path(".outputs") / audio_file.stem
+        if segment_source_pref in {"auto", "session_jsonl"}:
+            candidates.append(outputs_dir / f"{audio_file.stem}.jsonl")
+        if segment_source_pref in {"auto", "diarization_json"}:
+            candidates.append(outputs_dir / f"{audio_file.stem}.diarization.json")
+            candidates.append(outputs_dir / f"{audio_file.stem}.json")
+        for candidate in candidates:
+            expanded = candidate.expanduser()
+            if expanded in seen:
+                continue
+            seen.add(expanded)
+            if expanded.exists():
+                return expanded
+        return None
+
+    def _segment_matches(seg: TrainingSegment, audio_file: Path) -> bool:
+        seg_name = Path(seg.audio_file).name
+        if not seg_name:
+            return False
+        return (
+            seg_name == audio_file.name
+            or Path(seg_name).stem == audio_file.stem
+            or seg.audio_file == audio_file.name
+            or seg.audio_file == audio_file.stem
+        )
+
     for path in iter_files:
-        label, _matched = choose_speaker(path, mapping_pre, return_match=True)
-        logger.info("Training: extracting embeddings for %s (label=%s)", Path(path).name, label)
+        audio_path = Path(path)
+        audio_name = audio_path.name
+        file_summary: Dict[str, object] = {
+            "mode": "legacy",
+            "segments_source": None,
+            "windows_total": 0,
+        }
+
+        use_segments = speaker_bank_config.train_from_segments or segments_override_path is not None
+        segment_artifact: Optional[Path] = None
+        windows: List[SegmentWindow] = []
+
+        if use_segments:
+            segment_artifact = _discover_segment_artifact(audio_path)
+            if segment_artifact:
+                try:
+                    loaded_segments = load_segments_file(segment_artifact, mapping_pre or {})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Speaker bank training: failed to load segments from %s: %s",
+                        segment_artifact,
+                        exc,
+                    )
+                    loaded_segments = []
+                matching_segments = [
+                    seg
+                    for seg in loaded_segments
+                    if _segment_matches(seg, audio_path) and seg.speaker not in excluded_speakers
+                ]
+                if matching_segments:
+                    windows = generate_windows_for_segments(
+                        matching_segments,
+                        min_duration=speaker_bank_config.min_segment_dur,
+                        max_duration=speaker_bank_config.max_segment_dur,
+                        window_size=speaker_bank_config.window_size,
+                        window_stride=speaker_bank_config.window_stride,
+                    )
+                    file_summary["mode"] = "segments"
+                    file_summary["segments_source"] = str(segment_artifact)
+                else:
+                    logger.debug(
+                        "Speaker bank training: no matching segments for %s in %s",
+                        audio_name,
+                        segment_artifact,
+                    )
+            elif speaker_bank_config.train_from_segments:
+                logger.warning(
+                    "Speaker bank training: segment metadata not found for %s (source=%s)",
+                    audio_name,
+                    segment_source_pref,
+                )
+
+        if not windows and speaker_bank_config.vad_chunk_stems:
+            fallback_label, _ = choose_speaker(audio_name, mapping_pre, return_match=True)
+            if fallback_label and fallback_label not in excluded_speakers:
+                try:
+                    waveform = load_audio_mono(path, sample_rate=16000)
+                    duration = len(waveform) / 16000.0
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Speaker bank training: failed to load audio %s for chunking: %s",
+                        audio_name,
+                        exc,
+                    )
+                    duration = 0.0
+                if duration >= speaker_bank_config.min_segment_dur:
+                    base_segment = TrainingSegment(
+                        audio_file=audio_name,
+                        start=0.0,
+                        end=duration,
+                        speaker=fallback_label,
+                        speaker_raw=fallback_label,
+                    )
+                    windows = generate_windows_for_segments(
+                        [base_segment],
+                        min_duration=speaker_bank_config.min_segment_dur,
+                        max_duration=speaker_bank_config.max_segment_dur,
+                        window_size=speaker_bank_config.window_size,
+                        window_stride=speaker_bank_config.window_stride,
+                    )
+                    if windows:
+                        file_summary["mode"] = "segments"
+
+        windows_by_speaker: Dict[str, List[SegmentWindow]] = defaultdict(list)
+        for win in windows:
+            if win.speaker in excluded_speakers:
+                continue
+            windows_by_speaker[win.speaker].append(win)
+
+        selected_windows: List[SegmentWindow] = []
+        limit = speaker_bank_config.max_embeddings_per_speaker
+        for speaker_label, win_list in windows_by_speaker.items():
+            win_list.sort(key=lambda w: (w.start, w.segment_index, w.window_index))
+            if limit and limit > 0 and len(win_list) > limit:
+                step = max(1, math.ceil(len(win_list) / limit))
+                sampled = win_list[::step]
+                if len(sampled) > limit:
+                    sampled = sampled[:limit]
+                selected_windows.extend(sampled)
+            else:
+                selected_windows.extend(win_list)
+
+        selected_windows.sort(key=lambda w: (w.start, w.segment_index, w.window_index))
+        file_summary["windows_total"] = len(selected_windows)
+
+        if selected_windows:
+            payload: List[Tuple[float, float, str]] = []
+            window_lookup: Dict[int, SegmentWindow] = {}
+            for idx, win in enumerate(selected_windows):
+                payload.append((win.start, win.end, win.speaker))
+                window_lookup[idx] = win
+
+            embed_results, embed_summary = extract_embeddings_for_segments(
+                path,
+                payload,
+                hf_token=hf_token,
+                diarization_model_name=diarization_model or speaker_bank_config.diarization_model,
+                force_device=device_guess,
+                quiet=quiet,
+                pre_pad=speaker_bank_config.pre_pad,
+                post_pad=speaker_bank_config.post_pad,
+                batch_size=speaker_bank_config.embed_batch_size,
+                workers=speaker_bank_config.embed_workers,
+            )
+
+            speaker_counts: Dict[str, int] = defaultdict(int)
+            added = 0
+            for result in embed_results:
+                win = window_lookup.get(result.index)
+                if win is None:
+                    continue
+                vector = np.asarray(result.embedding, dtype=np.float32)
+                speaker_bank.extend(
+                    [
+                        (
+                            win.speaker,
+                            vector,
+                            audio_name,
+                            {
+                                "mode": "train_from_segments",
+                                "segment_index": win.segment_index,
+                                "window_index": win.window_index,
+                                "start": win.start,
+                                "end": win.end,
+                                "speaker_raw": win.speaker_raw,
+                                "segments_source": file_summary["segments_source"],
+                            },
+                        )
+                    ]
+                )
+                speaker_counts[win.speaker] += 1
+                added += 1
+                total_added += 1
+
+            if augmentation_config.enabled:
+                for pass_index in range(augmentation_config.copies):
+                    waveform_augmenter = build_waveform_augmenter(
+                        augmentation_config,
+                        domain="bank",
+                        pass_index=pass_index,
+                    )
+                    if waveform_augmenter is None:
+                        continue
+                    aug_results, aug_summary = extract_embeddings_for_segments(
+                        path,
+                        payload,
+                        hf_token=hf_token,
+                        diarization_model_name=diarization_model
+                        or speaker_bank_config.diarization_model,
+                        force_device=device_guess,
+                        quiet=quiet,
+                        pre_pad=speaker_bank_config.pre_pad,
+                        post_pad=speaker_bank_config.post_pad,
+                        batch_size=speaker_bank_config.embed_batch_size,
+                        workers=speaker_bank_config.embed_workers,
+                        waveform_transform=waveform_augmenter,
+                    )
+                    for result in aug_results:
+                        win = window_lookup.get(result.index)
+                        if win is None:
+                            continue
+                        vector = np.asarray(result.embedding, dtype=np.float32)
+                        speaker_bank.extend(
+                            [
+                                (
+                                    win.speaker,
+                                    vector,
+                                    audio_name,
+                                    {
+                                        "mode": "train_from_segments_aug",
+                                        "augmentation_profile": augmentation_config.profile,
+                                        "augmentation_pass": pass_index,
+                                        "segment_index": win.segment_index,
+                                        "window_index": win.window_index,
+                                        "start": win.start,
+                                        "end": win.end,
+                                        "speaker_raw": win.speaker_raw,
+                                        "segments_source": file_summary["segments_source"],
+                                    },
+                                )
+                            ]
+                        )
+                        speaker_counts[win.speaker] += 1
+                        added += 1
+                        total_added += 1
+                    file_summary.setdefault("augmentation_runs", []).append(
+                        {
+                            "pass_index": pass_index,
+                            "embedded": aug_summary.get("embedded"),
+                            "skipped": aug_summary.get("skipped"),
+                            "total_requests": aug_summary.get("total"),
+                        }
+                    )
+
+            file_summary.update(
+                {
+                    "embeddings_added": added,
+                    "embedded": embed_summary.get("embedded"),
+                    "skipped": embed_summary.get("skipped"),
+                    "total_requests": embed_summary.get("total"),
+                    "speakers": dict(speaker_counts),
+                }
+            )
+
+            logger.info(
+                "Training: %s -> %d segment embedding(s) appended (total=%d)",
+                audio_name,
+                added,
+                total_added,
+            )
+            summary["files"][audio_name] = file_summary
+            if progress_bar:
+                progress_bar.set_postfix_str(f"added={total_added}")
+            continue
+
+        # Fallback legacy single-embedding path
+        label, _ = choose_speaker(path, mapping_pre, return_match=True)
+        if label in excluded_speakers:
+            summary["files"][audio_name] = {
+                **file_summary,
+                "mode": "excluded",
+                "speaker": label,
+                "embeddings_added": 0,
+            }
+            continue
+        logger.info("Training: extracting fallback embeddings for %s (label=%s)", audio_name, label)
         try:
             embeddings, _ = extract_speaker_embeddings(
                 path,
@@ -588,33 +1493,52 @@ def run_speaker_bank_training(
                 min_speakers=1,
                 max_speakers=1,
                 pyannote_on_cpu=pyannote_on_cpu,
+                diarization_model_name=diarization_model or speaker_bank_config.diarization_model,
                 force_device=device_guess,
                 quiet=quiet,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Speaker bank training: failed to extract embeddings for %s: %s", Path(path).name, exc)
+            logger.warning(
+                "Speaker bank training: failed to extract fallback embeddings for %s: %s",
+                audio_name,
+                exc,
+            )
+            summary["files"][audio_name] = file_summary
             continue
+
         added = 0
+        speaker_counts: Dict[str, int] = defaultdict(int)
         for diar_label, vec in embeddings.items():
+            target_speaker, _ = choose_speaker(diar_label, mapping_pre, return_match=True)
+            vector = np.asarray(vec, dtype=np.float32)
             speaker_bank.extend(
                 [
                     (
-                        label,
-                        np.asarray(vec, dtype=np.float32),
-                        Path(path).name,
+                        target_speaker,
+                        vector,
+                        audio_name,
                         {"diar_label": diar_label, "mode": "train_command"},
                     )
                 ]
             )
+            speaker_counts[target_speaker] += 1
             added += 1
             total_added += 1
-        summary["files"][Path(path).name] = {
-            "speaker": label,
-            "embeddings_added": added,
-        }
+
+        file_summary.update(
+            {
+                "embeddings_added": added,
+                "embedded": added,
+                "skipped": 0,
+                "total_requests": len(embeddings),
+                "speakers": dict(speaker_counts),
+                "speaker": label,
+            }
+        )
+        summary["files"][audio_name] = file_summary
         logger.info(
             "Training: %s -> %d embedding(s) appended (total=%d)",
-            Path(path).name,
+            audio_name,
             added,
             total_added,
         )
@@ -627,6 +1551,64 @@ def run_speaker_bank_training(
     if total_added:
         speaker_bank.save()
         summary["final"] = speaker_bank.summary()
+        classifier_summary = None
+        if speaker_bank_config.classifier_train_enabled:
+            try:
+                classifier_summary = train_segment_classifier_from_multitrack(
+                    input_path=input_path,
+                    profile_dir=bank_profile_dir,
+                    speaker_mapping=mapping_pre or {},
+                    hf_token=hf_token,
+                    force_device=device_guess,
+                    quiet=quiet,
+                    batch_size=speaker_bank_config.embed_batch_size,
+                    workers=speaker_bank_config.embed_workers,
+                    speaker_aliases={"zariel torgan": "David Tanglethorn"},
+                    extra_input_paths=speaker_bank_config.classifier_input_paths,
+                    transcript_search_roots=[
+                        Path(path).expanduser()
+                        for path in speaker_bank_config.classifier_transcript_roots
+                    ]
+                    or None,
+                    allowed_speakers=sorted(
+                        {
+                            str(value).strip()
+                            for value in (mapping_pre or {}).values()
+                            if str(value).strip()
+                            and str(value).strip()
+                            not in {
+                                str(item).strip()
+                                for item in speaker_bank_config.classifier_excluded_speakers
+                                if str(item).strip()
+                            }
+                        }
+                    )
+                    or None,
+                    excluded_speakers=speaker_bank_config.classifier_excluded_speakers or None,
+                    model_name=speaker_bank_config.classifier_model,
+                    classifier_c=speaker_bank_config.classifier_c,
+                    classifier_n_neighbors=speaker_bank_config.classifier_n_neighbors,
+                    training_mode=speaker_bank_config.classifier_training_mode,
+                    augmentation_profile=speaker_bank_config.classifier_augmentation_profile,
+                    augmentation_copies=speaker_bank_config.classifier_augmentation_copies,
+                    augmentation_seed=speaker_bank_config.classifier_augmentation_seed,
+                    clean_max_records_per_speaker_per_session=(
+                        speaker_bank_config.classifier_clean_max_records_per_speaker_per_session
+                    ),
+                    dataset_cache_dir=(
+                        Path(speaker_bank_config.classifier_dataset_cache_dir).expanduser()
+                        if speaker_bank_config.classifier_dataset_cache_dir
+                        else None
+                    ),
+                    diarization_model_name=diarization_model
+                    or speaker_bank_config.diarization_model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Speaker bank training: segment classifier training failed: %s", exc)
+        if classifier_summary:
+            summary.setdefault("artifacts", {})
+            summary["artifacts"]["segment_classifier"] = classifier_summary.get("artifacts")
+            summary["segment_classifier"] = classifier_summary
         if speaker_bank_config.emit_pca:
             try:
                 pca_path = speaker_bank.render_pca(bank_profile_dir / "pca.png")
@@ -645,7 +1627,9 @@ def run_speaker_bank_training(
                 summary_path,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Speaker bank training: failed to persist summary %s: %s", summary_path, exc)
+            logger.warning(
+                "Speaker bank training: failed to persist summary %s: %s", summary_path, exc
+            )
     else:
         logger.info("Speaker bank training: no embeddings extracted from %s", input_path)
 
@@ -654,7 +1638,7 @@ def run_speaker_bank_training(
 
 def run_transcribe(
     input_path: str,
-    backend: str = "whisperx",
+    backend: str = "auto",
     model_name: str = "medium.en",
     compute_type: str = "float16",
     batch_size: int = 32,
@@ -668,8 +1652,8 @@ def run_transcribe(
     speaker_bank_root: str | None = None,
     local_files_only: bool = False,
     single_file_speaker: str | None = None,
-    vad_on_cpu: bool = False,
     pyannote_on_cpu: bool = False,
+    diarization_model: str | None = None,
     quiet: bool = True,
     auto_batch: bool = True,
     cache_mode: str | None = None,
@@ -713,6 +1697,19 @@ def run_transcribe(
         )
 
     files, tmp_root = gather_inputs(input_path)
+    resolved_backend = _resolve_backend_choice(
+        backend,
+        files=files,
+        tmp_root=str(tmp_root) if tmp_root is not None else None,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        single_file_speaker=single_file_speaker,
+        device=device,
+        speaker_bank_config=speaker_bank_config,
+    )
+    if resolved_backend != backend:
+        logger.info("Resolved backend=%s to backend=%s for this run.", backend, resolved_backend)
+    backend = resolved_backend
     if not files:
         raise SystemExit(f"No audio files found in: {input_path}")
 
@@ -720,15 +1717,14 @@ def run_transcribe(
 
     per_file_segments: List[Tuple[str, List[dict]]] = []
     diar_by_file: Dict[str, List[dict]] = {}
+    exclusive_diar_by_file: Dict[str, List[dict]] = {}
 
     # Compute sub-dirs for non-HF-hub model caches (faster-whisper/ctranslate2 + align models)
     if hf_cache_root:
         root_path = Path(os.path.expanduser(hf_cache_root)).resolve()
         model_cache_dir = str(root_path / "models")
-        align_cache_dir = str(root_path / "align")
     else:
         model_cache_dir = None
-        align_cache_dir = None
 
     # Preload mapping early so we can show friendly labels during progress
     try:
@@ -755,99 +1751,447 @@ def run_transcribe(
     speaker_bank: Optional[SpeakerBank] = None
     speaker_bank_summary: Dict[str, object] = {}
     speaker_bank_profile_dir: Optional[Path] = None
-    speaker_bank_training_entries: List[Tuple[str, object, Dict[str, object]]] = []
     speaker_bank_modified = False
     speaker_bank_debug_by_file: Dict[str, Dict[str, object]] = {}
     rendered_pca_path: Optional[Path] = None
+    segment_classifier = None
+    extract_embeddings_for_segments_fn = None
+    speaker_bank_embed_device: Optional[str] = None
 
     def _apply_speaker_bank(
         segments: List[dict],
         embeddings: Dict[str, np.ndarray],
         file_key: str,
     ) -> Dict[str, object]:
-        summary = {
-            "attempted": len(embeddings),
+        file_path = Path(file_key)
+        file_name = file_path.name
+        summary: Dict[str, object] = {
+            "attempted": 0,
             "matched": 0,
             "matches": {},
             "segment_counts": {"matched": 0, "unknown": 0},
         }
-        if not speaker_bank or not speaker_bank_config or not embeddings:
+        logger.debug(
+            "Speaker bank apply start file=%s embeddings=%d labels=%s",
+            file_name,
+            len(embeddings),
+            list(embeddings.keys()),
+        )
+
+        if not speaker_bank or not speaker_bank_config:
+            logger.debug(
+                "No speaker bank configured for %s",
+                file_name,
+            )
             return summary
         if not speaker_bank_config.use_existing:
+            logger.debug(
+                "Speaker bank configured to skip existing matches for %s",
+                file_name,
+            )
             return summary
 
+        threshold = float(speaker_bank_config.threshold)
+        margin_required = max(float(speaker_bank_config.scoring_margin), 0.0)
+        radius_factor = float(speaker_bank_config.radius_factor)
+
+        # Track raw diarization labels per segment
+        label_to_segments: Dict[str, List[int]] = defaultdict(list)
+        segment_labels: Dict[int, Optional[str]] = {}
+        for idx, seg in enumerate(segments):
+            raw_label = seg.get("speaker")
+            seg["speaker_raw"] = raw_label
+            segment_labels[idx] = raw_label
+            if raw_label:
+                label_to_segments[raw_label].append(idx)
+
+        segment_matches: Dict[int, Dict[str, object]] = {}
+        label_stats: Dict[str, Dict[str, object]] = {}
+
+        if speaker_bank_config.match_per_segment and segments:
+
+            def _segment_level_match() -> (
+                Tuple[Dict[int, Dict[str, object]], Dict[str, Dict[str, object]], Dict[str, object]]
+            ):
+                payload_by_label: Dict[str, List[Tuple[int, float, float, str]]] = defaultdict(list)
+                label_stats_local: Dict[str, Dict[str, object]] = {}
+                for idx, seg in enumerate(segments):
+                    raw_label = segment_labels[idx]
+                    if not raw_label:
+                        continue
+                    start = float(seg.get("start") or 0.0)
+                    end = float(seg.get("end") or 0.0)
+                    if end <= start:
+                        continue
+                    payload_by_label[raw_label].append((idx, start, end, raw_label))
+                    stats = label_stats_local.setdefault(
+                        raw_label,
+                        {
+                            "segments_total": 0,
+                            "segments_indices": [],
+                            "matches_by_speaker": defaultdict(list),
+                            "aggregation": speaker_bank_config.match_aggregation.lower(),
+                        },
+                    )
+                    stats["segments_total"] += 1
+                    stats["segments_indices"].append(idx)
+
+                if not payload_by_label:
+                    return {}, {}, {"embedded": 0, "skipped": 0, "total": 0}
+
+                seg_matches: Dict[int, Dict[str, object]] = {}
+                for payload_items in payload_by_label.values():
+                    for idx, *_ in payload_items:
+                        seg_matches[idx] = {
+                            "accepted": False,
+                            "match": None,
+                            "top_score": None,
+                            "second_best": None,
+                            "margin": None,
+                            "candidates": [],
+                        }
+
+                embed_summary: Dict[str, object] = {
+                    "embedded": 0,
+                    "skipped": 0,
+                    "total": 0,
+                    "labels": {},
+                }
+                for raw_label, payload_items in payload_by_label.items():
+                    payload = [(start, end, label) for _, start, end, label in payload_items]
+                    label_index_map = [idx for idx, *_ in payload_items]
+                    try:
+                        if extract_embeddings_for_segments_fn is None:
+                            continue
+                        embed_results, label_summary = extract_embeddings_for_segments_fn(
+                            file_key,
+                            payload,
+                            hf_token=hf_token,
+                            force_device=speaker_bank_embed_device,
+                            quiet=quiet,
+                            pre_pad=speaker_bank_config.pre_pad,
+                            post_pad=speaker_bank_config.post_pad,
+                            batch_size=speaker_bank_config.embed_batch_size,
+                            workers=speaker_bank_config.embed_workers,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Segment embedding extraction failed for %s (%s): %s",
+                            file_name,
+                            raw_label,
+                            exc,
+                        )
+                        embed_summary.setdefault("errors", {})[raw_label] = str(exc)
+                        continue
+
+                    for field in ("embedded", "skipped", "total"):
+                        embed_summary[field] = int(embed_summary.get(field, 0)) + int(
+                            label_summary.get(field, 0)
+                        )
+                    for field in ("device", "sample_rate"):
+                        if field in label_summary and field not in embed_summary:
+                            embed_summary[field] = label_summary[field]
+                    embed_summary["labels"][raw_label] = label_summary
+
+                    for result in embed_results:
+                        if result.index >= len(label_index_map):
+                            continue
+                        seg_idx = label_index_map[result.index]
+                        classifier_prediction = None
+                        if segment_classifier is not None:
+                            segment_duration = max(float(result.end) - float(result.start), 0.0)
+                            classifier_min_confidence, classifier_min_margin = (
+                                _segment_classifier_thresholds(
+                                    duration=segment_duration,
+                                    base_confidence=float(
+                                        speaker_bank_config.classifier_min_confidence
+                                    ),
+                                    base_margin=float(speaker_bank_config.classifier_min_margin),
+                                )
+                            )
+                            classifier_prediction = segment_classifier.predict(
+                                result.embedding,
+                                min_confidence=classifier_min_confidence,
+                                min_margin=classifier_min_margin,
+                            )
+                        if classifier_prediction is not None:
+                            seg_matches[seg_idx] = {
+                                "accepted": True,
+                                "match": {
+                                    "speaker": classifier_prediction.speaker,
+                                    "cluster_id": None,
+                                    "score": classifier_prediction.score,
+                                    "distance": None,
+                                    "margin": classifier_prediction.margin,
+                                    "second_best": classifier_prediction.second_best,
+                                    "source": "segment_classifier",
+                                },
+                                "top_score": classifier_prediction.score,
+                                "second_best": classifier_prediction.second_best,
+                                "margin": classifier_prediction.margin,
+                                "candidates": classifier_prediction.candidates,
+                            }
+                            continue
+                        candidates = speaker_bank.score_candidates(
+                            result.embedding,
+                            radius_factor=radius_factor,
+                            as_norm_enabled=speaker_bank_config.scoring_as_norm_enabled,
+                            as_norm_cohort_size=speaker_bank_config.scoring_as_norm_cohort_size,
+                        )
+                        top1 = candidates[0] if candidates else None
+                        top2_score = candidates[1]["score"] if len(candidates) > 1 else None
+                        margin_value = (
+                            (top1["score"] - top2_score)
+                            if top1 and top2_score is not None
+                            else (top1["score"] if top1 else None)
+                        )
+                        accepted = bool(
+                            top1
+                            and top1["score"] >= threshold
+                            and (margin_value if margin_value is not None else 0.0)
+                            >= margin_required
+                        )
+                        match_payload = None
+                        if accepted and top1:
+                            match_payload = {
+                                "speaker": top1["speaker"],
+                                "cluster_id": top1["cluster_id"],
+                                "score": top1["score"],
+                                "distance": top1["distance"],
+                                "margin": margin_value,
+                                "second_best": top2_score,
+                                "source": f"segment_{top1.get('source', 'centroid')}",
+                            }
+                        seg_matches[seg_idx] = {
+                            "accepted": accepted,
+                            "match": match_payload,
+                            "top_score": top1["score"] if top1 else None,
+                            "second_best": top2_score,
+                            "margin": margin_value,
+                            "candidates": candidates,
+                        }
+
+                # Aggregation per label
+                for label, stats in label_stats_local.items():
+                    selection, aggregate_stats = _aggregate_segment_label_candidates(
+                        stats.get("segments_indices", []),
+                        seg_matches,
+                        aggregation=str(stats.get("aggregation") or "mean"),
+                        threshold=threshold,
+                        margin_required=margin_required,
+                        min_segments_per_label=speaker_bank_config.min_segments_per_label,
+                    )
+                    stats.update(aggregate_stats)
+                    stats["selection"] = selection
+
+                debug_payload = {
+                    "embedding": embed_summary,
+                    "labels": {
+                        label: {
+                            "segments_total": stats.get("segments_total"),
+                            "segments_embedded": stats.get("segments_embedded"),
+                            "segments_matched": stats.get("segments_matched"),
+                            "aggregation": stats.get("aggregation"),
+                            "margin": stats.get("margin"),
+                        }
+                        for label, stats in label_stats_local.items()
+                    },
+                }
+                return seg_matches, label_stats_local, debug_payload
+
+            segment_matches, label_stats, segment_debug = _segment_level_match()
+            if segment_debug:
+                summary["segment_debug"] = segment_debug
+        else:
+            for label, indices in label_to_segments.items():
+                label_stats[label] = {
+                    "segments_total": len(indices),
+                    "segments_matched": 0,
+                    "aggregation": speaker_bank_config.match_aggregation.lower(),
+                    "matches_by_speaker": {},
+                    "selection": None,
+                }
+
+        # Begin determining label-level matches
         label_matches: Dict[str, Optional[Dict[str, object]]] = {}
+        for label, stats in label_stats.items():
+            selection = stats.get("selection")
+            if selection:
+                match_dict = {
+                    "speaker": selection.get("speaker"),
+                    "cluster_id": selection.get("cluster_id"),
+                    "score": selection.get("score"),
+                    "score_max": selection.get("score_max"),
+                    "distance": selection.get("distance"),
+                    "margin": selection.get("margin"),
+                    "second_best": selection.get("second_best"),
+                    "source": selection.get("source"),
+                }
+                label_matches[label] = match_dict
+            else:
+                label_matches[label] = None
+
+        # Fallback to diar-label embeddings for any remaining labels
         for label, vector in embeddings.items():
+            if label in label_matches and label_matches[label]:
+                continue
+            stats_for_label = label_stats.get(label) or {}
             try:
                 match = speaker_bank.match(
                     vector,
-                    threshold=speaker_bank_config.threshold,
-                    radius_factor=speaker_bank_config.radius_factor,
+                    threshold=threshold,
+                    radius_factor=radius_factor,
+                    margin=margin_required,
+                    as_norm_enabled=speaker_bank_config.scoring_as_norm_enabled,
+                    as_norm_cohort_size=speaker_bank_config.scoring_as_norm_cohort_size,
                 )
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger("transcriber").warning(
                     "Speaker bank match failed for %s (%s): %s",
-                    Path(file_key).name,
+                    file_name,
                     label,
                     exc,
                 )
                 match = None
             if match:
-                summary["matched"] += 1
+                match["source"] = "label_vector"
                 label_matches[label] = match
-            else:
-                label_matches[label] = None
-            summary["matches"][label] = match
+                continue
+            if segment_classifier is not None:
+                label_segment_count = int(stats_for_label.get("segments_total") or 0)
+                classifier_min_confidence, classifier_min_margin = _label_classifier_thresholds(
+                    segment_count=label_segment_count,
+                    base_confidence=float(speaker_bank_config.classifier_min_confidence),
+                    base_margin=float(speaker_bank_config.classifier_min_margin),
+                )
+                classifier_prediction = segment_classifier.predict(
+                    vector,
+                    min_confidence=classifier_min_confidence,
+                    min_margin=classifier_min_margin,
+                )
+                if classifier_prediction is not None:
+                    label_matches[label] = {
+                        "speaker": classifier_prediction.speaker,
+                        "cluster_id": None,
+                        "score": classifier_prediction.score,
+                        "score_max": classifier_prediction.score,
+                        "distance": None,
+                        "margin": classifier_prediction.margin,
+                        "second_best": classifier_prediction.second_best,
+                        "source": "label_classifier",
+                    }
+                    continue
+            label_matches[label] = match
+
+        summary["attempted"] = len(label_matches)
+        summary["matched"] = sum(1 for match in label_matches.values() if match)
 
         matched_segments = 0
         unknown_segments = 0
-        for seg in segments:
-            raw_label = seg.get("speaker")
-            if raw_label is None:
-                continue
-            seg["speaker_raw"] = raw_label
-            if raw_label not in label_matches:
-                continue
-            match = label_matches[raw_label]
-            if match:
-                seg["speaker"] = match["speaker"]
-                seg["speaker_match"] = {
-                    "speaker": match["speaker"],
-                    "score": float(match["score"]),
-                    "cluster_id": match["cluster_id"],
-                    "distance": float(match["distance"]),
-                    "source": "speaker_bank",
-                    "label": raw_label,
+
+        for label, match in label_matches.items():
+            # Record label stats for summary
+            if label in label_stats:
+                stats = label_stats[label]
+                summary.setdefault("label_stats", {})[label] = {
+                    "segments_total": stats.get("segments_total"),
+                    "segments_matched": stats.get("segments_matched"),
+                    "aggregation": stats.get("aggregation"),
+                    "margin": stats.get("margin"),
                 }
-                seg["speaker_match_score"] = float(match["score"])
-                seg["speaker_match_distance"] = float(match["distance"])
-                seg["speaker_match_cluster"] = match["cluster_id"]
-                seg["speaker_match_source"] = "speaker_bank"
-                matched_segments += 1
             else:
-                seg["speaker"] = "unknown"
-                seg["speaker_match"] = {
-                    "speaker": None,
-                    "score": None,
-                    "cluster_id": None,
-                    "distance": None,
-                    "source": "speaker_bank",
-                    "label": raw_label,
-                }
-                seg["speaker_match_score"] = None
-                seg["speaker_match_distance"] = None
-                seg["speaker_match_cluster"] = None
-                seg["speaker_match_source"] = "speaker_bank"
-                unknown_segments += 1
+                summary.setdefault("label_stats", {})[label] = {}
+
+            summary["matches"][label] = match
+
+            segment_indices = label_to_segments.get(label, [])
+            for idx in segment_indices:
+                seg = segments[idx]
+                seg_match_info = segment_matches.get(idx)
+                segment_level_match = None
+                if (
+                    seg_match_info
+                    and seg_match_info.get("accepted")
+                    and seg_match_info.get("match")
+                ):
+                    segment_level_match = dict(seg_match_info["match"])
+                    segment_level_match["label"] = label
+
+                effective_match = segment_level_match
+                if not effective_match and match:
+                    effective_match = {
+                        "speaker": match["speaker"],
+                        "score": match.get("score"),
+                        "cluster_id": match.get("cluster_id"),
+                        "distance": match.get("distance"),
+                        "margin": match.get("margin"),
+                        "second_best": match.get("second_best"),
+                        "source": match.get("source") or "speaker_bank",
+                        "label": label,
+                    }
+
+                if effective_match:
+                    _set_segment_speaker_label(seg, effective_match["speaker"])
+                    seg["speaker_match"] = effective_match
+                    seg["speaker_match_source"] = effective_match.get("source", "speaker_bank")
+                    seg["speaker_match_score"] = seg["speaker_match"].get("score")
+                    seg["speaker_match_distance"] = seg["speaker_match"].get("distance")
+                    seg["speaker_match_cluster"] = seg["speaker_match"].get("cluster_id")
+                    matched_segments += 1
+                else:
+                    _set_segment_speaker_label(seg, "unknown")
+                    seg["speaker_match"] = {
+                        "speaker": None,
+                        "score": None,
+                        "cluster_id": None,
+                        "distance": None,
+                        "source": "speaker_bank",
+                        "label": label,
+                    }
+                    seg["speaker_match_score"] = None
+                    seg["speaker_match_distance"] = None
+                    seg["speaker_match_cluster"] = None
+                    seg["speaker_match_source"] = "speaker_bank"
+                    unknown_segments += 1
+
+        # Segments without labels default to unknown
+        for idx, seg in enumerate(segments):
+            if segment_labels.get(idx) is None:
+                if not seg.get("speaker"):
+                    _set_segment_speaker_label(seg, "unknown")
+                    unknown_segments += 1
+                seg.setdefault(
+                    "speaker_match",
+                    {
+                        "speaker": None,
+                        "score": None,
+                        "cluster_id": None,
+                        "distance": None,
+                        "source": "speaker_bank",
+                        "label": None,
+                    },
+                )
+                seg.setdefault("speaker_match_source", "speaker_bank")
+                seg.setdefault("speaker_match_score", None)
+                seg.setdefault("speaker_match_distance", None)
+                seg.setdefault("speaker_match_cluster", None)
+
         summary["segment_counts"]["matched"] = matched_segments
         summary["segment_counts"]["unknown"] = unknown_segments
+
         if summary["attempted"]:
             logging.getLogger("transcriber").info(
                 "Speaker bank matched %d/%d diar speakers for %s",
                 summary["matched"],
                 summary["attempted"],
-                Path(file_key).name,
+                file_name,
             )
+        logger.debug(
+            "Speaker bank apply complete file=%s matched_segments=%d unknown_segments=%d",
+            file_name,
+            matched_segments,
+            unknown_segments,
+        )
         return summary
 
     if speaker_bank_config:
@@ -863,8 +2207,18 @@ def run_transcribe(
             cluster_method=speaker_bank_config.cluster_method,
             dbscan_eps=speaker_bank_config.cluster_eps,
             dbscan_min_samples=speaker_bank_config.cluster_min_samples,
+            prototypes_enabled=speaker_bank_config.prototypes_enabled,
+            prototypes_per_cluster=speaker_bank_config.prototypes_per_cluster,
+            prototypes_method=speaker_bank_config.prototypes_method,
+            scoring_whiten=speaker_bank_config.scoring_whiten,
         )
+        segment_classifier = load_segment_classifier(bank_profile_dir)
         bank_info = speaker_bank.summary()
+        logger.debug(
+            "Speaker bank summary initial profile=%s data=%s",
+            speaker_bank_profile_dir,
+            bank_info,
+        )
         speaker_bank_summary = {
             "profile": str(bank_profile_dir),
             "initial": bank_info,
@@ -873,9 +2227,21 @@ def run_transcribe(
                 "radius_factor": speaker_bank_config.radius_factor,
                 "use_existing": speaker_bank_config.use_existing,
                 "train_from_stems": speaker_bank_config.train_from_stems,
+                "margin": speaker_bank_config.scoring_margin,
+                "match_per_segment": speaker_bank_config.match_per_segment,
+                "match_aggregation": speaker_bank_config.match_aggregation,
+                "min_segments_per_label": speaker_bank_config.min_segments_per_label,
+                "prototypes_enabled": speaker_bank_config.prototypes_enabled,
+                "prototypes_per_cluster": speaker_bank_config.prototypes_per_cluster,
+                "prototypes_method": speaker_bank_config.prototypes_method,
+                "whiten": speaker_bank_config.scoring_whiten,
+                "as_norm_enabled": speaker_bank_config.scoring_as_norm_enabled,
+                "as_norm_cohort_size": speaker_bank_config.scoring_as_norm_cohort_size,
             },
             "files": {},
         }
+        if segment_classifier is not None:
+            speaker_bank_summary["segment_classifier"] = segment_classifier.summary()
         logging.getLogger("transcriber").info(
             "Speaker bank profile=%s (entries=%s, speakers=%s)",
             speaker_bank_profile_dir,
@@ -883,232 +2249,7 @@ def run_transcribe(
             len(bank_info.get("speakers", [])),
         )
 
-    if backend == "whisperx":
-        # Import after environment setup so Hugging Face picks up HF_* vars
-        from .whisperx_backend import (
-            transcribe_with_whisperx,
-            extract_speaker_embeddings,
-            _detect_device as _wx_detect_device,
-        )
-        # Accept common token env vars for gated models
-        hf_token = (
-            os.getenv("HUGGING_FACE_HUB_TOKEN")
-            or os.getenv("HF_TOKEN")
-            or os.getenv("HUGGINGFACE_TOKEN")
-        )
-        if not hf_token:
-            logger.warning("HF_TOKEN not set — pyannote diarization models may fail if gated.")
-        # Determine effective batch size (auto picks a conservative value by device/model)
-        device_guess = device if device in {"cpu", "cuda"} else _wx_detect_device()
-        try:
-            import torch  # type: ignore
-
-            cuda_available = bool(torch.cuda.is_available())
-        except Exception as exc:  # noqa: BLE001
-            cuda_available = False
-            logger.debug("CUDA availability check failed: %s", exc)
-        if device == "cuda" and not cuda_available:
-            logger.warning(
-                "CUDA requested but unavailable; falling back to CPU for transcription. "
-                "Check GPU drivers and visibility."
-            )
-            device_guess = "cpu"
-        eff_bs = batch_size
-        if auto_batch:
-            eff_bs = _recommend_batch_size(device_guess, model_name, compute_type, user_hint=batch_size)
-        iter_files = files
-        use_tqdm = _tqdm_enabled()
-        mapping_covers_all = bool(mapping_pre) and all(mapping_hits.get(f, False) for f in files)
-        diarization_forced = (min_speakers is not None) or (max_speakers is not None)
-        multi_track_zip = tmp_root is not None and len(files) > 1
-        enable_diarization = True
-        if multi_track_zip and not diarization_forced:
-            enable_diarization = False
-            logger.info(
-                "Skipping diarization: multi-track ZIP input treated as per-speaker stems (%d tracks).",
-                len(files),
-            )
-            missing = [
-                Path(f).name
-                for f in files
-                if mapping_pre and not mapping_hits.get(f, False)
-            ]
-            if missing:
-                logger.warning(
-                    "Speaker mapping missing entries for %s — using raw stems as labels.",
-                    ", ".join(missing),
-                )
-        elif mapping_covers_all and not diarization_forced:
-            enable_diarization = False
-            logger.info(
-                "Skipping diarization: speaker mapping resolved all input files (%d/%d).",
-                len(files),
-                len(files),
-            )
-        elif mapping_covers_all and diarization_forced:
-            logger.info(
-                "Speaker mapping covers all inputs, but diarization remains enabled due to explicit speaker count constraints."
-            )
-        if use_tqdm:
-            iter_files = tqdm(
-                files,
-                desc="Transcribing (whisperx)",
-                unit="file",
-                bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
-                dynamic_ncols=True,
-            )
-        for f in iter_files:
-            label = file_labels.get(f, Path(f).stem)
-            logger.warning("Start: %s", Path(f).name)
-            start_ts = time.time()
-            if use_tqdm:
-                from tqdm import tqdm as _tqdm  # local alias to avoid confusion
-                pbar = _tqdm(total=3, desc=f"{label}", leave=False, unit="phase")
-            else:
-                pbar = None
-
-            def _progress_cb(phase: str, step: int, total: int) -> None:  # noqa: ANN001
-                if pbar is not None:
-                    current = pbar.n
-                    to = max(min(step, total), current)
-                    if to > current:
-                        pbar.update(to - current)
-                    pbar.set_postfix_str(phase)
-                else:
-                    if step == 1 and phase == "asr":
-                        logger.warning("Phase: asr -> %s", Path(f).name)
-                    elif step == 2 and phase == "align":
-                        logger.warning("Phase: align -> %s", Path(f).name)
-                    elif step == 3 and phase == "diar":
-                        logger.warning("Phase: diar -> %s", Path(f).name)
-
-            logger.warning(
-                "Using device=%s compute=%s for %s",
-                device_guess,
-                compute_type,
-                Path(f).name,
-            )
-            segs, diar, speaker_embeddings = transcribe_with_whisperx(
-                f,
-                model_name=model_name,
-                compute_type=compute_type,
-                batch_size=eff_bs,
-                hf_token=hf_token,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                model_cache_dir=model_cache_dir,
-                align_cache_dir=align_cache_dir,
-                local_files_only=local_files_only,
-                vad_on_cpu=(vad_on_cpu or pyannote_on_cpu),
-                pyannote_on_cpu=pyannote_on_cpu,
-                progress_cb=_progress_cb,
-                quiet=quiet,
-                force_device=device_guess,
-                strict_cuda=(device == "cuda" and device_guess == "cuda"),
-                enable_diarization=enable_diarization,
-            )
-            if pbar is not None:
-                pbar.close()
-            dur = int(time.time() - start_ts)
-            logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
-            summary = {
-                "attempted": len(speaker_embeddings),
-                "matched": 0,
-                "matches": {},
-                "segment_counts": {"matched": 0, "unknown": 0},
-            }
-            if speaker_embeddings:
-                bank_summary = _apply_speaker_bank(segs, speaker_embeddings, f)
-                summary.update(bank_summary)
-            speaker_bank_debug_by_file[f] = summary
-            if speaker_bank_summary is not None and "files" in speaker_bank_summary:
-                speaker_bank_summary["files"][Path(f).name] = summary
-
-            if (
-                speaker_bank
-                and speaker_bank_config
-                and speaker_bank_config.train_from_stems
-                and multi_track_zip
-            ):
-                training_label = file_labels.get(f, Path(f).stem)
-                training_embeddings = speaker_embeddings
-                if not training_embeddings:
-                    try:
-                        training_embeddings, _ = extract_speaker_embeddings(
-                            f,
-                            hf_token=hf_token,
-                            min_speakers=1,
-                            max_speakers=1,
-                            pyannote_on_cpu=pyannote_on_cpu,
-                            force_device=device_guess,
-                            quiet=quiet,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Speaker bank training failed for %s: %s",
-                            Path(f).name,
-                            exc,
-                        )
-                        training_embeddings = {}
-                added = 0
-                for diar_label, vec in training_embeddings.items():
-                    speaker_bank_training_entries.append(
-                        (
-                            training_label,
-                            vec,
-                            {
-                                "file": str(Path(f).name),
-                                "diar_label": diar_label,
-                                "mode": "train_from_stems",
-                            },
-                        )
-                    )
-                    added += 1
-                if added:
-                    summary.setdefault("training", {})
-                    summary["training"]["embeddings_added"] = added
-                    summary["training"]["speaker"] = training_label
-                    speaker_bank_modified = True
-
-            per_file_segments.append((f, segs))
-            if diar:
-                diar_by_file[f] = diar
-
-        if speaker_bank and speaker_bank_training_entries:
-            enrollment: List[Tuple[str, np.ndarray, Optional[str], Dict[str, object]]] = []
-            for speaker_label, vec, meta in speaker_bank_training_entries:
-                vector = np.asarray(vec, dtype=np.float32)
-                source = meta.get("file") if isinstance(meta, dict) else None
-                enrollment.append((speaker_label, vector, source, meta if isinstance(meta, dict) else {}))
-            if enrollment:
-                speaker_bank.extend(enrollment)
-                speaker_bank_modified = True
-                speaker_bank_summary.setdefault("training", {})
-                speaker_bank_summary["training"]["embeddings_added"] = speaker_bank_summary.get("training", {}).get("embeddings_added", 0) + len(enrollment)
-
-        if speaker_bank and speaker_bank_modified:
-            try:
-                speaker_bank.save()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to save speaker bank profile %s: %s", speaker_bank_profile_dir, exc)
-
-        if speaker_bank and speaker_bank_summary is not None:
-            speaker_bank_summary["final"] = speaker_bank.summary()
-
-        if (
-            speaker_bank
-            and speaker_bank_config
-            and speaker_bank_config.emit_pca
-            and speaker_bank_summary
-        ):
-            try:
-                rendered_pca_path = speaker_bank.render_pca(speaker_bank_profile_dir / "pca.png")
-                if rendered_pca_path:
-                    speaker_bank_summary.setdefault("artifacts", {})
-                    speaker_bank_summary["artifacts"]["pca"] = str(rendered_pca_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Speaker bank PCA rendering failed: %s", exc)
-    elif backend == "parakeet":
+    if backend == "parakeet":
         logger.info("Using parakeet-mlx backend.")
         from .parakeet_backend import (
             load_model as parakeet_load,
@@ -1120,9 +2261,9 @@ def run_transcribe(
             logger.warning(
                 "Parakeet backend does not support diarization; ignoring min/max speaker hints."
             )
-        if vad_on_cpu or pyannote_on_cpu:
+        if pyannote_on_cpu:
             logger.warning(
-                "Parakeet backend does not use WhisperX/pyannote VAD controls; ignoring those flags."
+                "Parakeet backend does not use direct pyannote controls; ignoring --pyannote-on-cpu."
             )
 
         parakeet_model_name = parakeet_resolve_model_name(model_name)
@@ -1147,19 +2288,24 @@ def run_transcribe(
             local_files_only=local_files_only,
         )
         use_tqdm = _tqdm_enabled()
-        iter_files = tqdm(
-            files,
-            desc="Transcribing (parakeet)",
-            unit="file",
-            bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
-            dynamic_ncols=True,
-        ) if use_tqdm else files
+        iter_files = (
+            tqdm(
+                files,
+                desc="Transcribing (parakeet)",
+                unit="file",
+                bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
+                dynamic_ncols=True,
+            )
+            if use_tqdm
+            else files
+        )
         for f in iter_files:
             label = file_labels.get(f, Path(f).stem)
             logger.warning("Start: %s", Path(f).name)
             start_ts = time.time()
             if use_tqdm:
                 from tqdm import tqdm as _tqdm
+
                 with _tqdm(total=1, desc=f"{label}", leave=False, unit="phase") as pbar:
                     segs = parakeet_transcribe(f, model, batch_size=batch_size)
                     pbar.update(1)
@@ -1170,13 +2316,22 @@ def run_transcribe(
             logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
             per_file_segments.append((f, segs))
     else:
-        # faster-whisper only (no diarization)
-        logger.info("Using faster-whisper backend.")
-        # Import after environment setup so Hugging Face picks up HF_* vars
-        from .backend import load_model as fw_load, transcribe_file as fw_transcribe
-        from .whisperx_backend import _detect_device as _wx_detect_device
+        logger.info("Using faster-whisper + direct pyannote backend.")
+        from .diarization import (
+            _detect_device as _diar_detect_device,
+            extract_embeddings_for_segments as diar_extract_embeddings_for_segments,
+            extract_speaker_embeddings,
+        )
+        from .transcript_pipeline import transcribe_with_faster_pipeline
 
-        fw_device = device if device in {"cpu", "cuda"} else _wx_detect_device()
+        extract_embeddings_for_segments_fn = diar_extract_embeddings_for_segments
+
+        hf_token = (
+            os.getenv("HUGGING_FACE_HUB_TOKEN")
+            or os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACE_TOKEN")
+        )
+        fw_device = device if device in {"cpu", "cuda"} else _diar_detect_device()
         fw_compute = compute_type
         cpu_supported = {"int8", "int8_float32", "int8_np"}
         if fw_device == "cpu" and fw_compute not in cpu_supported:
@@ -1185,43 +2340,278 @@ def run_transcribe(
                 fw_compute,
             )
             fw_compute = "int8"
+        speaker_bank_embed_device = fw_device
         logger.warning("ASR Device (faster-whisper): %s compute=%s", fw_device, fw_compute)
-        # Determine effective batch size (auto picks conservative by device/model)
         eff_bs = batch_size
         if auto_batch:
             eff_bs = _recommend_batch_size(fw_device, model_name, fw_compute, user_hint=batch_size)
-        model = fw_load(
-            model_name,
-            compute_type=fw_compute,
-            device=fw_device,
-            download_root=model_cache_dir,
-            local_files_only=local_files_only,
-        )
+        mapping_covers_all = bool(mapping_pre) and all(mapping_hits.get(f, False) for f in files)
+        diarization_forced = (min_speakers is not None) or (max_speakers is not None)
+        multi_track_zip = tmp_root is not None and len(files) > 1
+        enable_diarization = True
+        if multi_track_zip and not diarization_forced:
+            enable_diarization = False
+            logger.info(
+                "Skipping diarization: multi-track ZIP input treated as per-speaker stems (%d tracks).",
+                len(files),
+            )
+        elif mapping_covers_all and not diarization_forced:
+            enable_diarization = False
+            logger.info(
+                "Skipping diarization: speaker mapping resolved all input files (%d/%d).",
+                len(files),
+                len(files),
+            )
         use_tqdm = _tqdm_enabled()
-        iter_files = tqdm(
-            files,
-            desc="Transcribing (faster-whisper)",
-            unit="file",
-            bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
-            dynamic_ncols=True,
-        ) if use_tqdm else files
+        iter_files = (
+            tqdm(
+                files,
+                desc="Transcribing (faster+pyannote)",
+                unit="file",
+                bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
+                dynamic_ncols=True,
+            )
+            if use_tqdm
+            else files
+        )
         for f in iter_files:
             label = file_labels.get(f, Path(f).stem)
             logger.warning("Start: %s", Path(f).name)
             start_ts = time.time()
             if use_tqdm:
                 from tqdm import tqdm as _tqdm
-                with _tqdm(total=1, desc=f"{label}", leave=False, unit="phase") as pbar:
-                    segs = fw_transcribe(f, model, batch_size=eff_bs)
+
+                phase_total = 2 if enable_diarization else 1
+                with _tqdm(total=phase_total, desc=f"{label}", leave=False, unit="phase") as pbar:
+                    result = transcribe_with_faster_pipeline(
+                        f,
+                        model_name=model_name,
+                        compute_type=fw_compute,
+                        batch_size=eff_bs,
+                        hf_token=hf_token,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                        model_cache_dir=model_cache_dir,
+                        local_files_only=local_files_only,
+                        pyannote_on_cpu=pyannote_on_cpu,
+                        diarization_model_name=diarization_model
+                        or (speaker_bank_config.diarization_model if speaker_bank_config else None),
+                        force_device=fw_device,
+                        quiet=quiet,
+                        enable_diarization=enable_diarization,
+                    )
                     pbar.update(1)
                     pbar.set_postfix_str("asr")
+                    if enable_diarization:
+                        pbar.update(1)
+                        pbar.set_postfix_str("diar")
             else:
-                segs = fw_transcribe(f, model, batch_size=eff_bs)
+                result = transcribe_with_faster_pipeline(
+                    f,
+                    model_name=model_name,
+                    compute_type=fw_compute,
+                    batch_size=eff_bs,
+                    hf_token=hf_token,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    model_cache_dir=model_cache_dir,
+                    local_files_only=local_files_only,
+                    pyannote_on_cpu=pyannote_on_cpu,
+                    diarization_model_name=diarization_model
+                    or (speaker_bank_config.diarization_model if speaker_bank_config else None),
+                    force_device=fw_device,
+                    quiet=quiet,
+                    enable_diarization=enable_diarization,
+                )
+            segs = result.segments
             dur = int(time.time() - start_ts)
             logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
+            summary = {
+                "attempted": len(result.speaker_embeddings),
+                "matched": 0,
+                "matches": {},
+                "segment_counts": {"matched": 0, "unknown": 0},
+            }
+            if result.speaker_embeddings:
+                bank_summary = _apply_speaker_bank(segs, result.speaker_embeddings, f)
+                summary.update(bank_summary)
+            speaker_bank_debug_by_file[f] = summary
+            if speaker_bank_summary is not None and "files" in speaker_bank_summary:
+                speaker_bank_summary["files"][Path(f).name] = summary
+
+            if (
+                speaker_bank
+                and speaker_bank_config
+                and speaker_bank_config.train_from_stems
+                and multi_track_zip
+            ):
+                training_label = file_labels.get(f, Path(f).stem)
+                training_embeddings = result.speaker_embeddings
+                if not training_embeddings:
+                    try:
+                        training_embeddings, _ = extract_speaker_embeddings(
+                            f,
+                            hf_token=hf_token,
+                            min_speakers=1,
+                            max_speakers=1,
+                            pyannote_on_cpu=pyannote_on_cpu,
+                            diarization_model_name=diarization_model
+                            or (
+                                speaker_bank_config.diarization_model
+                                if speaker_bank_config
+                                else None
+                            ),
+                            force_device=fw_device,
+                            quiet=quiet,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Speaker bank training failed for %s: %s",
+                            Path(f).name,
+                            exc,
+                        )
+                        training_embeddings = {}
+                added = 0
+                training_entries: List[Tuple[str, np.ndarray, str, Dict[str, object]]] = []
+                for diar_label, vec in training_embeddings.items():
+                    training_entries.append(
+                        (
+                            training_label,
+                            np.asarray(vec, dtype=np.float32),
+                            str(Path(f).name),
+                            {
+                                "file": str(Path(f).name),
+                                "diar_label": diar_label,
+                                "mode": "train_from_stems",
+                            },
+                        )
+                    )
+                    added += 1
+                if added:
+                    speaker_bank.extend(training_entries)
+                    summary.setdefault("training", {})
+                    summary["training"]["embeddings_added"] = added
+                    summary["training"]["speaker"] = training_label
+                    speaker_bank_modified = True
+
             per_file_segments.append((f, segs))
+            if result.diarization_segments:
+                diar_by_file[f] = result.diarization_segments
+            if result.exclusive_diarization_segments:
+                exclusive_diar_by_file[f] = result.exclusive_diarization_segments
+
+    if speaker_bank and speaker_bank_modified:
+        try:
+            speaker_bank.save()
+            speaker_bank_summary["final"] = speaker_bank.summary()
+            if speaker_bank_config and speaker_bank_config.emit_pca and speaker_bank_profile_dir:
+                rendered_pca_path = speaker_bank.render_pca(speaker_bank_profile_dir / "pca.png")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist speaker bank updates: %s", exc)
 
     base = Path(input_path).stem
+
+    def _normalise_per_file_segments(
+        payload: List[Tuple[str, List[dict]]],
+    ) -> Tuple[List[Tuple[str, List[dict]]], set[str]]:
+        normalised: List[Tuple[str, List[dict]]] = []
+        kept: set[str] = set()
+        for idx, entry in enumerate(payload):
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                fname, segs_obj = entry
+            elif isinstance(entry, dict) and len(entry) == 1:
+                ((fname, segs_obj),) = entry.items()
+            else:
+                logger.warning(
+                    "Unexpected segment payload at index %d: %r (skipping)",
+                    idx,
+                    entry,
+                )
+                continue
+
+            fname_str = str(fname)
+            seg_iterable: List[dict] = []
+            if isinstance(segs_obj, dict) and "segments" in segs_obj:
+                candidate = segs_obj.get("segments") or []
+                if isinstance(candidate, (list, tuple)):
+                    seg_iterable = list(candidate)
+                elif hasattr(candidate, "__iter__") and not isinstance(candidate, (str, bytes)):
+                    seg_iterable = list(candidate)
+            elif isinstance(segs_obj, (list, tuple)):
+                seg_iterable = list(segs_obj)
+            elif hasattr(segs_obj, "__iter__") and not isinstance(segs_obj, (str, bytes)):
+                seg_iterable = list(segs_obj)
+            else:
+                logger.warning(
+                    "Unsupported segment container for %s (type=%s); skipping file.",
+                    fname_str,
+                    type(segs_obj).__name__,
+                )
+                continue
+
+            cleaned_segments: List[dict] = []
+            for seg in seg_iterable:
+                if isinstance(seg, dict):
+                    cleaned_segments.append(seg)
+                elif hasattr(seg, "to_dict"):
+                    try:
+                        cleaned_segments.append(seg.to_dict())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Failed to convert segment to dict for %s: %s", fname_str, exc)
+                else:
+                    logger.debug("Dropping non-dict segment for %s: %r", fname_str, seg)
+            normalised.append((fname_str, cleaned_segments))
+            kept.add(fname_str)
+        return normalised, kept
+
+    per_file_segments, _kept_files = _normalise_per_file_segments(per_file_segments)
+
+    def _normalise_diarization(
+        payload: Dict[str, List[dict]] | Dict[str, object] | None,
+        kept: set[str],
+    ) -> Dict[str, List[dict]]:
+        if not payload:
+            return {}
+        normalised: Dict[str, List[dict]] = {}
+        for key, value in payload.items():
+            fname = str(key)
+            if fname not in kept:
+                continue
+            entries: List[dict] = []
+            candidates: List[object] = []
+            if isinstance(value, dict) and "segments" in value:
+                segment_block = value.get("segments") or []
+                if isinstance(segment_block, (list, tuple)):
+                    candidates = list(segment_block)
+                elif hasattr(segment_block, "__iter__") and not isinstance(
+                    segment_block, (str, bytes)
+                ):
+                    candidates = list(segment_block)
+            elif isinstance(value, (list, tuple)):
+                candidates = list(value)
+            elif hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+                candidates = list(value)
+            else:
+                logger.debug(
+                    "Unsupported diarization payload for %s (type=%s); skipping.",
+                    fname,
+                    type(value).__name__,
+                )
+                continue
+            for item in candidates:
+                if isinstance(item, dict):
+                    entries.append(item)
+                elif hasattr(item, "to_dict"):
+                    try:
+                        entries.append(item.to_dict())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Failed to convert diarization entry for %s: %s", fname, exc)
+            if entries:
+                normalised[fname] = entries
+        return normalised
+
+    diar_by_file = _normalise_diarization(diar_by_file, _kept_files)
+    exclusive_diar_by_file = _normalise_diarization(exclusive_diar_by_file, _kept_files)
 
     # Optional speaker renaming and filename-based labeling (prototype parity)
     # Reload mapping after transcription for application (kept separate from progress labels)
@@ -1234,35 +2624,24 @@ def run_transcribe(
             file_label = choose_speaker(fname, mapping)
             for s in segs:
                 if multi_file:
-                    matched_by_bank = s.get("speaker_match_source") == "speaker_bank"
-                    if matched_by_bank and s.get("speaker") not in (None, "unknown"):
+                    if s.get("speaker_match_source"):
                         continue
-                    if matched_by_bank and s.get("speaker") == "unknown":
-                        continue
-                    s["speaker"] = file_label
+                    _set_segment_speaker_label(s, file_label)
                 else:
                     # Single-file: only fill missing and allow cluster -> name override
                     if not s.get("speaker"):
-                        s["speaker"] = file_label
+                        _set_segment_speaker_label(s, file_label)
                     if s.get("speaker") in mapping:
-                        s["speaker"] = mapping[s["speaker"]]
+                        _set_segment_speaker_label(s, mapping[s["speaker"]])
             per_file_segments[i] = (fname, segs)
-        # Apply mapping to diarization output if present (best-effort, non-critical)
-        for fname, diar in list(diar_by_file.items()):
-            for d in diar:
-                if d.get("speaker") in mapping:
-                    d["speaker"] = mapping[d["speaker"]]
-            diar_by_file[fname] = diar
-
     # Prototype single-file behavior: allow forcing a generic label
     if single_file_speaker and len(files) == 1:
         target = files[0]
-        force_single_file_speaker = backend != "whisperx"
         for i, (fname, segs) in enumerate(per_file_segments):
             if fname == target:
                 for s in segs:
-                    if force_single_file_speaker or not s.get("speaker"):
-                        s["speaker"] = single_file_speaker
+                    if single_file_speaker or not s.get("speaker"):
+                        _set_segment_speaker_label(s, single_file_speaker)
                 per_file_segments[i] = (fname, segs)
 
     consolidated_pairs = consolidate(per_file_segments)
@@ -1280,6 +2659,7 @@ def run_transcribe(
         per_file_segments=per_file_segments,
         consolidated_pairs=consolidated_pairs,
         diar_by_file=diar_by_file or None,
+        exclusive_diar_by_file=exclusive_diar_by_file or None,
         write_srt_file=write_srt,
         write_jsonl_file=write_jsonl,
     )
@@ -1309,7 +2689,10 @@ def run_transcribe(
         "Done. Outputs in %s", str(Path(final_out_dir).resolve())
     )
 
-def _recommend_batch_size(device: str, model_name: str, compute_type: str, user_hint: int | None = None) -> int:
+
+def _recommend_batch_size(
+    device: str, model_name: str, compute_type: str, user_hint: int | None = None
+) -> int:
     """Heuristic batch-size recommendation per device/model/precision.
 
     - Uses total VRAM when CUDA is available (via torch) to scale conservatively.
@@ -1417,10 +2800,7 @@ def watch_and_transcribe(
                 cfg_watch_input = None
                 cfg_input = None
             input_root = (
-                getattr(args, "watch_input", None)
-                or cfg_watch_input
-                or args.input
-                or cfg_input
+                getattr(args, "watch_input", None) or cfg_watch_input or args.input or cfg_input
             )
             if not input_root:
                 logger.error(
@@ -1440,12 +2820,16 @@ def watch_and_transcribe(
                     logger.warning("Watch: INPUT is a file; watching parent directory: %s", parent)
                     root = parent
                 else:
-                    logger.error("Watch: %s is neither file nor directory; sleeping %ss", root, interval)
+                    logger.error(
+                        "Watch: %s is neither file nor directory; sleeping %ss", root, interval
+                    )
                     time.sleep(interval)
                     continue
 
             # Use WARNING so it appears even in quiet mode
-            logger.warning("Watch: monitoring %s (every %ss, stability %ss)", root, interval, stability)
+            logger.warning(
+                "Watch: monitoring %s (every %ss, stability %ss)", root, interval, stability
+            )
 
             candidates = _iter_candidate_media(root)
             pending: list[str] = []
@@ -1492,11 +2876,13 @@ def watch_and_transcribe(
                             cache_mode=args.cache_mode,
                             local_files_only=args.local_files_only,
                             single_file_speaker=args.single_file_speaker,
-                            vad_on_cpu=args.vad_on_cpu,
                             pyannote_on_cpu=args.pyannote_on_cpu,
+                            diarization_model=getattr(args, "diarization_model", None),
                             quiet=args.quiet,
                             auto_batch=args.auto_batch,
-                            device=None if getattr(args, "device", "auto") == "auto" else args.device,
+                            device=(
+                                None if getattr(args, "device", "auto") == "auto" else args.device
+                            ),
                             speaker_bank_config=speaker_bank_config,
                         )
                     except BaseException as exc:  # noqa: PIE786
@@ -1538,24 +2924,59 @@ def main():
     cfg = _load_yaml_or_json(cfg_path) if cfg_path else {}
 
     # Phase 2: full parser with defaults from config
-    ap = argparse.ArgumentParser(description="Transcription with alignment + diarization (WhisperX)")
+    ap = argparse.ArgumentParser(
+        description="Transcription with ASR, diarization, and speaker naming"
+    )
     ap.add_argument("input", nargs="?", help="Path to audio file, directory, or .zip of audios")
-    ap.add_argument("--backend", choices=["whisperx", "faster", "parakeet"], default="whisperx")
-    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default=cfg.get("device", "auto"), help="Force device selection (default: auto)")
+    ap.add_argument("--backend", choices=["auto", "faster", "parakeet"], default="auto")
+    ap.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default=cfg.get("device", "auto"),
+        help="Force device selection (default: auto)",
+    )
     ap.add_argument("--model", default="large-v3", help="Model name (e.g., large-v3)")
-    ap.add_argument("--compute-type", default="float16", help="Compute type (e.g., float16, int8_float16)")
+    ap.add_argument(
+        "--compute-type", default="float16", help="Compute type (e.g., float16, int8_float16)"
+    )
     ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--auto-batch", dest="auto_batch", action="store_true", default=True, help="Choose batch size automatically for your GPU (default)")
-    ap.add_argument("--no-auto-batch", dest="auto_batch", action="store_false", help="Disable auto batch-size selection")
-    ap.add_argument("--watch", action="store_true", help="Continuously watch INPUT directory for new audio/ZIP files")
-    ap.add_argument("--watch-interval", type=int, default=10, help="Polling interval (seconds) in watch mode")
-    ap.add_argument("--watch-stability", type=int, default=5, help="Minimum age (seconds) before a new file is considered stable for processing")
+    ap.add_argument(
+        "--auto-batch",
+        dest="auto_batch",
+        action="store_true",
+        default=True,
+        help="Choose batch size automatically for your GPU (default)",
+    )
+    ap.add_argument(
+        "--no-auto-batch",
+        dest="auto_batch",
+        action="store_false",
+        help="Disable auto batch-size selection",
+    )
+    ap.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuously watch INPUT directory for new audio/ZIP files",
+    )
+    ap.add_argument(
+        "--watch-interval", type=int, default=10, help="Polling interval (seconds) in watch mode"
+    )
+    ap.add_argument(
+        "--watch-stability",
+        type=int,
+        default=5,
+        help="Minimum age (seconds) before a new file is considered stable for processing",
+    )
     ap.add_argument(
         "--watch-input",
         help="Override the directory to monitor in watch mode (defaults to INPUT/config input)",
     )
     ap.add_argument("--output-dir", default="outputs")
-    ap.add_argument("--speaker-mapping", dest="speaker_mapping", help="YAML/JSON mapping of speaker IDs -> names")
+    ap.add_argument(
+        "--speaker-mapping",
+        dest="speaker_mapping",
+        help="YAML/JSON mapping of speaker IDs -> names",
+    )
     ap.add_argument("--min-speakers", type=int)
     ap.add_argument("--max-speakers", type=int)
     ap.add_argument("--no-srt", action="store_true", help="Don't write combined SRT")
@@ -1590,21 +3011,24 @@ def main():
     )
     ap.add_argument("--config", default=cfg_path, help="Path to YAML/JSON config file")
     # Quiet mode
-    ap.add_argument("--quiet", dest="quiet", action="store_true", default=prelim.quiet, help="Reduce log noise and hide warnings (default)")
-    ap.add_argument("--no-quiet", dest="quiet", action="store_false", help="Show library warnings and info logs")
+    ap.add_argument(
+        "--quiet",
+        dest="quiet",
+        action="store_true",
+        default=prelim.quiet,
+        help="Reduce log noise and hide warnings (default)",
+    )
+    ap.add_argument(
+        "--no-quiet", dest="quiet", action="store_false", help="Show library warnings and info logs"
+    )
     ap.add_argument(
         "--single-file-speaker",
         help="If input resolves to one audio file, label segments with this speaker name (no diarization)",
     )
     ap.add_argument(
-        "--vad-on-cpu",
-        action="store_true",
-        help="Force WhisperX VAD stage to run on CPU (workaround for some GPU/cuDNN issues)",
-    )
-    ap.add_argument(
         "--pyannote-on-cpu",
         action="store_true",
-        help="Force all pyannote stages (VAD + diarization) to run on CPU",
+        help="Force direct pyannote diarization and embedding stages to run on CPU",
     )
     ap.add_argument(
         "--speaker-bank",
@@ -1624,6 +3048,12 @@ def main():
         "--speaker-bank-threshold",
         type=float,
         help="Cosine similarity threshold to accept a speaker match",
+    )
+    ap.add_argument(
+        "--speaker-bank-margin",
+        dest="speaker_bank_margin",
+        type=float,
+        help="Minimum margin between top-1 and top-2 scores to accept a speaker match.",
     )
     ap.add_argument(
         "--speaker-bank-radius-factor",
@@ -1685,9 +3115,150 @@ def main():
         help="DBSCAN min_samples value for clustering speaker embeddings",
     )
     ap.add_argument(
+        "--speaker-bank-prototypes",
+        dest="speaker_bank_prototypes",
+        action="store_true",
+        default=None,
+        help="Enable prototype-based speaker matching (in addition to cluster centroids).",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-prototypes",
+        dest="speaker_bank_prototypes",
+        action="store_false",
+        help="Disable prototype-based speaker matching.",
+    )
+    ap.add_argument(
+        "--speaker-bank-prototypes-per-cluster",
+        dest="speaker_bank_prototypes_per_cluster",
+        type=int,
+        help="Number of prototype embeddings to retain per speaker cluster.",
+    )
+    ap.add_argument(
+        "--speaker-bank-prototypes-method",
+        dest="speaker_bank_prototypes_method",
+        choices=["central", "kmeans"],
+        help="Prototype selection strategy (default: central).",
+    )
+    ap.add_argument(
         "--speaker-bank-train-only",
         metavar="AUDIO_PATH",
         help="Train or update the speaker bank using audio without running transcription",
+    )
+    ap.add_argument(
+        "--segments-json",
+        dest="speaker_bank_segments_json",
+        help="JSON/JSONL file or directory containing labeled segments for speaker-bank training",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-from-segments",
+        dest="speaker_bank_train_from_segments",
+        action="store_true",
+        default=None,
+        help="Enable training from pre-computed segments (JSON/JSONL).",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-train-from-segments",
+        dest="speaker_bank_train_from_segments",
+        action="store_false",
+        help="Disable training from pre-computed segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-segment-source",
+        dest="speaker_bank_train_segment_source",
+        choices=["auto", "session_jsonl", "diarization_json"],
+        help="Preferred artifact when auto-discovering segment metadata (default: auto).",
+    )
+    ap.add_argument(
+        "--speaker-bank-min-segment-dur",
+        dest="speaker_bank_min_segment_dur",
+        type=float,
+        help="Minimum segment/window duration in seconds when training from segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-max-segment-dur",
+        dest="speaker_bank_max_segment_dur",
+        type=float,
+        help="Maximum segment/window duration in seconds when training from segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-window-size",
+        dest="speaker_bank_window_size",
+        type=float,
+        help="Sliding window size in seconds for segment chunking (<=0 uses the full segment).",
+    )
+    ap.add_argument(
+        "--speaker-bank-window-stride",
+        dest="speaker_bank_window_stride",
+        type=float,
+        help="Stride in seconds between sliding windows (<=0 defaults to the window size).",
+    )
+    ap.add_argument(
+        "--speaker-bank-max-embeddings",
+        dest="speaker_bank_max_embeddings",
+        type=int,
+        help="Maximum number of embeddings to retain per speaker during training (<=0 = unlimited).",
+    )
+    ap.add_argument(
+        "--speaker-bank-train-chunk-stems",
+        dest="speaker_bank_vad_chunk_stems",
+        action="store_true",
+        default=None,
+        help="Chunk single-speaker stems into windows when segment metadata is unavailable.",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-train-chunk-stems",
+        dest="speaker_bank_vad_chunk_stems",
+        action="store_false",
+        help="Do not chunk stems when segment metadata is unavailable.",
+    )
+    ap.add_argument(
+        "--speaker-bank-pre-pad",
+        dest="speaker_bank_pre_pad",
+        type=float,
+        help="Seconds of audio to prepend to each training window when extracting embeddings.",
+    )
+    ap.add_argument(
+        "--speaker-bank-post-pad",
+        dest="speaker_bank_post_pad",
+        type=float,
+        help="Seconds of audio to append to each training window when extracting embeddings.",
+    )
+    ap.add_argument(
+        "--speaker-bank-embed-workers",
+        dest="speaker_bank_embed_workers",
+        type=int,
+        help="Number of CPU workers used to crop training segments.",
+    )
+    ap.add_argument(
+        "--speaker-bank-embed-batch-size",
+        dest="speaker_bank_embed_batch_size",
+        type=int,
+        help="Number of segment windows to embed per GPU forward batch.",
+    )
+    ap.add_argument(
+        "--speaker-bank-match-per-segment",
+        dest="speaker_bank_match_per_segment",
+        action="store_true",
+        default=None,
+        help="Match each diarization segment against the speaker bank and aggregate per label.",
+    )
+    ap.add_argument(
+        "--speaker-bank-no-match-per-segment",
+        dest="speaker_bank_match_per_segment",
+        action="store_false",
+        help="Disable per-segment speaker-bank matching.",
+    )
+    ap.add_argument(
+        "--speaker-bank-match-aggregation",
+        dest="speaker_bank_match_aggregation",
+        choices=["mean", "vote"],
+        help="Aggregation strategy for segment-level matches (default: mean).",
+    )
+    ap.add_argument(
+        "--speaker-bank-min-segments-per-label",
+        dest="speaker_bank_min_segments_per_label",
+        type=int,
+        help="Minimum number of matched segments required before assigning a speaker to a diar label.",
     )
 
     _apply_config_defaults(ap, cfg)
@@ -1709,18 +3280,18 @@ def main():
             hf_cache_root=args.hf_cache_root or args.cache_root,
             cache_mode=args.cache_mode,
             local_files_only=args.local_files_only,
-            backend=args.backend,
             model_name=args.model,
             compute_type=args.compute_type,
             batch_size=args.batch_size,
             auto_batch=args.auto_batch,
-            vad_on_cpu=args.vad_on_cpu,
             pyannote_on_cpu=args.pyannote_on_cpu,
+            diarization_model=getattr(args, "diarization_model", None),
             quiet=args.quiet,
             device=None if args.device == "auto" else args.device,
             speaker_bank_config=speaker_bank_config or SpeakerBankConfig(),
             speaker_mapping_path=args.speaker_mapping,
             speaker_bank_root_override=args.speaker_bank_root,
+            segments_json=args.speaker_bank_segments_json,
         )
         return
 
@@ -1756,12 +3327,13 @@ def main():
         cache_mode=args.cache_mode,
         local_files_only=args.local_files_only,
         single_file_speaker=args.single_file_speaker,
-        vad_on_cpu=args.vad_on_cpu,
         pyannote_on_cpu=args.pyannote_on_cpu,
+        diarization_model=getattr(args, "diarization_model", None),
         quiet=args.quiet,
         device=None if args.device == "auto" else args.device,
         speaker_bank_config=speaker_bank_config,
     )
+
 
 if __name__ == "__main__":
     main()
