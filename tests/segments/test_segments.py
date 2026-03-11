@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 import types
-from pathlib import Path
 
 import numpy as np
 
@@ -12,7 +11,7 @@ from transcriber.segments import (
     generate_windows_for_segments,
     load_segments_from_jsonl,
 )
-from transcriber.whisperx_backend import extract_embeddings_for_segments
+from transcriber.diarization import extract_embeddings_for_segments
 
 
 def test_load_segments_from_jsonl(tmp_path):
@@ -58,13 +57,26 @@ def test_generate_windows_from_segment():
 
 
 def test_extract_embeddings_for_segments_mocked(monkeypatch, tmp_path):
-    # Stub whisperx.audio
-    audio_module = types.SimpleNamespace(
-        load_audio=lambda path: np.ones(32000, dtype=np.float32),
-        SAMPLE_RATE=16000,
+    monkeypatch.setattr(
+        "transcriber.diarization.load_audio_mono",
+        lambda path, sample_rate=16000: np.ones(32000, dtype=np.float32),
     )
-    monkeypatch.setitem(sys.modules, "whisperx", types.SimpleNamespace(audio=audio_module))
-    monkeypatch.setitem(sys.modules, "whisperx.audio", audio_module)
+
+    class DummyNoGrad:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    torch_module = types.SimpleNamespace(
+        device=lambda value: value,
+        float32=np.float32,
+        from_numpy=lambda arr: np.asarray(arr, dtype=np.float32),
+        zeros=lambda shape, dtype=None, device=None: np.zeros(shape, dtype=np.float32),
+        no_grad=lambda: DummyNoGrad(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
 
     class DummyEmbedder:
         sample_rate = 16000
@@ -76,13 +88,9 @@ def test_extract_embeddings_for_segments_mocked(monkeypatch, tmp_path):
             batch = wave_batch.shape[0]
             return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (batch, 1))
 
-    class DummyPipeline:
-        def __init__(self):
-            self.model = types.SimpleNamespace(_embedding=DummyEmbedder(), embedding="dummy")
-
     monkeypatch.setattr(
-        "transcriber.whisperx_backend._get_diar_pipeline",
-        lambda device, token: DummyPipeline(),
+        "transcriber.diarization._resolve_embedder",
+        lambda model_name, hf_token, device: DummyEmbedder(),
     )
 
     segments = [(0.0, 1.0, "SpeakerA"), (1.0, 2.0, "SpeakerB")]

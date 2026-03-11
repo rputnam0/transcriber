@@ -34,7 +34,7 @@ Array = NDArray[np.float32]
 class SpeakerBankConfig:
     enabled: bool = True
     path: str = "default"
-    threshold: float = 0.65
+    threshold: float = 0.35
     radius_factor: float = 2.5
     use_existing: bool = True
     train_from_stems: bool = False
@@ -52,15 +52,34 @@ class SpeakerBankConfig:
     embed_workers: int = 4
     embed_batch_size: int = 16
     scoring_margin: float = 0.0
+    classifier_min_confidence: float = 0.0
+    classifier_min_margin: float = 0.03
+    classifier_fusion_mode: str = "fallback"
+    classifier_fusion_weight: float = 0.70
+    classifier_bank_weight: float = 0.30
+    classifier_model: str = "knn"
+    classifier_c: float = 1.0
+    classifier_n_neighbors: int = 7
+    classifier_training_mode: str = "mixed"
+    classifier_train_enabled: bool = True
+    classifier_excluded_speakers: List[str] = field(default_factory=list)
+    classifier_augmentation_profile: str = "none"
+    classifier_augmentation_copies: int = 0
+    classifier_augmentation_seed: int = 13
+    classifier_clean_max_records_per_speaker_per_session: int = 80
+    classifier_dataset_cache_dir: Optional[str] = None
+    classifier_input_paths: List[str] = field(default_factory=list)
+    classifier_transcript_roots: List[str] = field(default_factory=list)
+    diarization_model: Optional[str] = None
     scoring_as_norm_enabled: bool = False
     scoring_as_norm_cohort_size: int = 50
-    scoring_whiten: bool = False
+    scoring_whiten: bool = True
     prototypes_enabled: bool = True
     prototypes_per_cluster: int = 3
     prototypes_method: str = "central"
-    match_per_segment: bool = False
+    match_per_segment: bool = True
     match_aggregation: str = "mean"
-    min_segments_per_label: int = 3
+    min_segments_per_label: int = 1
     emit_pca: bool = True
     cluster_method: str = "dbscan"
     cluster_eps: float = 0.28
@@ -136,6 +155,7 @@ class SpeakerBank:
         prototypes_enabled: bool = True,
         prototypes_per_cluster: int = 3,
         prototypes_method: str = "central",
+        scoring_whiten: bool = False,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.profile = profile
@@ -149,9 +169,14 @@ class SpeakerBank:
         self.prototypes_enabled = prototypes_enabled
         self.prototypes_per_cluster = max(int(prototypes_per_cluster or 0), 0)
         self.prototypes_method = (prototypes_method or "central").lower()
+        self.scoring_whiten = bool(scoring_whiten)
         self._embeddings: List[Array] = []
         self._metas: List[SampleMeta] = []
         self._clusters: Dict[str, List[ClusterInfo]] = {}
+        self._score_embeddings: Optional[List[Array]] = None
+        self._whiten_mean: Optional[NDArray[np.float64]] = None
+        self._whiten_matrix: Optional[NDArray[np.float64]] = None
+        self._cohort_cache: Dict[str, NDArray[np.float32]] = {}
         self._dirty = False
         self._load()
 
@@ -197,6 +222,7 @@ class SpeakerBank:
                 try:
                     indices = [int(i) for i in info.get("members", [])]  # type: ignore[union-attr]
                     centroid = self._compute_centroid(indices)
+                    variance = self._cluster_variance(centroid, indices)
                     prototypes_raw = info.get("prototypes") or []
                     proto_indices = [int(i) for i in prototypes_raw if isinstance(i, (int, float))]
                     items.append(
@@ -205,7 +231,7 @@ class SpeakerBank:
                             cluster_id=str(info.get("cluster_id") or ""),
                             centroid=centroid,
                             member_indices=indices,
-                            variance=float(info.get("variance") or 0.0),
+                            variance=variance,
                             prototype_indices=proto_indices,
                         )
                     )
@@ -216,7 +242,8 @@ class SpeakerBank:
         return result
 
     def _compute_centroid(self, indices: Iterable[int]) -> Array:
-        vectors = [self._embeddings[idx] for idx in indices if 0 <= idx < len(self._embeddings)]
+        active_embeddings = self._get_active_embeddings()
+        vectors = [active_embeddings[idx] for idx in indices if 0 <= idx < len(active_embeddings)]
         if not vectors:
             return np.zeros((1,), dtype=np.float32)
         stacked = np.vstack(vectors)
@@ -248,6 +275,8 @@ class SpeakerBank:
             extra=extra or {},
         )
         self._metas.append(meta)
+        self._clusters = {}
+        self._invalidate_scoring_cache()
         self._dirty = True
 
     def extend(
@@ -276,6 +305,132 @@ class SpeakerBank:
         tmp_path.replace(self.manifest_path)
         self._dirty = False
 
+    def _invalidate_scoring_cache(self) -> None:
+        self._score_embeddings = None
+        self._whiten_mean = None
+        self._whiten_matrix = None
+        self._cohort_cache = {}
+
+    def _get_active_embeddings(self) -> List[Array]:
+        if not self.scoring_whiten or not self._embeddings:
+            return self._embeddings
+        if self._score_embeddings is not None:
+            return self._score_embeddings
+
+        matrix = np.vstack(self._embeddings).astype(np.float64, copy=False)
+        if matrix.shape[0] < 2:
+            self._score_embeddings = [vec.copy() for vec in self._embeddings]
+            return self._score_embeddings
+
+        mean = matrix.mean(axis=0)
+        centered = matrix - mean
+        cov = np.cov(centered, rowvar=False, bias=False)
+        if cov.ndim == 0:
+            cov = np.array([[float(cov)]], dtype=np.float64)
+
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError as exc:
+            logger.debug(
+                "Whitening eigendecomposition failed; falling back to raw embeddings: %s", exc
+            )
+            self._score_embeddings = [vec.copy() for vec in self._embeddings]
+            return self._score_embeddings
+
+        if eigenvalues.size == 0:
+            self._score_embeddings = [vec.copy() for vec in self._embeddings]
+            return self._score_embeddings
+
+        eps = max(float(np.max(eigenvalues)) * 1e-6, 1e-8)
+        inv_sqrt = np.where(eigenvalues > eps, 1.0 / np.sqrt(eigenvalues), 0.0)
+        whitening = eigenvectors @ np.diag(inv_sqrt) @ eigenvectors.T
+        transformed = centered @ whitening
+        norms = np.linalg.norm(transformed, axis=1, keepdims=True)
+        safe_norms = np.where(norms > 0.0, norms, 1.0)
+        transformed = transformed / safe_norms
+
+        self._whiten_mean = mean.astype(np.float64, copy=False)
+        self._whiten_matrix = whitening.astype(np.float64, copy=False)
+        self._score_embeddings = [np.asarray(row, dtype=np.float32) for row in transformed]
+        return self._score_embeddings
+
+    def _transform_for_scoring(self, vec: Array) -> Array:
+        normalized = np.asarray(vec, dtype=np.float32)
+        if normalized.ndim != 1:
+            raise ValueError("Embedding to transform must be a 1D vector")
+        if not self.scoring_whiten:
+            return normalized
+
+        active_embeddings = self._get_active_embeddings()
+        if (
+            active_embeddings is self._embeddings
+            or self._whiten_mean is None
+            or self._whiten_matrix is None
+        ):
+            return normalized
+
+        transformed = (normalized.astype(np.float64) - self._whiten_mean) @ self._whiten_matrix
+        norm = np.linalg.norm(transformed)
+        if norm == 0.0:
+            return normalized
+        return np.asarray(transformed / norm, dtype=np.float32)
+
+    def _get_cohort_matrix(self, speaker: str) -> NDArray[np.float32]:
+        cached = self._cohort_cache.get(speaker)
+        if cached is not None:
+            return cached
+
+        active_embeddings = self._get_active_embeddings()
+        cohort_rows = [
+            active_embeddings[idx]
+            for idx, meta in enumerate(self._metas)
+            if meta.speaker != speaker
+        ]
+        if cohort_rows:
+            cohort = np.vstack(cohort_rows).astype(np.float32, copy=False)
+        elif active_embeddings:
+            cohort = np.zeros((0, active_embeddings[0].shape[0]), dtype=np.float32)
+        else:
+            cohort = np.zeros((0, 1), dtype=np.float32)
+        self._cohort_cache[speaker] = cohort
+        return cohort
+
+    def _top_k_stats(self, scores: NDArray[np.float32], cohort_size: int) -> Tuple[float, float]:
+        if scores.size == 0 or cohort_size <= 0:
+            return 0.0, 1.0
+        limit = min(int(cohort_size), int(scores.size))
+        if limit <= 0:
+            return 0.0, 1.0
+        if limit >= scores.size:
+            top_scores = scores
+        else:
+            partition_index = scores.size - limit
+            top_scores = np.partition(scores, partition_index)[partition_index:]
+        mean = float(np.mean(top_scores))
+        std = float(np.std(top_scores))
+        return mean, max(std, 1e-6)
+
+    def _apply_adaptive_s_norm(
+        self,
+        raw_score: float,
+        query_vec: Array,
+        candidate_vec: Array,
+        *,
+        speaker: str,
+        cohort_size: int,
+    ) -> float:
+        cohort = self._get_cohort_matrix(speaker)
+        if cohort.size == 0:
+            return raw_score
+
+        query_scores = np.asarray(cohort @ query_vec, dtype=np.float32)
+        candidate_scores = np.asarray(cohort @ candidate_vec, dtype=np.float32)
+        query_mean, query_std = self._top_k_stats(query_scores, cohort_size)
+        candidate_mean, candidate_std = self._top_k_stats(candidate_scores, cohort_size)
+        return 0.5 * (
+            ((raw_score - candidate_mean) / candidate_std) + ((raw_score - query_mean) / query_std)
+        )
+
     def _select_prototypes(self, member_indices: Iterable[int], centroid: Array) -> List[int]:
         if not self.prototypes_enabled or self.prototypes_per_cluster <= 0:
             return []
@@ -286,9 +441,15 @@ class SpeakerBank:
         if limit <= 0:
             return []
 
-        vectors = np.vstack([self._embeddings[i] for i in indices])
+        active_embeddings = self._get_active_embeddings()
+        vectors = np.vstack([active_embeddings[i] for i in indices])
 
-        if self.prototypes_method == "kmeans" and KMeans is not None and limit > 1 and len(indices) >= limit:
+        if (
+            self.prototypes_method == "kmeans"
+            and KMeans is not None
+            and limit > 1
+            and len(indices) >= limit
+        ):
             try:
                 km = KMeans(n_clusters=limit, n_init=10, random_state=42)
                 km.fit(vectors)
@@ -305,7 +466,11 @@ class SpeakerBank:
                 if len(chosen) >= limit:
                     return chosen[:limit]
                 indices_remaining = [idx for idx in indices if idx not in chosen]
-                vectors_remaining = np.vstack([self._embeddings[i] for i in indices_remaining]) if indices_remaining else np.empty((0, vectors.shape[1]))
+                vectors_remaining = (
+                    np.vstack([active_embeddings[i] for i in indices_remaining])
+                    if indices_remaining
+                    else np.empty((0, vectors.shape[1]))
+                )
                 if indices_remaining:
                     distances = np.linalg.norm(vectors_remaining - centroid, axis=1)
                     order = np.argsort(distances)
@@ -332,8 +497,9 @@ class SpeakerBank:
         for idx, meta in enumerate(self._metas):
             speaker_to_indices.setdefault(meta.speaker, []).append(idx)
 
+        active_embeddings = self._get_active_embeddings()
         for speaker, indices in speaker_to_indices.items():
-            vectors = np.vstack([self._embeddings[i] for i in indices])
+            vectors = np.vstack([active_embeddings[i] for i in indices])
             method = (self.cluster_method or "dbscan").lower()
             labels = np.zeros(len(indices), dtype=int)
             if method == "dbscan" and DBSCAN is not None and len(indices) >= 2:
@@ -356,7 +522,7 @@ class SpeakerBank:
                 if label == -1:
                     # treat each as its own cluster
                     for idx in member_indices:
-                        centroid = self._embeddings[idx]
+                        centroid = active_embeddings[idx]
                         cluster = ClusterInfo(
                             speaker=speaker,
                             cluster_id=f"{speaker}_solo_{idx}",
@@ -396,20 +562,30 @@ class SpeakerBank:
 
     def _cluster_variance(self, centroid: Array, indices: Iterable[int]) -> float:
         distances: List[float] = []
+        active_embeddings = self._get_active_embeddings()
         for idx in indices:
-            vec = self._embeddings[idx]
+            vec = active_embeddings[idx]
             distances.append(float(np.linalg.norm(vec - centroid)))
         if not distances:
             return 0.0
         return float(np.mean(np.square(distances)))
 
-    def _serialize_clusters(self, clusters: Dict[str, List[ClusterInfo]]) -> Dict[str, List[Dict[str, object]]]:
+    def _serialize_clusters(
+        self, clusters: Dict[str, List[ClusterInfo]]
+    ) -> Dict[str, List[Dict[str, object]]]:
         return {
             speaker: [cluster.serialize() for cluster in cluster_list]
             for speaker, cluster_list in clusters.items()
         }
 
-    def _score_candidates_normalized(self, vec: Array, radius_factor: float) -> List[Dict[str, object]]:
+    def _score_candidates_normalized(
+        self,
+        vec: Array,
+        radius_factor: float,
+        *,
+        as_norm_enabled: bool,
+        as_norm_cohort_size: int,
+    ) -> List[Dict[str, object]]:
         if not self._clusters:
             self._clusters = self._build_clusters()
         if not self._clusters:
@@ -417,6 +593,7 @@ class SpeakerBank:
         results: List[Dict[str, object]] = []
         for speaker, cluster_list in self._clusters.items():
             best_score: Optional[float] = None
+            best_raw_score: Optional[float] = None
             best_cluster: Optional[ClusterInfo] = None
             best_source = "centroid"
             best_distance = 0.0
@@ -428,9 +605,12 @@ class SpeakerBank:
                 if self.prototypes_enabled and cluster.prototype_indices:
                     for idx in cluster.prototype_indices:
                         if 0 <= idx < len(self._embeddings):
-                            candidate_vectors.append(("prototype", self._embeddings[idx]))
+                            candidate_vectors.append(
+                                ("prototype", self._get_active_embeddings()[idx])
+                            )
 
                 cluster_best_score: Optional[float] = None
+                cluster_best_raw_score: Optional[float] = None
                 cluster_best_source = "centroid"
                 cluster_best_distance = 0.0
                 for source_name, candidate_vec in candidate_vectors:
@@ -441,9 +621,19 @@ class SpeakerBank:
                         distance_limit = math.sqrt(cluster.variance) * radius_factor
                         if candidate_distance > max(distance_limit, 1e-4):
                             continue
-                    score = float(np.dot(vec, candidate_vec))
+                    raw_score = float(np.dot(vec, candidate_vec))
+                    score = raw_score
+                    if as_norm_enabled:
+                        score = self._apply_adaptive_s_norm(
+                            raw_score,
+                            vec,
+                            candidate_vec,
+                            speaker=speaker,
+                            cohort_size=as_norm_cohort_size,
+                        )
                     if cluster_best_score is None or score > cluster_best_score:
                         cluster_best_score = score
+                        cluster_best_raw_score = raw_score
                         cluster_best_source = source_name
                         cluster_best_distance = candidate_distance
 
@@ -451,6 +641,7 @@ class SpeakerBank:
                     continue
                 if best_score is None or cluster_best_score > best_score:
                     best_score = cluster_best_score
+                    best_raw_score = cluster_best_raw_score
                     best_cluster = cluster
                     best_source = cluster_best_source
                     best_distance = cluster_best_distance
@@ -461,9 +652,11 @@ class SpeakerBank:
                         "speaker": speaker,
                         "cluster_id": best_cluster.cluster_id,
                         "score": best_score,
+                        "raw_score": best_raw_score if best_raw_score is not None else best_score,
                         "distance": best_distance,
                         "source": best_source,
                         "variance": best_cluster.variance,
+                        "score_mode": "as_norm" if as_norm_enabled else "cosine",
                     }
                 )
 
@@ -475,6 +668,8 @@ class SpeakerBank:
         embedding: Array,
         *,
         radius_factor: float = 2.5,
+        as_norm_enabled: bool = False,
+        as_norm_cohort_size: int = 50,
     ) -> List[Dict[str, object]]:
         vec = np.asarray(embedding, dtype=np.float32)
         if vec.ndim != 1:
@@ -483,7 +678,12 @@ class SpeakerBank:
         if norm == 0:
             return []
         normalized = vec / norm
-        candidates = self._score_candidates_normalized(normalized, radius_factor)
+        candidates = self._score_candidates_normalized(
+            self._transform_for_scoring(normalized),
+            radius_factor,
+            as_norm_enabled=bool(as_norm_enabled),
+            as_norm_cohort_size=max(int(as_norm_cohort_size or 0), 0),
+        )
         return candidates
 
     def match(
@@ -493,8 +693,15 @@ class SpeakerBank:
         threshold: float,
         radius_factor: float = 2.5,
         margin: float = 0.0,
+        as_norm_enabled: bool = False,
+        as_norm_cohort_size: int = 50,
     ) -> Optional[Dict[str, object]]:
-        candidates = self.score_candidates(embedding, radius_factor=radius_factor)
+        candidates = self.score_candidates(
+            embedding,
+            radius_factor=radius_factor,
+            as_norm_enabled=as_norm_enabled,
+            as_norm_cohort_size=as_norm_cohort_size,
+        )
         if not candidates:
             logger.debug(
                 "Speaker bank profile=%s has no clusters available for matching.",
@@ -561,9 +768,16 @@ class SpeakerBank:
                 if meta.speaker not in colors:
                     colors[meta.speaker] = tuple(rng.uniform(0.25, 0.95, size=3))
                 color = colors[meta.speaker]
-                ax.scatter(coords[idx, 0], coords[idx, 1], c=[color], label=meta.speaker, alpha=0.7, s=24)
+                ax.scatter(
+                    coords[idx, 0], coords[idx, 1], c=[color], label=meta.speaker, alpha=0.7, s=24
+                )
                 if annotate:
-                    ax.annotate(meta.cluster_id or idx, (coords[idx, 0], coords[idx, 1]), fontsize=6, alpha=0.6)
+                    ax.annotate(
+                        meta.cluster_id or idx,
+                        (coords[idx, 0], coords[idx, 1]),
+                        fontsize=6,
+                        alpha=0.6,
+                    )
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 unique = dict(zip(labels, handles))

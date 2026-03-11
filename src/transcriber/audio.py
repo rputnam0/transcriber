@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 import shutil
 from typing import List, Tuple, Optional
+
+import numpy as np
 
 AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 
@@ -75,13 +78,10 @@ def gather_inputs(path: str) -> Tuple[List[str], Optional[str]]:
         return ([str(target)] if is_audio_file(target) else []), None
 
     return (
-        sorted(
-            str(f)
-            for f in target.rglob("*")
-            if f.is_file() and is_audio_file(f)
-        ),
+        sorted(str(f) for f in target.rglob("*") if f.is_file() and is_audio_file(f)),
         None,
     )
+
 
 def cleanup_tmp(root: Optional[str]) -> None:
     if root:
@@ -89,3 +89,31 @@ def cleanup_tmp(root: Optional[str]) -> None:
             shutil.rmtree(root)
         except Exception:
             pass
+
+
+def load_audio_mono(
+    path: str | Path,
+    *,
+    sample_rate: int = 16000,
+) -> np.ndarray:
+    """Decode audio to mono float32 PCM via ffmpeg."""
+    target = str(Path(path).expanduser())
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        target,
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-ac",
+        "1",
+        "-ar",
+        str(int(sample_rate)),
+        "pipe:1",
+    ]
+    result = subprocess.run(command, check=True, capture_output=True)
+    return np.frombuffer(result.stdout, dtype=np.float32)

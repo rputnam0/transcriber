@@ -1,4 +1,4 @@
-backend: whisperx
+backend: faster
 device: auto
 model: large-v3
 compute_type: float16
@@ -10,18 +10,40 @@ input: audio/Session_XX.zip
 output_dir: .outputs
 
 speaker_mapping: config/speaker_mapping.yaml
+diarization_model: pyannote/speaker-diarization-community-1
 
 speaker_bank:
   enabled: true
   path: default
-  threshold: 0.60
-  scoring_margin: 0.03
+  threshold: 0.35
+  scoring_margin: 0.0
+  scoring:
+    whiten: true
   radius_factor: 2.5
   use_existing: true
   train_from_stems: false
   match_per_segment: true
   match_aggregation: mean
-  min_segments_per_label: 3
+  min_segments_per_label: 1
+  classifier:
+    model: knn
+    c: 1.0
+    n_neighbors: 7
+    training_mode: mixed
+    clean_max_records_per_speaker_per_session: 100
+    dataset_cache_dir: ./.hf_cache/speaker_bank/default/classifier_dataset
+    min_confidence: 0.0
+    min_margin: 0.03
+    excluded_speakers: []
+    augmentation:
+      profile: none
+      copies: 0
+      seed: 13
+    input_paths:
+      - /mnt/g/My Drive/DND/Audio
+      - /mnt/g/My Drive/DND/Audio/transcribe
+    transcript_roots:
+      - /mnt/g/My Drive/DND/Transcripts
   emit_pca: true
   train:
     from_segments: true

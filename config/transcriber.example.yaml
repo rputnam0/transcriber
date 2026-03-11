@@ -1,4 +1,4 @@
-backend: whisperx
+backend: auto  # auto -> faster for CUDA/speaker-aware runs, parakeet for ZIP stems or explicit single-speaker CPU runs
 # device options: auto (default), cuda, cpu
 device: auto
 model: large-v3
@@ -26,22 +26,43 @@ write_jsonl: true
 speaker_mapping: config/speaker_mapping.example.yaml
 min_speakers:
 max_speakers:
+diarization_model: pyannote/speaker-diarization-community-1
 # When input resolves to a single file, label all segments with this speaker name.
 single_file_speaker:
 
 speaker_bank:
   enabled: true
   path: default  # stored under cache_root/speaker_bank/
-  threshold: 0.65
+  threshold: 0.35
   radius_factor: 2.5
   use_existing: true
   train_from_stems: false
+  scoring_margin: 0.0
+  scoring:
+    whiten: true
+  match_per_segment: true
+  min_segments_per_label: 1
+  classifier:
+    model: knn             # knn | logreg | logreg_unbalanced | torch_linear
+    c: 1.0                 # ignored by knn
+    n_neighbors: 7
+    training_mode: mixed   # mixed | clean | hybrid
+    clean_max_records_per_speaker_per_session: 100
+    dataset_cache_dir: ./.hf_cache/speaker_bank/default/classifier_dataset
+    min_confidence: 0.0
+    min_margin: 0.03
+    excluded_speakers: []  # Optional labels to drop from classifier and bank training
+    augmentation:
+      profile: none        # none | light | discord
+      copies: 0
+      seed: 13
+    input_paths: []        # Optional extra ZIP roots for classifier training
+    transcript_roots: []   # Optional transcript roots paired with input_paths
   emit_pca: true
   cluster:
     method: dbscan
     eps: 0.28
     min_samples: 5
-vad_on_cpu: false
 pyannote_on_cpu: false
 
 # Cache location strategy
