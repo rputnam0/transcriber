@@ -1898,11 +1898,7 @@ def run_transcribe(
                             continue
                         seg_idx = label_index_map[result.index]
                         classifier_prediction = None
-                        classifier_candidates: List[Dict[str, object]] = []
                         if segment_classifier is not None:
-                            classifier_candidates = segment_classifier.score_candidates(
-                                result.embedding
-                            )
                             segment_duration = max(float(result.end) - float(result.start), 0.0)
                             classifier_min_confidence, classifier_min_margin = (
                                 _segment_classifier_thresholds(
@@ -1972,7 +1968,7 @@ def run_transcribe(
                             "top_score": top1["score"] if top1 else None,
                             "second_best": top2_score,
                             "margin": margin_value,
-                            "candidates": classifier_candidates or candidates,
+                            "candidates": candidates,
                         }
 
                 # Aggregation per label

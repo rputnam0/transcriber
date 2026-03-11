@@ -708,6 +708,188 @@ def test_run_transcribe_segment_classifier_overrides_bank_when_confident(monkeyp
     )
 
 
+def test_run_transcribe_label_aggregation_uses_bank_candidates_after_classifier_reject(
+    monkeypatch, tmp_path
+):
+    from transcriber import cli as cli_mod
+    from transcriber.diarization import SegmentEmbeddingResult
+    from transcriber.speaker_bank import SpeakerBankConfig
+    from transcriber.transcript_pipeline import TranscriptPipelineResult
+
+    fake_input = tmp_path / "input.m4a"
+    fake_input.write_text("dummy")
+
+    def fake_gather_inputs(path: str) -> Tuple[List[str], None]:
+        assert path == str(fake_input)
+        return ([str(fake_input)], None)
+
+    def fake_transcribe_with_faster_pipeline(*args: Any, **kwargs: Any):
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one", "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 2.0, "text": "two", "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 3.0, "text": "three", "speaker": "SPEAKER_00"},
+        ]
+        diar = [dict(item) for item in segments]
+        return TranscriptPipelineResult(
+            segments=segments,
+            diarization_segments=diar,
+            exclusive_diarization_segments=diar,
+            speaker_embeddings={"SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32)},
+            metadata={},
+        )
+
+    def fake_extract_embeddings_for_segments(
+        audio_path: str,
+        segments: List[Tuple[float, float, str]],
+        hf_token: str | None,
+        **kwargs: Any,
+    ):
+        vectors = [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.4, 0.6], dtype=np.float32),
+        ]
+        results = [
+            SegmentEmbeddingResult(
+                speaker=label,
+                start=float(start),
+                end=float(end),
+                index=index,
+                embedding=vectors[index],
+            )
+            for index, (start, end, label) in enumerate(segments)
+        ]
+        return results, {"embedded": len(results), "skipped": 0, "total": len(results)}
+
+    class FakeSpeakerBank:
+        def __init__(self, *args: Any, **kwargs: Any):
+            self.is_empty = False
+
+        def summary(self) -> Dict[str, Any]:
+            return {"profile": "default", "speakers": ["BankAlice", "ClassifierBob"], "entries": 2}
+
+        def score_candidates(self, embedding: np.ndarray, **kwargs: Any):
+            if float(embedding[0]) >= 0.9:
+                return [
+                    {
+                        "speaker": "BankAlice",
+                        "cluster_id": "alice",
+                        "score": 0.92,
+                        "raw_score": 0.92,
+                        "distance": 0.08,
+                        "source": "prototype",
+                    },
+                    {
+                        "speaker": "ClassifierBob",
+                        "cluster_id": "bob",
+                        "score": 0.20,
+                        "raw_score": 0.20,
+                        "distance": 0.80,
+                        "source": "prototype",
+                    },
+                ]
+            return [
+                {
+                    "speaker": "BankAlice",
+                    "cluster_id": "alice",
+                    "score": 0.45,
+                    "raw_score": 0.45,
+                    "distance": 0.55,
+                    "source": "prototype",
+                },
+                {
+                    "speaker": "ClassifierBob",
+                    "cluster_id": "bob",
+                    "score": 0.30,
+                    "raw_score": 0.30,
+                    "distance": 0.70,
+                    "source": "prototype",
+                },
+            ]
+
+        def match(self, embedding: np.ndarray, **kwargs: Any) -> Dict[str, Any] | None:
+            candidate = self.score_candidates(embedding)[0]
+            if candidate["score"] < kwargs.get("threshold", 0.0):
+                return None
+            return {**candidate, "margin": candidate["score"], "second_best": 0.0}
+
+    class FakeSegmentClassifier:
+        def summary(self) -> Dict[str, Any]:
+            return {"samples": 3, "speakers": {"ClassifierBob": 3}}
+
+        def score_candidates(self, embedding: np.ndarray) -> List[Dict[str, Any]]:
+            return [
+                {"speaker": "ClassifierBob", "score": 0.95, "source": "segment_classifier"},
+                {"speaker": "BankAlice", "score": 0.05, "source": "segment_classifier"},
+            ]
+
+        def predict(
+            self,
+            embedding: np.ndarray,
+            *,
+            min_confidence: float,
+            min_margin: float,
+        ):
+            return None
+
+    def fake_save_outputs(
+        *,
+        base_stem: str,
+        output_dir: str,
+        per_file_segments: List[Tuple[str, List[Dict[str, Any]]]],
+        consolidated_pairs: List[Tuple[str, str, str]],
+        diar_by_file: Dict[str, List[Dict[str, Any]]] | None,
+        exclusive_diar_by_file: Dict[str, List[Dict[str, Any]]] | None,
+        write_srt_file: bool,
+        write_jsonl_file: bool,
+    ) -> Path:
+        speakers = [segment["speaker"] for _, segments in per_file_segments for segment in segments]
+        assert speakers == ["BankAlice", "BankAlice", "BankAlice"]
+        return Path(output_dir)
+
+    monkeypatch.setattr(cli_mod, "gather_inputs", fake_gather_inputs)
+    monkeypatch.setattr(cli_mod, "save_outputs", fake_save_outputs)
+    monkeypatch.setattr(cli_mod, "cleanup_tmp", lambda *_args: None)
+    monkeypatch.setattr(cli_mod, "SpeakerBank", FakeSpeakerBank)
+    monkeypatch.setattr(
+        cli_mod, "load_segment_classifier", lambda *_args, **_kwargs: FakeSegmentClassifier()
+    )
+    monkeypatch.setattr(
+        "transcriber.transcript_pipeline.transcribe_with_faster_pipeline",
+        fake_transcribe_with_faster_pipeline,
+    )
+    monkeypatch.setattr(
+        "transcriber.diarization.extract_embeddings_for_segments",
+        fake_extract_embeddings_for_segments,
+    )
+    monkeypatch.setattr("transcriber.diarization._detect_device", lambda: "cpu")
+    monkeypatch.setattr(cli_mod, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli_mod, "_preload_cudnn_libs", lambda: None)
+
+    cli_mod.run_transcribe(
+        input_path=str(fake_input),
+        backend="faster",
+        model_name="tiny",
+        compute_type="int8",
+        batch_size=4,
+        output_dir=str(tmp_path / "outputs"),
+        hf_cache_root=None,
+        speaker_bank_root=str(tmp_path / "speaker_bank_root"),
+        write_srt=False,
+        write_jsonl=False,
+        auto_batch=False,
+        speaker_bank_config=SpeakerBankConfig(
+            enabled=True,
+            use_existing=True,
+            emit_pca=False,
+            match_per_segment=True,
+            min_segments_per_label=1,
+            threshold=0.5,
+            scoring_margin=0.0,
+        ),
+    )
+
+
 def test_run_transcribe_faster_writes_exclusive_diarization(monkeypatch, tmp_path):
     from transcriber import cli as cli_mod
     from transcriber.transcript_pipeline import TranscriptPipelineResult
