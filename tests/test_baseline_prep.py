@@ -381,3 +381,13 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     assert "hard_negative" in final_dataset.sources
     assert "quality_filters" in final_summary
     assert "source_groups" in final_summary
+
+
+def test_selected_stage_names_respects_from_stage_with_stage_subset():
+    selected = baseline_prep._selected_stage_names(
+        ["bank", "train", "eval"],
+        from_stage="train",
+        to_stage=None,
+    )
+
+    assert selected == ["train", "eval"]

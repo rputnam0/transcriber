@@ -301,7 +301,7 @@ def _selected_stage_names(
     if from_stage:
         if from_stage not in DEFAULT_STAGE_ORDER:
             raise RuntimeError(f"Unknown from-stage: {from_stage}")
-        requested = requested[DEFAULT_STAGE_ORDER.index(from_stage) :]
+        requested = requested[requested.index(from_stage) :] if from_stage in requested else []
     if to_stage:
         if to_stage not in DEFAULT_STAGE_ORDER:
             raise RuntimeError(f"Unknown to-stage: {to_stage}")
