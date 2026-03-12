@@ -32,6 +32,7 @@ from .diarization import (
     extract_speaker_embeddings,
     release_runtime_caches,
 )
+from .prep_artifacts import artifact_id_for_payload, build_path_identity
 
 
 @dataclass
@@ -274,13 +275,16 @@ def compute_segment_purity(
 
         total_power = float(sum(powers.values()))
         top_label = None
+        second_label = None
         top_power = 0.0
         second_power = 0.0
         dominant_share = 0.0
         active_speakers = sum(1 for value in powers.values() if value >= min_power)
         if total_power > 0.0 and powers:
-            top_label, top_power = powers.most_common(1)[0]
-            second_power = powers.most_common(2)[1][1] if len(powers) > 1 else 0.0
+            ranking = powers.most_common(2)
+            top_label, top_power = ranking[0]
+            if len(ranking) > 1:
+                second_label, second_power = ranking[1]
             dominant_share = top_power / total_power
 
         if dominant_share >= training_min_share:
@@ -317,6 +321,7 @@ def compute_segment_purity(
                 "duration": duration,
                 "raw_label": str(segment.get("speaker_raw") or segment.get("speaker") or ""),
                 "speaker": top_label,
+                "second_speaker": second_label,
                 "dominant_share": dominant_share,
                 "top1_power": top_power,
                 "top2_power": second_power,
@@ -450,6 +455,7 @@ def _resolve_run_defaults(config_path: Optional[Path]) -> Dict[str, object]:
         "speaker_mapping_path": cfg.get("speaker_mapping"),
         "speaker_bank_root": cfg.get("speaker_bank_root") or speaker_bank_root,
         "speaker_bank_config": speaker_bank_config,
+        "diarization_model": cfg.get("diarization_model"),
         "device": cfg.get("device"),
         "local_files_only": bool(cfg.get("local_files_only", False)),
     }
@@ -551,6 +557,65 @@ def _load_cached_segment_embeddings(path: Path) -> List[CachedSegmentEmbedding]:
         )
         for idx in range(len(indices))
     ]
+
+
+def _build_predicted_cache_signature(
+    *,
+    mixed_path: Path,
+    speaker_count: int,
+    defaults: Dict[str, object],
+    device_override: Optional[str],
+) -> Dict[str, object]:
+    device_name = str(device_override or defaults.get("device") or "auto")
+    backend_name = str(defaults.get("backend") or "faster")
+    payload = {
+        "mixed_audio": build_path_identity(mixed_path, hash_contents=True),
+        "speaker_count": int(speaker_count),
+        "backend": backend_name,
+        "model_name": str(defaults.get("model_name") or ""),
+        "compute_type": str(defaults.get("compute_type") or ""),
+        "diarization_model": str(defaults.get("diarization_model") or ""),
+        "device": device_name,
+    }
+    return {
+        **payload,
+        "artifact_id": artifact_id_for_payload(payload),
+    }
+
+
+def _build_reference_cache_signature(
+    *,
+    clips_dir: Path,
+    speaker_mapping_path: Path,
+    defaults: Dict[str, object],
+    device_override: Optional[str],
+    local_files_only_override: Optional[bool],
+) -> Dict[str, object]:
+    device_name = str(device_override or defaults.get("device") or "auto")
+    backend_name = str(defaults.get("backend") or "faster")
+    local_files_only = (
+        bool(defaults["local_files_only"])
+        if local_files_only_override is None
+        else bool(local_files_only_override)
+    )
+    payload = {
+        "reference_clips": build_path_identity(clips_dir),
+        "speaker_mapping": build_path_identity(speaker_mapping_path, hash_contents=True),
+        "backend": backend_name,
+        "model_name": str(defaults.get("model_name") or ""),
+        "compute_type": str(defaults.get("compute_type") or ""),
+        "diarization_model": str(defaults.get("diarization_model") or ""),
+        "device": device_name,
+        "local_files_only": local_files_only,
+    }
+    return {
+        **payload,
+        "artifact_id": artifact_id_for_payload(payload),
+    }
+
+
+def _cache_signature_path(raw_out_dir: Path) -> Path:
+    return raw_out_dir / "cache_signature.json"
 
 
 def _build_segment_embedding_cache(
@@ -886,6 +951,14 @@ def apply_profile_to_cached_segments(
         for index in label_to_segments.get(label, []):
             segment = relabeled[index]
             seg_match_info = segment_matches.get(index) or {}
+            top_candidates = [
+                {
+                    "speaker": candidate.get("speaker"),
+                    "score": candidate.get("score"),
+                    "source": candidate.get("source"),
+                }
+                for candidate in list(seg_match_info.get("candidates") or [])[:2]
+            ]
             segment_level_match = None
             if seg_match_info.get("accepted") and seg_match_info.get("match"):
                 segment_level_match = dict(seg_match_info["match"])
@@ -911,6 +984,7 @@ def apply_profile_to_cached_segments(
                 segment["speaker_match_score"] = segment["speaker_match"].get("score")
                 segment["speaker_match_distance"] = segment["speaker_match"].get("distance")
                 segment["speaker_match_cluster"] = segment["speaker_match"].get("cluster_id")
+                segment["speaker_match_candidates"] = top_candidates
                 matched_segments += 1
             else:
                 _set_segment_speaker_label(segment, "unknown")
@@ -926,6 +1000,7 @@ def apply_profile_to_cached_segments(
                 segment["speaker_match_distance"] = None
                 segment["speaker_match_cluster"] = None
                 segment["speaker_match_source"] = "speaker_bank"
+                segment["speaker_match_candidates"] = top_candidates
                 unknown_segments += 1
 
     for index, segment in enumerate(relabeled):
@@ -948,6 +1023,7 @@ def apply_profile_to_cached_segments(
             segment.setdefault("speaker_match_score", None)
             segment.setdefault("speaker_match_distance", None)
             segment.setdefault("speaker_match_cluster", None)
+            segment.setdefault("speaker_match_candidates", [])
 
     summary["segment_counts"]["matched"] = matched_segments
     summary["segment_counts"]["unknown"] = unknown_segments
@@ -963,15 +1039,30 @@ def _prepare_reference_outputs(
     device_override: Optional[str],
     local_files_only_override: Optional[bool],
 ) -> Path:
-    if list(reference_out_dir.rglob("*.jsonl")):
-        return _resolve_output_jsonl(clips_dir, reference_out_dir)
+    signature_path = _cache_signature_path(reference_out_dir)
+    expected_signature = _build_reference_cache_signature(
+        clips_dir=clips_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=defaults,
+        device_override=device_override,
+        local_files_only_override=local_files_only_override,
+    )
+    reference_jsonls = list(reference_out_dir.rglob("*.jsonl"))
+    if reference_jsonls and signature_path.exists():
+        try:
+            cached_signature = json.loads(signature_path.read_text(encoding="utf-8"))
+        except Exception:
+            cached_signature = {}
+        if cached_signature == expected_signature:
+            return _resolve_output_jsonl(clips_dir, reference_out_dir)
+
     release_runtime_caches()
     run_transcribe(
         input_path=str(clips_dir),
-        backend="faster",
+        backend=str(defaults.get("backend") or "faster"),
         model_name=str(defaults["model_name"]),
-        compute_type="int8",
-        batch_size=1,
+        compute_type=str(defaults["compute_type"]),
+        batch_size=int(defaults["batch_size"]),
         output_dir=str(reference_out_dir),
         speaker_mapping_path=str(speaker_mapping_path),
         min_speakers=None,
@@ -988,9 +1079,13 @@ def _prepare_reference_outputs(
         quiet=True,
         auto_batch=bool(defaults["auto_batch"]),
         cache_mode=str(defaults["cache_mode"]),
-        device="cpu",
+        device=device_override or defaults["device"],  # type: ignore[arg-type]
+        diarization_model=(
+            str(defaults["diarization_model"]) if defaults.get("diarization_model") else None
+        ),
         speaker_bank_config=None,
     )
+    signature_path.write_text(json.dumps(expected_signature, indent=2), encoding="utf-8")
     return _resolve_output_jsonl(clips_dir, reference_out_dir)
 
 
@@ -1006,17 +1101,30 @@ def _prepare_predicted_cache(
     raw_jsonl_path = raw_out_dir / mixed_path.stem / f"{mixed_path.stem}.jsonl"
     label_embedding_path = raw_out_dir / "label_embeddings.npz"
     segment_embedding_path = raw_out_dir / "segment_embeddings.npz"
+    signature_path = _cache_signature_path(raw_out_dir)
+    expected_signature = _build_predicted_cache_signature(
+        mixed_path=mixed_path,
+        speaker_count=speaker_count,
+        defaults=defaults,
+        device_override=device_override,
+    )
     if (
         raw_jsonl_path.exists()
         and label_embedding_path.exists()
         and segment_embedding_path.exists()
+        and signature_path.exists()
     ):
-        return raw_jsonl_path, label_embedding_path, segment_embedding_path
+        try:
+            cached_signature = json.loads(signature_path.read_text(encoding="utf-8"))
+        except Exception:
+            cached_signature = {}
+        if cached_signature == expected_signature:
+            return raw_jsonl_path, label_embedding_path, segment_embedding_path
 
     release_runtime_caches()
     run_transcribe(
         input_path=str(mixed_path),
-        backend="faster",
+        backend=str(defaults.get("backend") or "faster"),
         model_name=str(defaults["model_name"]),
         compute_type=str(defaults["compute_type"]),
         batch_size=int(defaults["batch_size"]),
@@ -1037,6 +1145,9 @@ def _prepare_predicted_cache(
         auto_batch=bool(defaults["auto_batch"]),
         cache_mode=str(defaults["cache_mode"]),
         device=device_override or defaults["device"],  # type: ignore[arg-type]
+        diarization_model=(
+            str(defaults["diarization_model"]) if defaults.get("diarization_model") else None
+        ),
         speaker_bank_config=None,
     )
     raw_jsonl_path = _resolve_output_jsonl(mixed_path, raw_out_dir)
@@ -1058,6 +1169,7 @@ def _prepare_predicted_cache(
         quiet=True,
     )
     _save_cached_segment_embeddings(segment_embedding_path, cached_segments)
+    signature_path.write_text(json.dumps(expected_signature, indent=2), encoding="utf-8")
     return raw_jsonl_path, label_embedding_path, segment_embedding_path
 
 
@@ -1075,20 +1187,26 @@ def evaluate_multitrack_session(
     min_speakers: int,
     device_override: Optional[str],
     local_files_only_override: Optional[bool],
+    windows_override: Optional[Sequence[dict]] = None,
 ) -> Dict[str, object]:
     defaults = _resolve_run_defaults(config_path)
     defaults["speaker_mapping_path"] = str(speaker_mapping_path)
     mapping = _load_yaml_or_json(str(speaker_mapping_path))
-    windows = select_candidate_windows(
-        load_labeled_records(
-            session_jsonl,
-            speaker_aliases={"zariel torgan": "David Tanglethorn"},
-            speaker_mapping=mapping,
-        ),
-        window_seconds=window_seconds,
-        hop_seconds=hop_seconds,
-        top_k=top_k,
-        min_speakers=min_speakers,
+    transcript_records = load_labeled_records(
+        session_jsonl,
+        speaker_aliases={"zariel torgan": "David Tanglethorn"},
+        speaker_mapping=mapping,
+    )
+    windows = (
+        [dict(item) for item in windows_override]
+        if windows_override is not None
+        else select_candidate_windows(
+            transcript_records,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+            top_k=top_k,
+            min_speakers=min_speakers,
+        )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     prepared_root = (cache_root or (output_dir / "_cache")).expanduser().resolve()
@@ -1204,7 +1322,12 @@ def evaluate_multitrack_session(
             "window": window,
             "name": window_name,
             "reference_jsonl": str(reference_jsonl),
+            "reference_cache_signature_path": str(_cache_signature_path(reference_out_dir)),
             "predicted_jsonl": str(predicted_jsonl),
+            "raw_predicted_jsonl": str(raw_jsonl),
+            "label_embedding_path": str(label_embedding_path),
+            "segment_embedding_path": str(segment_embedding_path),
+            "cache_signature_path": str(_cache_signature_path(raw_out_dir)),
             "mixed_audio": str(mixed_path),
             "stem_labels": clip_labels,
             "reference_word_count": len(reference_words),

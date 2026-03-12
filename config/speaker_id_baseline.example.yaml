@@ -1,0 +1,64 @@
+# Example recipe for scripts/prepare_speaker_id_baseline.py
+# The short-segment eval slice is derived automatically from the sessions below.
+
+output_root: .outputs/speaker_id_baseline
+hf_cache_root: ./.hf_cache
+extracted_session_cache_root: data/.cache/extracted_sessions
+mixed_base_cache_root: data/.cache/mixed_base
+metrics_log_path: .outputs/speaker_id_baseline/stage_metrics.jsonl
+resume: true
+# stages: [bank, mixed_base, variants, hard_negatives, train, eval]
+
+base_config: config/training.example.yaml
+speaker_mapping: config/speaker_mapping.example.yaml
+diarization_model: pyannote/speaker-diarization-community-1
+
+device: cuda
+quiet: true
+batch_size: 64
+workers: 4
+
+training_inputs:
+  - /path/to/audio
+
+transcript_roots:
+  - /path/to/transcripts
+
+eval:
+  - name: Session22
+    session_zip: /path/to/eval/Session_22.zip
+    transcript: /path/to/eval/Session_22.jsonl
+  - name: Session61
+    session_zip: /path/to/eval/Session_61.zip
+    transcript: /path/to/eval/Session_61.jsonl
+
+baseline_pack:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+build_variants:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+hard_negative_candidate_variants:
+  - mixed_raw
+
+seed_confusion_pairs:
+  - ["Cyrus Schwert", "Cletus Cobbington"]
+
+current_winner:
+  model_name: knn
+  classifier_c: 1.0
+  classifier_n_neighbors: 7
+  classifier_min_margin: 0.03
+  threshold: 0.40
+  min_segments_per_label: 2
+
+# Optional knobs
+# core_speakers:
+#   - Dungeon Master
+#   - David Tanglethorn
+# excluded_speakers:
+#   - B. Ver

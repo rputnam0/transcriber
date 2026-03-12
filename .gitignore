@@ -23,6 +23,7 @@ audio/
 .outputs/
 outputs/
 transcripts/
+data/
 
 # Local developer configs copied from examples
 config/speaker_mapping.yaml

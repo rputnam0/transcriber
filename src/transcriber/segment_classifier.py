@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -20,6 +22,17 @@ from sklearn.preprocessing import LabelEncoder
 
 from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
 from .consolidate import choose_speaker
+from .prep_artifacts import (
+    artifact_id_for_payload,
+    build_path_identity,
+    build_audio_quality_metrics,
+    build_source_session_speaker_breakdown,
+    load_jsonl_records,
+    quality_rejection_reason,
+    save_candidate_pool,
+    save_jsonl_records,
+    summarize_quality_records,
+)
 
 
 DEFAULT_CLASSIFIER_MARGIN = 0.08
@@ -1022,6 +1035,545 @@ def _sample_evenly(items: Sequence[T], limit: int) -> List[T]:
     return [items[int(round(position))] for position in positions]
 
 
+def _load_audio_array(path: Path) -> Tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    audio_data, sample_rate = sf.read(path)
+    if getattr(audio_data, "ndim", 1) > 1:
+        audio_data = audio_data.mean(axis=1)
+    return np.asarray(audio_data, dtype=np.float32), int(sample_rate)
+
+
+def _emit_progress(
+    progress_callback: Optional[Any],
+    *,
+    status: str,
+    session: Optional[str] = None,
+    cache_hit: Optional[bool] = None,
+    elapsed_seconds: Optional[float] = None,
+    extra: Optional[Dict[str, object]] = None,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(
+        status=status,
+        session=session,
+        cache_hit=cache_hit,
+        elapsed_seconds=elapsed_seconds,
+        extra=extra or {},
+    )
+
+
+def _build_mixed_base_signature(
+    *,
+    session_sources: Sequence[Path],
+    transcript_search_roots: Sequence[Path],
+    top_k: int,
+    hop_seconds: float,
+    min_speakers: int,
+    min_share: float,
+    min_power: float,
+    min_segment_dur: float,
+    max_segment_dur: float,
+    window_seconds: float,
+    allowed_speakers: Sequence[str],
+    excluded_speakers: Sequence[str],
+    diarization_model_name: Optional[str],
+) -> Dict[str, object]:
+    return {
+        "version": 1,
+        "session_sources": [build_path_identity(path, hash_contents=False) for path in session_sources],
+        "transcript_search_roots": [
+            build_path_identity(path, hash_contents=False) for path in transcript_search_roots
+        ],
+        "top_k": int(top_k),
+        "hop_seconds": float(hop_seconds),
+        "min_speakers": int(min_speakers),
+        "min_share": float(min_share),
+        "min_power": float(min_power),
+        "min_segment_dur": float(min_segment_dur),
+        "max_segment_dur": float(max_segment_dur),
+        "window_seconds": float(window_seconds),
+        "allowed_speakers": sorted(str(item) for item in allowed_speakers if str(item).strip()),
+        "excluded_speakers": sorted(str(item) for item in excluded_speakers if str(item).strip()),
+        "diarization_model_name": str(diarization_model_name or ""),
+    }
+
+
+def _prepare_extracted_session_source(
+    session_source: Path,
+    *,
+    cache_root: Optional[Path],
+    progress_callback: Optional[Any] = None,
+) -> Path:
+    if _safe_path_is_dir(session_source) or cache_root is None:
+        return session_source
+
+    source_identity = build_path_identity(session_source, hash_contents=False)
+    cache_key = artifact_id_for_payload({"source_identity": source_identity}, length=24)
+    cache_root = Path(cache_root).expanduser()
+    extracted_dir = cache_root / cache_key
+    manifest_path = extracted_dir / "extraction_manifest.json"
+    started_at = time.monotonic()
+
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        if manifest.get("source_identity") == source_identity:
+            stem_inventory = list(manifest.get("stem_inventory") or [])
+            if stem_inventory and all((extracted_dir / str(item)).exists() for item in stem_inventory):
+                _emit_progress(
+                    progress_callback,
+                    status="extraction_cache_hit",
+                    session=session_source.stem,
+                    cache_hit=True,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    extra={"cache_key": cache_key},
+                )
+                return extracted_dir
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = cache_root / f".{cache_key}.tmp"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(session_source) as archive:
+        archive.extractall(temp_dir)
+    stem_inventory = [
+        str(path.relative_to(temp_dir))
+        for path in sorted(temp_dir.rglob("*"))
+        if path.is_file() and path.suffix.lower() in {".ogg", ".wav", ".flac", ".mp3", ".m4a"}
+    ]
+    manifest_path_tmp = temp_dir / "extraction_manifest.json"
+    manifest_path_tmp.write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "source_identity": source_identity,
+                "source_path": str(session_source),
+                "extracted_dir": str(extracted_dir),
+                "stem_inventory": stem_inventory,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if extracted_dir.exists():
+        shutil.rmtree(extracted_dir)
+    temp_dir.rename(extracted_dir)
+    _emit_progress(
+        progress_callback,
+        status="extraction_cache_miss",
+        session=session_source.stem,
+        cache_hit=False,
+        elapsed_seconds=time.monotonic() - started_at,
+        extra={"cache_key": cache_key, "stem_files": len(stem_inventory)},
+    )
+    return extracted_dir
+
+
+def _collect_labeled_stems(
+    extract_dir: Path,
+    *,
+    speaker_mapping: Dict[str, object],
+    allowed_speaker_set: set[str],
+    excluded_speaker_set: set[str],
+) -> List[Tuple[Path, str]]:
+    stems: List[Tuple[Path, str]] = []
+    for path in sorted(extract_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".ogg", ".wav", ".flac", ".mp3", ".m4a"}:
+            continue
+        label = choose_speaker(path.name, speaker_mapping)
+        if label and label != "unknown":
+            if label in excluded_speaker_set:
+                continue
+            if allowed_speaker_set and label not in allowed_speaker_set:
+                continue
+            stems.append((path, label))
+    return stems
+
+
+def _prepare_cached_window_inputs(
+    *,
+    session_source: Path,
+    session_name: str,
+    stems: Sequence[Tuple[Path, str]],
+    window: Dict[str, object],
+    window_index: int,
+    cache_root: Optional[Path],
+    progress_callback: Optional[Any] = None,
+) -> Tuple[Path, List[Path]]:
+    if cache_root is None:
+        raise ValueError("window cache root is required for cached window prep")
+    session_identity = build_path_identity(session_source, hash_contents=False)
+    window_key = artifact_id_for_payload(
+        {
+            "session_identity": session_identity,
+            "window": {
+                "start": float(window["start"]),
+                "end": float(window["end"]),
+                "speaker_count": int(window["speaker_count"]),
+                "window_index": int(window_index),
+            },
+        },
+        length=24,
+    )
+    window_dir = Path(cache_root).expanduser() / session_name / window_key
+    clips_dir = window_dir / "clips"
+    mixed_path = window_dir / "mixed.wav"
+    manifest_path = window_dir / "window_manifest.json"
+    clip_paths = [clips_dir / f"{stem_path.stem}.wav" for stem_path, _label in stems]
+    started_at = time.monotonic()
+
+    if manifest_path.exists() and mixed_path.exists() and all(path.exists() for path in clip_paths):
+        _emit_progress(
+            progress_callback,
+            status="window_cache_hit",
+            session=session_name,
+            cache_hit=True,
+            elapsed_seconds=time.monotonic() - started_at,
+            extra={"window_index": int(window_index), "window_key": window_key},
+        )
+        return mixed_path, clip_paths
+
+    window_dir.mkdir(parents=True, exist_ok=True)
+    for (stem_path, _label), clip_path in zip(stems, clip_paths):
+        if not clip_path.exists():
+            _clip_audio(
+                stem_path,
+                clip_path,
+                start=float(window["start"]),
+                duration=float(window["end"]) - float(window["start"]),
+            )
+    if not mixed_path.exists():
+        _mix_audio_files(clip_paths, mixed_path)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "session_source": str(session_source),
+                "session_identity": session_identity,
+                "session_name": session_name,
+                "window_index": int(window_index),
+                "window": {
+                    "start": float(window["start"]),
+                    "end": float(window["end"]),
+                    "speaker_count": int(window["speaker_count"]),
+                },
+                "clips_dir": str(clips_dir),
+                "clip_paths": [str(path) for path in clip_paths],
+                "mixed_path": str(mixed_path),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _emit_progress(
+        progress_callback,
+        status="window_cache_miss",
+        session=session_name,
+        cache_hit=False,
+        elapsed_seconds=time.monotonic() - started_at,
+        extra={"window_index": int(window_index), "window_key": window_key},
+    )
+    return mixed_path, clip_paths
+
+
+def _prepared_windows_path(dataset_dir: Path) -> Path:
+    return Path(dataset_dir).expanduser() / "prepared_windows.jsonl"
+
+
+def _load_prepared_window_records(dataset_dir: Path) -> List[Dict[str, object]]:
+    return load_jsonl_records(_prepared_windows_path(dataset_dir))
+
+
+def _build_classifier_dataset_from_rows(
+    rows: Sequence[Tuple[np.ndarray, str, str, str, str, float, float, float, float, int]],
+) -> ClassifierDataset:
+    if not rows:
+        return ClassifierDataset(
+            embeddings=np.zeros((0, 0), dtype=np.float32),
+            labels=[],
+            domains=[],
+            sources=[],
+            sessions=[],
+            durations=np.zeros((0,), dtype=np.float32),
+            dominant_shares=np.zeros((0,), dtype=np.float32),
+            top1_powers=np.zeros((0,), dtype=np.float32),
+            top2_powers=np.zeros((0,), dtype=np.float32),
+            active_speakers=np.zeros((0,), dtype=np.int32),
+        )
+    return ClassifierDataset(
+        embeddings=np.vstack([np.asarray(row[0], dtype=np.float32) for row in rows]).astype(np.float32),
+        labels=[str(row[1]) for row in rows],
+        domains=[str(row[2]) for row in rows],
+        sources=[str(row[3]) for row in rows],
+        sessions=[str(row[4]) for row in rows],
+        durations=np.asarray([float(row[5]) for row in rows], dtype=np.float32),
+        dominant_shares=np.asarray([float(row[6]) for row in rows], dtype=np.float32),
+        top1_powers=np.asarray([float(row[7]) for row in rows], dtype=np.float32),
+        top2_powers=np.asarray([float(row[8]) for row in rows], dtype=np.float32),
+        active_speakers=np.asarray([int(row[9]) for row in rows], dtype=np.int32),
+    )
+
+
+def _dataset_from_candidate_pool(
+    candidate_records: Sequence[Dict[str, object]],
+    candidate_embeddings: np.ndarray,
+) -> ClassifierDataset:
+    selected_records: List[Dict[str, object]] = []
+    selected_embeddings: List[np.ndarray] = []
+    for record in candidate_records:
+        if not bool(record.get("accepted")):
+            continue
+        raw_index = record.get("embedding_index")
+        if raw_index is None:
+            continue
+        index = int(raw_index)
+        if index < 0 or index >= candidate_embeddings.shape[0]:
+            continue
+        selected_records.append(dict(record))
+        selected_embeddings.append(np.asarray(candidate_embeddings[index], dtype=np.float32))
+    if not selected_records:
+        return ClassifierDataset(
+            embeddings=np.zeros((0, 0), dtype=np.float32),
+            labels=[],
+            domains=[],
+            sources=[],
+            sessions=[],
+            durations=np.zeros((0,), dtype=np.float32),
+            dominant_shares=np.zeros((0,), dtype=np.float32),
+            top1_powers=np.zeros((0,), dtype=np.float32),
+            top2_powers=np.zeros((0,), dtype=np.float32),
+            active_speakers=np.zeros((0,), dtype=np.int32),
+        )
+    return ClassifierDataset(
+        embeddings=np.vstack(selected_embeddings).astype(np.float32),
+        labels=[str(record["speaker"]) for record in selected_records],
+        domains=["mixed"] * len(selected_records),
+        sources=["mixed_raw"] * len(selected_records),
+        sessions=[str(record.get("session") or "unknown") for record in selected_records],
+        durations=np.asarray(
+            [float(record.get("duration") or 0.0) for record in selected_records],
+            dtype=np.float32,
+        ),
+        dominant_shares=np.asarray(
+            [float(record.get("dominant_share") or 0.0) for record in selected_records],
+            dtype=np.float32,
+        ),
+        top1_powers=np.asarray(
+            [float(record.get("top1_power") or 0.0) for record in selected_records],
+            dtype=np.float32,
+        ),
+        top2_powers=np.asarray(
+            [float(record.get("top2_power") or 0.0) for record in selected_records],
+            dtype=np.float32,
+        ),
+        active_speakers=np.asarray(
+            [int(record.get("active_speakers") or 0) for record in selected_records],
+            dtype=np.int32,
+        ),
+    )
+
+
+def materialize_classifier_dataset_from_mixed_base(
+    *,
+    mixed_base_dir: Path,
+    dataset_cache_dir: Path,
+    hf_token: Optional[str],
+    force_device: str,
+    quiet: bool,
+    batch_size: int = 64,
+    workers: int = 4,
+    augmentation_profile: str = "none",
+    augmentation_copies: int = 0,
+    augmentation_seed: int = 13,
+    include_base_samples: bool = False,
+    max_samples_per_speaker: int = 0,
+    diarization_model_name: Optional[str] = None,
+    reuse_cached_dataset: bool = True,
+    progress_callback: Optional[Any] = None,
+) -> Tuple[ClassifierDataset, Dict[str, object]]:
+    from .diarization import extract_embeddings_for_segments
+
+    dataset_cache_dir = Path(dataset_cache_dir).expanduser()
+    mixed_base_dir = Path(mixed_base_dir).expanduser()
+    dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    prepared_windows_path = _prepared_windows_path(mixed_base_dir)
+    mixed_base_summary_path = mixed_base_dir / "dataset_summary.json"
+    if not prepared_windows_path.exists():
+        raise FileNotFoundError(f"Missing prepared mixed-base windows: {prepared_windows_path}")
+    if not mixed_base_summary_path.exists():
+        raise FileNotFoundError(f"Missing mixed-base dataset summary: {mixed_base_summary_path}")
+
+    augmentation_config = AudioAugmentationConfig(
+        profile=str(augmentation_profile or "none"),
+        copies=max(int(augmentation_copies or 0), 0),
+        seed=int(augmentation_seed),
+    )
+    base_summary = json.loads(mixed_base_summary_path.read_text(encoding="utf-8"))
+    materialization_signature = {
+        "version": 1,
+        "prepared_windows": build_path_identity(prepared_windows_path, hash_contents=False),
+        "mixed_base_summary": build_path_identity(mixed_base_summary_path, hash_contents=False),
+        "augmentation": {
+            "profile": augmentation_config.profile,
+            "copies": int(augmentation_config.copies),
+            "seed": int(augmentation_config.seed),
+        },
+        "include_base_samples": bool(include_base_samples),
+        "max_samples_per_speaker": int(max_samples_per_speaker),
+        "diarization_model_name": str(diarization_model_name or ""),
+    }
+    cache_matrix_path = dataset_cache_dir / "dataset.npz"
+    cache_meta_path = dataset_cache_dir / "dataset_summary.json"
+    if reuse_cached_dataset and cache_matrix_path.exists() and cache_meta_path.exists():
+        cached_summary = json.loads(cache_meta_path.read_text(encoding="utf-8"))
+        if cached_summary.get("materialization_signature") == materialization_signature:
+            return load_classifier_dataset(dataset_cache_dir)
+
+    collected_rows: List[Tuple[np.ndarray, str, str, str, str, float, float, float, float, int]] = []
+    started_at = time.monotonic()
+    for window_record in _load_prepared_window_records(mixed_base_dir):
+        session_name = str(window_record.get("session") or "unknown")
+        mixed_path = Path(str(window_record.get("mixed_path") or "")).expanduser()
+        accepted_segments = list(window_record.get("accepted_segments") or [])
+        if not mixed_path.exists() or not accepted_segments:
+            continue
+        payload = [
+            (
+                float(segment["start"]),
+                float(segment["end"]),
+                str(segment.get("raw_label") or segment.get("speaker") or "segment"),
+            )
+            for segment in accepted_segments
+        ]
+        mixed_audio, mixed_sample_rate = _load_audio_array(mixed_path)
+        if include_base_samples:
+            embed_results, _ = extract_embeddings_for_segments(
+                str(mixed_path),
+                payload,
+                hf_token=hf_token,
+                diarization_model_name=diarization_model_name,
+                force_device=force_device,
+                quiet=quiet,
+                batch_size=batch_size,
+                workers=workers,
+                audio_waveform=mixed_audio,
+                audio_sample_rate=mixed_sample_rate,
+            )
+            for result in embed_results:
+                if result.index >= len(accepted_segments):
+                    continue
+                segment = accepted_segments[result.index]
+                collected_rows.append(
+                    (
+                        np.asarray(result.embedding, dtype=np.float32),
+                        str(segment["speaker"]),
+                        "mixed",
+                        "mixed_raw",
+                        session_name,
+                        float(segment["duration"]),
+                        float(segment["dominant_share"]),
+                        float(segment["top1_power"]),
+                        float(segment["top2_power"]),
+                        int(segment["active_speakers"]),
+                    )
+                )
+        if augmentation_config.enabled:
+            for pass_index in range(augmentation_config.copies):
+                waveform_augmenter = build_waveform_augmenter(
+                    augmentation_config,
+                    domain="mixed",
+                    pass_index=pass_index,
+                )
+                if waveform_augmenter is None:
+                    continue
+                aug_results, _ = extract_embeddings_for_segments(
+                    str(mixed_path),
+                    payload,
+                    hf_token=hf_token,
+                    diarization_model_name=diarization_model_name,
+                    force_device=force_device,
+                    quiet=quiet,
+                    batch_size=batch_size,
+                    workers=workers,
+                    waveform_transform=waveform_augmenter,
+                    audio_waveform=mixed_audio,
+                    audio_sample_rate=mixed_sample_rate,
+                )
+                for result in aug_results:
+                    if result.index >= len(accepted_segments):
+                        continue
+                    segment = accepted_segments[result.index]
+                    collected_rows.append(
+                        (
+                            np.asarray(result.embedding, dtype=np.float32),
+                            str(segment["speaker"]),
+                            "mixed_aug",
+                            "mixed_aug",
+                            session_name,
+                            float(segment["duration"]),
+                            float(segment["dominant_share"]),
+                            float(segment["top1_power"]),
+                            float(segment["top2_power"]),
+                            int(segment["active_speakers"]),
+                        )
+                    )
+        del mixed_audio
+        _emit_progress(
+            progress_callback,
+            status="materialized_window",
+            session=session_name,
+            cache_hit=False,
+            elapsed_seconds=time.monotonic() - started_at,
+            extra={
+                "accepted_segments": len(accepted_segments),
+                "mixed_path": str(mixed_path),
+            },
+        )
+
+    grouped_indices: Dict[str, List[int]] = defaultdict(list)
+    for index, row in enumerate(collected_rows):
+        grouped_indices[str(row[1])].append(index)
+    selected_indices: List[int] = []
+    for label, indices in grouped_indices.items():
+        if max_samples_per_speaker > 0 and len(indices) > max_samples_per_speaker:
+            indices = _sample_evenly(indices, max_samples_per_speaker)
+        selected_indices.extend(indices)
+    selected_indices.sort()
+    selected_rows = [collected_rows[index] for index in selected_indices]
+    dataset = _build_classifier_dataset_from_rows(selected_rows)
+    summary: Dict[str, object] = {
+        "materialization_mode": "mixed_base_derived",
+        "base_artifact_id": base_summary.get("artifact_id"),
+        "parent_artifacts": [base_summary.get("artifact_id")] if base_summary.get("artifact_id") else [],
+        "materialization_signature": materialization_signature,
+        "quality_filters": dict(base_summary.get("quality_filters") or {}),
+        "source_groups": dict(base_summary.get("source_groups") or {}),
+        "cache_hits": {"materialized_variant": False},
+        "stage_dependencies": ["mixed_base"],
+    }
+    summary.update(_summarize_classifier_dataset(dataset))
+    summary["breakdown"] = build_source_session_speaker_breakdown(dataset)
+    artifacts = save_classifier_dataset(dataset_cache_dir, dataset, summary=summary)
+    summary.setdefault("artifacts", {})
+    summary["artifacts"].update(artifacts)
+    for artifact_name in [
+        "purity.jsonl",
+        "quality_records.jsonl",
+        "quality_report.json",
+    ]:
+        source_path = mixed_base_dir / artifact_name
+        if source_path.exists():
+            shutil.copy2(source_path, dataset_cache_dir / artifact_name)
+    cache_meta_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return dataset, summary
+
+
 def _purity_bucket(dominant_share: float) -> str:
     if dominant_share >= 0.80:
         return "high"
@@ -1335,9 +1887,10 @@ def _build_dataset_cache_signature(
     excluded_speakers: Sequence[str],
     augmentation: AudioAugmentationConfig,
     diarization_model_name: Optional[str],
+    include_base_samples: bool,
 ) -> Dict[str, object]:
     return {
-        "version": 3,
+        "version": 4,
         "session_sources": [_safe_path_identity(path) for path in session_sources],
         "transcript_search_roots": [_safe_path_identity(path) for path in transcript_search_roots],
         "training_mode": training_mode,
@@ -1360,6 +1913,7 @@ def _build_dataset_cache_signature(
             "copies": int(augmentation.copies),
             "seed": int(augmentation.seed),
         },
+        "include_base_samples": bool(include_base_samples),
         "diarization_model_name": diarization_model_name or "",
     }
 
@@ -1457,6 +2011,9 @@ def train_segment_classifier_from_multitrack(
     reuse_cached_dataset: bool = True,
     diarization_model_name: Optional[str] = None,
     include_base_samples: bool = True,
+    extracted_session_cache_root: Optional[Path] = None,
+    window_cache_root: Optional[Path] = None,
+    progress_callback: Optional[Any] = None,
     train_model: bool = True,
 ) -> Optional[Dict[str, object]]:
     from .diarization import diarize_audio, extract_embeddings_for_segments
@@ -1511,6 +2068,11 @@ def train_segment_classifier_from_multitrack(
             "buckets": {"high": 0, "medium": 0, "low": 0},
             "rejections": {},
         },
+        "quality_filters": {
+            "clipping_fraction_max": 0.005,
+            "silence_fraction_max": 0.80,
+        },
+        "source_groups": {},
     }
     collected_embeddings: List[np.ndarray] = []
     collected_labels: List[str] = []
@@ -1523,6 +2085,10 @@ def train_segment_classifier_from_multitrack(
     collected_top2_powers: List[float] = []
     collected_active_speakers: List[int] = []
     purity_records: List[Dict[str, object]] = []
+    quality_records: List[Dict[str, object]] = []
+    candidate_pool_records: List[Dict[str, object]] = []
+    candidate_pool_embeddings: List[np.ndarray] = []
+    prepared_window_records: List[Dict[str, object]] = []
     allowed_speaker_set = {
         speaker
         for speaker in (
@@ -1574,6 +2140,7 @@ def train_segment_classifier_from_multitrack(
         excluded_speakers=sorted(excluded_speaker_set),
         augmentation=augmentation_config,
         diarization_model_name=diarization_model_name,
+        include_base_samples=include_base_samples,
     )
     if dataset_cache_dir is not None:
         dataset_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1583,14 +2150,30 @@ def train_segment_classifier_from_multitrack(
             cached_summary = json.loads(cache_meta_path.read_text(encoding="utf-8"))
             if cached_summary.get("dataset_cache_signature") == cache_signature:
                 dataset, summary = load_classifier_dataset(dataset_cache_dir)
+                summary.setdefault("cache_hits", {})
+                summary["cache_hits"]["dataset"] = True
+                _emit_progress(
+                    progress_callback,
+                    status="dataset_cache_hit",
+                    elapsed_seconds=0.0,
+                    cache_hit=True,
+                    extra={"dataset_cache_dir": str(dataset_cache_dir)},
+                )
 
     if dataset is None:
         with tempfile.TemporaryDirectory(prefix="segment_classifier_") as tmp_dir_name:
             tmp_dir = Path(tmp_dir_name)
             for session_source in session_sources:
+                session_started_at = time.monotonic()
                 session_transcript = _discover_session_transcript(session_source, search_roots)
                 if session_transcript is None:
                     continue
+                _emit_progress(
+                    progress_callback,
+                    status="session_started",
+                    session=session_source.stem,
+                    elapsed_seconds=0.0,
+                )
 
                 records = _normalize_session_records(
                     load_labeled_records(
@@ -1623,32 +2206,24 @@ def train_segment_classifier_from_multitrack(
                         top_k=top_k,
                         min_speakers=min_speakers,
                     )
-                    if not windows and not use_clean_segments:
-                        continue
-                if _safe_path_is_dir(session_source):
-                    extract_dir = session_source
-                else:
+                if not windows and not use_clean_segments:
+                    continue
+                extract_dir = _prepare_extracted_session_source(
+                    session_source,
+                    cache_root=extracted_session_cache_root,
+                    progress_callback=progress_callback,
+                )
+                if not _safe_path_is_dir(extract_dir):
                     extract_dir = tmp_dir / f"stems_{session_source.stem.replace(' ', '_')}"
-                    with zipfile.ZipFile(session_source) as archive:
-                        archive.extractall(extract_dir)
-
-                stems: List[Tuple[Path, str]] = []
-                for path in sorted(extract_dir.rglob("*")):
-                    if not path.is_file() or path.suffix.lower() not in {
-                        ".ogg",
-                        ".wav",
-                        ".flac",
-                        ".mp3",
-                        ".m4a",
-                    }:
-                        continue
-                    label = choose_speaker(path.name, speaker_mapping)
-                    if label and label != "unknown":
-                        if label in excluded_speaker_set:
-                            continue
-                        if allowed_speaker_set and label not in allowed_speaker_set:
-                            continue
-                        stems.append((path, label))
+                    if not extract_dir.exists():
+                        with zipfile.ZipFile(session_source) as archive:
+                            archive.extractall(extract_dir)
+                stems = _collect_labeled_stems(
+                    extract_dir,
+                    speaker_mapping=speaker_mapping,
+                    allowed_speaker_set=allowed_speaker_set,
+                    excluded_speaker_set=excluded_speaker_set,
+                )
                 if not stems:
                     continue
 
@@ -1684,21 +2259,53 @@ def train_segment_classifier_from_multitrack(
                     )
                     clean_counts: Counter[str] = Counter()
                     for stem_path, payload in clean_segments_by_path.items():
-                        if include_base_samples:
+                        waveform, sample_rate = _load_audio_array(stem_path)
+                        accepted_payload: List[Tuple[float, float, str]] = []
+                        for start, end, label in payload:
+                            start_index = max(0, int(math.floor(float(start) * sample_rate)))
+                            end_index = max(start_index + 1, int(math.ceil(float(end) * sample_rate)))
+                            metrics = build_audio_quality_metrics(
+                                waveform[start_index : min(end_index, waveform.shape[0])],
+                                sample_rate,
+                            )
+                            qa_rejection = quality_rejection_reason(
+                                metrics,
+                                min_duration=min_segment_dur,
+                                max_duration=max_segment_dur,
+                            )
+                            quality_records.append(
+                                {
+                                    "session": session_name,
+                                    "window_index": None,
+                                    "start": float(start),
+                                    "end": float(end),
+                                    "speaker": str(label),
+                                    "raw_label": str(label),
+                                    "source": "clean_raw",
+                                    **metrics,
+                                    "qa_rejection": qa_rejection,
+                                }
+                            )
+                            if qa_rejection is not None:
+                                continue
+                            accepted_payload.append((start, end, label))
+                        if include_base_samples and accepted_payload:
                             embed_results, _ = extract_embeddings_for_segments(
                                 str(stem_path),
-                                payload,
+                                accepted_payload,
                                 hf_token=hf_token,
                                 diarization_model_name=diarization_model_name,
                                 force_device=force_device,
                                 quiet=quiet,
                                 batch_size=batch_size,
                                 workers=workers,
+                                audio_waveform=waveform,
+                                audio_sample_rate=sample_rate,
                             )
                             for result in embed_results:
-                                if result.index >= len(payload):
+                                if result.index >= len(accepted_payload):
                                     continue
-                                start, end, label = payload[result.index]
+                                start, end, label = accepted_payload[result.index]
                                 collected_embeddings.append(
                                     np.asarray(result.embedding, dtype=np.float32)
                                 )
@@ -1719,11 +2326,11 @@ def train_segment_classifier_from_multitrack(
                                     domain="clean",
                                     pass_index=pass_index,
                                 )
-                                if waveform_augmenter is None:
+                                if waveform_augmenter is None or not accepted_payload:
                                     continue
                                 aug_results, _ = extract_embeddings_for_segments(
                                     str(stem_path),
-                                    payload,
+                                    accepted_payload,
                                     hf_token=hf_token,
                                     diarization_model_name=diarization_model_name,
                                     force_device=force_device,
@@ -1731,11 +2338,13 @@ def train_segment_classifier_from_multitrack(
                                     batch_size=batch_size,
                                     workers=workers,
                                     waveform_transform=waveform_augmenter,
+                                    audio_waveform=waveform,
+                                    audio_sample_rate=sample_rate,
                                 )
                                 for result in aug_results:
-                                    if result.index >= len(payload):
+                                    if result.index >= len(accepted_payload):
                                         continue
-                                    start, end, label = payload[result.index]
+                                    start, end, label = accepted_payload[result.index]
                                     collected_embeddings.append(
                                         np.asarray(result.embedding, dtype=np.float32)
                                     )
@@ -1749,6 +2358,7 @@ def train_segment_classifier_from_multitrack(
                                     collected_top2_powers.append(float("nan"))
                                     collected_active_speakers.append(-1)
                                     clean_counts[label] += 1
+                        del waveform
                     session_stats["clean_segments"] = {
                         "used_segments": int(sum(clean_counts.values())),
                         "speaker_counts": {
@@ -1758,24 +2368,32 @@ def train_segment_classifier_from_multitrack(
 
                 if not use_mixed_segments:
                     summary["sessions"].append(session_stats)
+                    _emit_progress(
+                        progress_callback,
+                        status="session_completed",
+                        session=session_name,
+                        elapsed_seconds=time.monotonic() - session_started_at,
+                        extra={"windows": 0, "mode": training_mode_normalized},
+                    )
                     continue
 
                 for index, window in enumerate(windows, start=1):
-                    window_dir = tmp_dir / f"{session_source.stem}_{index:02d}"
-                    clips_dir = window_dir / "clips"
-                    mixed_path = window_dir / "mixed.wav"
-
-                    clip_paths: List[Path] = []
+                    window_cache_base = (
+                        Path(window_cache_root).expanduser()
+                        if window_cache_root is not None
+                        else tmp_dir / "window_cache"
+                    )
+                    mixed_path, clip_paths = _prepare_cached_window_inputs(
+                        session_source=session_source,
+                        session_name=session_name,
+                        stems=stems,
+                        window=window,
+                        window_index=index,
+                        cache_root=window_cache_base,
+                        progress_callback=progress_callback,
+                    )
                     stem_arrays: List[Tuple[str, np.ndarray]] = []
-                    for stem_path, label in stems:
-                        clip_path = clips_dir / f"{stem_path.stem}.wav"
-                        _clip_audio(
-                            stem_path,
-                            clip_path,
-                            start=float(window["start"]),
-                            duration=float(window["end"]) - float(window["start"]),
-                        )
-                        clip_paths.append(clip_path)
+                    for (stem_path, label), clip_path in zip(stems, clip_paths):
                         audio_data, sample_rate = sf.read(clip_path)
                         if getattr(audio_data, "ndim", 1) > 1:
                             audio_data = audio_data.mean(axis=1)
@@ -1784,8 +2402,11 @@ def train_segment_classifier_from_multitrack(
                                 f"Expected 16 kHz clips, found {sample_rate} for {clip_path}"
                             )
                         stem_arrays.append((label, np.asarray(audio_data, dtype=np.float32)))
-
-                    _mix_audio_files(clip_paths, mixed_path)
+                    mixed_audio, mixed_sample_rate = _load_audio_array(mixed_path)
+                    if mixed_sample_rate != 16000:
+                        raise RuntimeError(
+                            f"Expected 16 kHz mixed audio, found {mixed_sample_rate} for {mixed_path}"
+                        )
                     diarization = diarize_audio(
                         str(mixed_path),
                         model_name=diarization_model_name,
@@ -1795,9 +2416,7 @@ def train_segment_classifier_from_multitrack(
                         device=force_device,
                     )
 
-                    labeled_segments: List[
-                        Tuple[float, float, str, str, float, float, float, int]
-                    ] = []
+                    window_candidates: List[Dict[str, object]] = []
                     per_window_rejections: Counter[str] = Counter()
                     per_window_buckets: Counter[str] = Counter()
                     diar_turns = diarization.exclusive_segments or diarization.segments
@@ -1817,13 +2436,16 @@ def train_segment_classifier_from_multitrack(
 
                         total_power = float(sum(powers.values()))
                         top_label = None
+                        second_label = None
                         top_power = 0.0
                         second_power = 0.0
                         dominance = 0.0
                         active_speakers = sum(1 for value in powers.values() if value >= min_power)
                         if total_power > 0.0 and powers:
-                            top_label, top_power = powers.most_common(1)[0]
-                            second_power = powers.most_common(2)[1][1] if len(powers) > 1 else 0.0
+                            power_ranking = powers.most_common(2)
+                            top_label, top_power = power_ranking[0]
+                            if len(power_ranking) > 1:
+                                second_label, second_power = power_ranking[1]
                             dominance = top_power / total_power
                         purity_bucket = _purity_bucket(dominance)
                         per_window_buckets[purity_bucket] += 1
@@ -1832,19 +2454,30 @@ def train_segment_classifier_from_multitrack(
                             int(summary["purity"]["buckets"][purity_bucket]) + 1
                         )
 
-                        rejection = None
+                        purity_rejection = None
                         if duration < min_segment_dur:
-                            rejection = "too_short"
+                            purity_rejection = "too_short"
                         elif duration > max_segment_dur:
-                            rejection = "too_long"
+                            purity_rejection = "too_long"
                         elif total_power <= 0.0:
-                            rejection = "no_power"
+                            purity_rejection = "no_power"
                         elif top_power < min_power:
-                            rejection = "low_power"
+                            purity_rejection = "low_power"
                         elif dominance < min_share:
-                            rejection = "low_share"
+                            purity_rejection = "low_share"
                         elif top_power <= second_power:
-                            rejection = "not_dominant"
+                            purity_rejection = "not_dominant"
+
+                        metrics = build_audio_quality_metrics(
+                            mixed_audio[start_index : min(end_index, mixed_audio.shape[0])],
+                            mixed_sample_rate,
+                        )
+                        qa_rejection = quality_rejection_reason(
+                            metrics,
+                            min_duration=min_segment_dur,
+                            max_duration=max_segment_dur,
+                        )
+                        rejection = qa_rejection or purity_rejection
 
                         diagnostic = {
                             "session": session_name,
@@ -1854,37 +2487,52 @@ def train_segment_classifier_from_multitrack(
                             "duration": duration,
                             "raw_label": raw_label,
                             "speaker": top_label,
+                            "second_speaker": second_label,
                             "dominant_share": dominance,
                             "top1_power": top_power,
                             "top2_power": second_power,
                             "power_gap": top_power - second_power,
                             "active_speakers": active_speakers,
                             "bucket": purity_bucket,
+                            "source": "mixed_raw",
+                            **metrics,
+                            "qa_rejection": qa_rejection,
+                            "purity_rejection": purity_rejection,
                             "accepted": rejection is None,
                             "rejection": rejection,
                         }
                         purity_records.append(diagnostic)
+                        quality_records.append(diagnostic)
+                        window_candidates.append(diagnostic)
+                        if purity_rejection is not None:
+                            summary["purity"]["rejections"][purity_rejection] = (
+                                int(summary["purity"]["rejections"].get(purity_rejection, 0)) + 1
+                            )
+                        else:
+                            summary["purity"]["accepted"] = int(summary["purity"]["accepted"]) + 1
                         if rejection is not None:
                             per_window_rejections[rejection] += 1
-                            summary["purity"]["rejections"][rejection] = (
-                                int(summary["purity"]["rejections"].get(rejection, 0)) + 1
-                            )
                             continue
-                        summary["purity"]["accepted"] = int(summary["purity"]["accepted"]) + 1
-                        labeled_segments.append(
+
+                    candidate_payload: List[Tuple[float, float, str]] = []
+                    candidate_meta: List[Dict[str, object]] = []
+                    for candidate in window_candidates:
+                        if not candidate.get("speaker"):
+                            continue
+                        if candidate.get("qa_rejection") is not None:
+                            continue
+                        if float(candidate.get("top1_power") or 0.0) < min_power:
+                            continue
+                        candidate_payload.append(
                             (
-                                start,
-                                end,
-                                raw_label,
-                                str(top_label),
-                                float(dominance),
-                                float(top_power),
-                                float(second_power),
-                                int(active_speakers),
+                                float(candidate["start"]),
+                                float(candidate["end"]),
+                                str(candidate["raw_label"]),
                             )
                         )
+                        candidate_meta.append(candidate)
 
-                    if not labeled_segments:
+                    if not candidate_meta:
                         session_stats["windows"].append(
                             {
                                 "index": index,
@@ -1897,49 +2545,47 @@ def train_segment_classifier_from_multitrack(
                         continue
 
                     per_window_counts: Counter[str] = Counter()
-                    payload = [
-                        (start, end, raw_label) for start, end, raw_label, *_ in labeled_segments
-                    ]
-                    if include_base_samples:
-                        embed_results, _ = extract_embeddings_for_segments(
-                            str(mixed_path),
-                            payload,
-                            hf_token=hf_token,
-                            diarization_model_name=diarization_model_name,
-                            force_device=force_device,
-                            quiet=quiet,
-                            batch_size=batch_size,
-                            workers=workers,
-                        )
+                    embed_results, _ = extract_embeddings_for_segments(
+                        str(mixed_path),
+                        candidate_payload,
+                        hf_token=hf_token,
+                        diarization_model_name=diarization_model_name,
+                        force_device=force_device,
+                        quiet=quiet,
+                        batch_size=batch_size,
+                        workers=workers,
+                        audio_waveform=mixed_audio,
+                        audio_sample_rate=mixed_sample_rate,
+                    )
+                    accepted_payload: List[Tuple[float, float, str]] = []
+                    accepted_meta: List[Dict[str, object]] = []
+                    for result in embed_results:
+                        if result.index >= len(candidate_meta):
+                            continue
+                        candidate = candidate_meta[result.index]
+                        embedding = np.asarray(result.embedding, dtype=np.float32)
+                        candidate_pool_records.append(dict(candidate))
+                        candidate_pool_embeddings.append(embedding)
+                        if not bool(candidate.get("accepted")):
+                            continue
+                        accepted_payload.append(candidate_payload[result.index])
+                        accepted_meta.append(candidate)
+                        if not include_base_samples:
+                            continue
+                        label = str(candidate["speaker"])
+                        collected_embeddings.append(embedding)
+                        collected_labels.append(label)
+                        collected_domains.append("mixed")
+                        collected_sources.append("mixed_raw")
+                        collected_sessions.append(session_name)
+                        collected_durations.append(float(candidate["duration"]))
+                        collected_dominant_shares.append(float(candidate["dominant_share"]))
+                        collected_top1_powers.append(float(candidate["top1_power"]))
+                        collected_top2_powers.append(float(candidate["top2_power"]))
+                        collected_active_speakers.append(int(candidate["active_speakers"]))
+                        per_window_counts[label] += 1
 
-                        for result in embed_results:
-                            if result.index >= len(labeled_segments):
-                                continue
-                            (
-                                start,
-                                end,
-                                _raw_label,
-                                label,
-                                dominance,
-                                top_power,
-                                second_power,
-                                active_speakers,
-                            ) = labeled_segments[result.index]
-                            collected_embeddings.append(
-                                np.asarray(result.embedding, dtype=np.float32)
-                            )
-                            collected_labels.append(label)
-                            collected_domains.append("mixed")
-                            collected_sources.append("mixed_raw")
-                            collected_sessions.append(session_name)
-                            collected_durations.append(float(end - start))
-                            collected_dominant_shares.append(float(dominance))
-                            collected_top1_powers.append(float(top_power))
-                            collected_top2_powers.append(float(second_power))
-                            collected_active_speakers.append(int(active_speakers))
-                            per_window_counts[label] += 1
-
-                    if augmentation_config.enabled:
+                    if augmentation_config.enabled and accepted_payload:
                         for pass_index in range(augmentation_config.copies):
                             waveform_augmenter = build_waveform_augmenter(
                                 augmentation_config,
@@ -1950,7 +2596,7 @@ def train_segment_classifier_from_multitrack(
                                 continue
                             aug_results, _ = extract_embeddings_for_segments(
                                 str(mixed_path),
-                                payload,
+                                accepted_payload,
                                 hf_token=hf_token,
                                 diarization_model_name=diarization_model_name,
                                 force_device=force_device,
@@ -1958,33 +2604,56 @@ def train_segment_classifier_from_multitrack(
                                 batch_size=batch_size,
                                 workers=workers,
                                 waveform_transform=waveform_augmenter,
+                                audio_waveform=mixed_audio,
+                                audio_sample_rate=mixed_sample_rate,
                             )
                             for result in aug_results:
-                                if result.index >= len(labeled_segments):
+                                if result.index >= len(accepted_meta):
                                     continue
-                                (
-                                    start,
-                                    end,
-                                    _raw_label,
-                                    label,
-                                    dominance,
-                                    top_power,
-                                    second_power,
-                                    active_speakers,
-                                ) = labeled_segments[result.index]
+                                candidate = accepted_meta[result.index]
                                 collected_embeddings.append(
                                     np.asarray(result.embedding, dtype=np.float32)
                                 )
-                                collected_labels.append(label)
+                                collected_labels.append(str(candidate["speaker"]))
                                 collected_domains.append("mixed_aug")
                                 collected_sources.append("mixed_aug")
                                 collected_sessions.append(session_name)
-                                collected_durations.append(float(end - start))
-                                collected_dominant_shares.append(float(dominance))
-                                collected_top1_powers.append(float(top_power))
-                                collected_top2_powers.append(float(second_power))
-                                collected_active_speakers.append(int(active_speakers))
-                                per_window_counts[label] += 1
+                                collected_durations.append(float(candidate["duration"]))
+                                collected_dominant_shares.append(float(candidate["dominant_share"]))
+                                collected_top1_powers.append(float(candidate["top1_power"]))
+                                collected_top2_powers.append(float(candidate["top2_power"]))
+                                collected_active_speakers.append(int(candidate["active_speakers"]))
+                                per_window_counts[str(candidate["speaker"])] += 1
+
+                    if accepted_meta:
+                        prepared_window_records.append(
+                            {
+                                "session": session_name,
+                                "session_source": str(session_source),
+                                "window_index": int(index),
+                                "window": {
+                                    "start": float(window["start"]),
+                                    "end": float(window["end"]),
+                                    "speaker_count": int(window["speaker_count"]),
+                                },
+                                "mixed_path": str(mixed_path),
+                                "clip_paths": [str(path) for path in clip_paths],
+                                "accepted_segments": [
+                                    {
+                                        "start": float(candidate["start"]),
+                                        "end": float(candidate["end"]),
+                                        "duration": float(candidate["duration"]),
+                                        "speaker": str(candidate["speaker"]),
+                                        "raw_label": str(candidate["raw_label"]),
+                                        "dominant_share": float(candidate["dominant_share"]),
+                                        "top1_power": float(candidate["top1_power"]),
+                                        "top2_power": float(candidate["top2_power"]),
+                                        "active_speakers": int(candidate["active_speakers"]),
+                                    }
+                                    for candidate in accepted_meta
+                                ],
+                            }
+                        )
 
                     session_stats["mixed_segments"]["used_segments"] = int(
                         session_stats["mixed_segments"]["used_segments"]
@@ -2021,8 +2690,16 @@ def train_segment_classifier_from_multitrack(
                             "purity_buckets": dict(per_window_buckets),
                         }
                     )
+                    del mixed_audio
 
                 summary["sessions"].append(session_stats)
+                _emit_progress(
+                    progress_callback,
+                    status="session_completed",
+                    session=session_name,
+                    elapsed_seconds=time.monotonic() - session_started_at,
+                    extra={"windows": len(windows), "mode": training_mode_normalized},
+                )
 
         if not collected_embeddings:
             return None
@@ -2063,6 +2740,14 @@ def train_segment_classifier_from_multitrack(
             ),
         )
         summary["dataset_cache_signature"] = cache_signature
+        summary["breakdown"] = build_source_session_speaker_breakdown(dataset)
+        summary["quality"] = summarize_quality_records(
+            quality_records,
+            clipping_fraction_max=float(summary["quality_filters"]["clipping_fraction_max"]),
+            silence_fraction_max=float(summary["quality_filters"]["silence_fraction_max"]),
+        )
+        summary.setdefault("cache_hits", {})
+        summary["cache_hits"]["dataset"] = False
         if cache_matrix_path is not None and cache_meta_path is not None:
             summary.update(_summarize_classifier_dataset(dataset))
             artifacts = save_classifier_dataset(dataset_cache_dir, dataset, summary=summary)
@@ -2074,12 +2759,39 @@ def train_segment_classifier_from_multitrack(
                     for record in purity_records:
                         handle.write(json.dumps(record) + "\n")
                 summary["artifacts"]["purity"] = str(purity_path)
+            if quality_records:
+                quality_records_path = dataset_cache_dir / "quality_records.jsonl"
+                with quality_records_path.open("w", encoding="utf-8") as handle:
+                    for record in quality_records:
+                        handle.write(json.dumps(record) + "\n")
+                quality_report_path = dataset_cache_dir / "quality_report.json"
+                quality_report_path.write_text(
+                    json.dumps(summary["quality"], indent=2),
+                    encoding="utf-8",
+                )
+                summary["artifacts"]["quality_records"] = str(quality_records_path)
+                summary["artifacts"]["quality_report"] = str(quality_report_path)
+            if candidate_pool_records and candidate_pool_embeddings:
+                summary["artifacts"].update(
+                    save_candidate_pool(
+                        dataset_cache_dir,
+                        records=candidate_pool_records,
+                        embeddings=candidate_pool_embeddings,
+                    )
+                )
+            if prepared_window_records:
+                prepared_windows_path = save_jsonl_records(
+                    _prepared_windows_path(dataset_cache_dir),
+                    prepared_window_records,
+                )
+                summary["artifacts"]["prepared_windows"] = str(prepared_windows_path)
             cache_meta_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if dataset is None or not dataset.labels:
         return None
 
     summary.update(_summarize_classifier_dataset(dataset))
+    summary.setdefault("breakdown", build_source_session_speaker_breakdown(dataset))
     summary["model_name"] = model_name
     if not train_model:
         return summary

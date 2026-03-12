@@ -347,6 +347,8 @@ def extract_embeddings_for_segments(
     batch_size: int = 16,
     workers: int = 4,
     waveform_transform: Optional[Callable[[np.ndarray, int, str, int], np.ndarray]] = None,
+    audio_waveform: Optional[np.ndarray] = None,
+    audio_sample_rate: Optional[int] = None,
 ) -> Tuple[List[SegmentEmbeddingResult], Dict[str, object]]:
     del quiet  # retained for API compatibility
     del workers  # cropping is in-memory now
@@ -365,8 +367,12 @@ def extract_embeddings_for_segments(
     diar_model_name = diarization_model_name or DEFAULT_DIARIZATION_MODEL
     embedder = _resolve_embedder(model_name=diar_model_name, hf_token=hf_token, device=device)
     sample_rate = int(getattr(embedder, "sample_rate", 16000) or 16000)
-    base_waveform = load_audio_mono(audio_path, sample_rate=16000)
-    base_sr = 16000
+    if audio_waveform is not None:
+        base_waveform = np.asarray(audio_waveform, dtype=np.float32).flatten()
+        base_sr = int(audio_sample_rate or 16000)
+    else:
+        base_waveform = load_audio_mono(audio_path, sample_rate=16000)
+        base_sr = 16000
 
     if sample_rate != base_sr:
         try:
@@ -390,40 +396,13 @@ def extract_embeddings_for_segments(
     if not segment_items:
         return [], {"embedded": 0, "skipped": 0, "total": 0}
 
-    cropped: List[Tuple[int, float, float, str, np.ndarray]] = []
-    for index, start, end, speaker in segment_items:
-        if end <= start:
-            continue
-        crop_start = max(start - pre_pad, 0.0)
-        crop_end = min(end + post_pad, audio_duration)
-        if crop_end <= crop_start:
-            continue
-        start_idx = max(0, int(math.floor(crop_start * base_sr)))
-        end_idx = min(total_samples, int(math.ceil(crop_end * base_sr)))
-        if end_idx <= start_idx:
-            continue
-        wave = np.asarray(base_waveform[start_idx:end_idx], dtype=np.float32)
-        if wave.size == 0:
-            continue
-        if waveform_transform is not None:
-            wave = np.asarray(
-                waveform_transform(wave.copy(), int(base_sr), speaker, index),
-                dtype=np.float32,
-            ).flatten()
-            if wave.size == 0:
-                continue
-        cropped.append((index, start, end, speaker, wave))
-
-    if not cropped:
-        return [], {"embedded": 0, "skipped": len(segment_items), "total": len(segment_items)}
-
     try:
         torch_device = torch.device(device)
     except Exception:
         torch_device = device
 
     results: List[SegmentEmbeddingResult] = []
-    skipped = len(segment_items) - len(cropped)
+    skipped = 0
     batch: List[Tuple[int, float, float, str, np.ndarray]] = []
 
     def _flush_batch() -> None:
@@ -467,13 +446,42 @@ def extract_embeddings_for_segments(
                     embedding=(vector / norm).astype(np.float32),
                 )
             )
+        del wave_batch
+        del mask_batch
+        del embedding_batch
         batch.clear()
 
-    for item in cropped:
-        batch.append(item)
+    for index, start, end, speaker in segment_items:
+        if end <= start:
+            skipped += 1
+            continue
+        crop_start = max(start - pre_pad, 0.0)
+        crop_end = min(end + post_pad, audio_duration)
+        if crop_end <= crop_start:
+            skipped += 1
+            continue
+        start_idx = max(0, int(math.floor(crop_start * base_sr)))
+        end_idx = min(total_samples, int(math.ceil(crop_end * base_sr)))
+        if end_idx <= start_idx:
+            skipped += 1
+            continue
+        wave = np.asarray(base_waveform[start_idx:end_idx], dtype=np.float32)
+        if wave.size == 0:
+            skipped += 1
+            continue
+        if waveform_transform is not None:
+            wave = np.asarray(
+                waveform_transform(wave.copy(), int(base_sr), speaker, index),
+                dtype=np.float32,
+            ).flatten()
+            if wave.size == 0:
+                skipped += 1
+                continue
+        batch.append((index, start, end, speaker, wave))
         if len(batch) >= batch_size:
             _flush_batch()
     _flush_batch()
+    del base_waveform
 
     results.sort(key=lambda item: item.index)
     return results, {

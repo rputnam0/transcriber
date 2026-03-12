@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 
+import transcriber.multitrack_eval as multitrack_eval
 from transcriber.multitrack_eval import (
     CachedSegmentEmbedding,
     WordSpan,
+    _prepare_reference_outputs,
+    _prepare_predicted_cache,
     apply_profile_to_cached_segments,
     compute_segment_purity,
     extract_session_stems,
@@ -449,3 +454,273 @@ def test_apply_profile_to_cached_segments_uses_label_classifier_for_short_segmen
     assert relabeled[1]["speaker"] == "Cyrus Schwert"
     assert relabeled[0]["speaker_match_source"] == "label_classifier"
     assert relabeled[1]["speaker_match_source"] == "label_classifier"
+
+
+def test_prepare_predicted_cache_invalidates_when_signature_changes(tmp_path, monkeypatch):
+    mixed_path = tmp_path / "mixed.wav"
+    mixed_path.write_bytes(b"mixed-audio")
+    raw_out_dir = tmp_path / "raw_cache"
+    calls = {"run_transcribe": 0}
+
+    def fake_run_transcribe(**kwargs):
+        calls["run_transcribe"] += 1
+        output_dir = Path(kwargs["output_dir"])
+        jsonl_dir = output_dir / mixed_path.stem
+        jsonl_dir.mkdir(parents=True, exist_ok=True)
+        (jsonl_dir / f"{mixed_path.stem}.jsonl").write_text(
+            '{"speaker":"SPEAKER_00","start":0.0,"end":1.0,"text":"hello","words":[]}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(multitrack_eval, "release_runtime_caches", lambda: None)
+    monkeypatch.setattr(multitrack_eval, "run_transcribe", fake_run_transcribe)
+    monkeypatch.setattr(
+        multitrack_eval,
+        "extract_speaker_embeddings",
+        lambda *args, **kwargs: (
+            {"SPEAKER_00": np.asarray([1.0, 0.0], dtype=np.float32)},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        multitrack_eval,
+        "_build_segment_embedding_cache",
+        lambda *args, **kwargs: [
+            CachedSegmentEmbedding(
+                segment_index=0,
+                raw_label="SPEAKER_00",
+                start=0.0,
+                end=1.0,
+                embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+            )
+        ],
+    )
+
+    defaults = {
+        "model_name": "large-v3",
+        "compute_type": "float16",
+        "batch_size": 16,
+        "speaker_mapping_path": str(tmp_path / "speaker_mapping.json"),
+        "hf_cache_root": str(tmp_path / "hf_cache"),
+        "local_files_only": False,
+        "auto_batch": True,
+        "cache_mode": "repo",
+        "device": "cuda",
+        "diarization_model": "pyannote/speaker-diarization-community-1",
+    }
+
+    _prepare_predicted_cache(
+        mixed_path=mixed_path,
+        raw_out_dir=raw_out_dir,
+        speaker_count=4,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+    _prepare_predicted_cache(
+        mixed_path=mixed_path,
+        raw_out_dir=raw_out_dir,
+        speaker_count=4,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    assert calls["run_transcribe"] == 1
+
+    updated_defaults = dict(defaults)
+    updated_defaults["diarization_model"] = "pyannote/speaker-diarization-legacy"
+    _prepare_predicted_cache(
+        mixed_path=mixed_path,
+        raw_out_dir=raw_out_dir,
+        speaker_count=4,
+        defaults=updated_defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    updated_defaults = dict(defaults)
+    updated_defaults["model_name"] = "medium"
+    _prepare_predicted_cache(
+        mixed_path=mixed_path,
+        raw_out_dir=raw_out_dir,
+        speaker_count=4,
+        defaults=updated_defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    _prepare_predicted_cache(
+        mixed_path=mixed_path,
+        raw_out_dir=raw_out_dir,
+        speaker_count=5,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    signature = json.loads((raw_out_dir / "cache_signature.json").read_text(encoding="utf-8"))
+    assert calls["run_transcribe"] == 4
+    assert signature["speaker_count"] == 5
+
+
+def test_prepare_reference_outputs_honors_runtime_defaults_and_reuses_signature(
+    tmp_path, monkeypatch
+):
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    (clips_dir / "Alice.wav").write_bytes(b"alice")
+    reference_out_dir = tmp_path / "reference"
+    speaker_mapping_path = tmp_path / "speaker_mapping.json"
+    speaker_mapping_path.write_text('{"Alice":"Alice"}', encoding="utf-8")
+    calls: list[dict] = []
+
+    def fake_run_transcribe(**kwargs):
+        calls.append(dict(kwargs))
+        output_dir = Path(kwargs["output_dir"])
+        jsonl_dir = output_dir / clips_dir.stem
+        jsonl_dir.mkdir(parents=True, exist_ok=True)
+        (jsonl_dir / f"{clips_dir.stem}.jsonl").write_text(
+            '{"speaker":"Alice","start":0.0,"end":1.0,"text":"hello","words":[]}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(multitrack_eval, "release_runtime_caches", lambda: None)
+    monkeypatch.setattr(multitrack_eval, "run_transcribe", fake_run_transcribe)
+
+    defaults = {
+        "backend": "faster",
+        "model_name": "large-v3",
+        "compute_type": "float16",
+        "batch_size": 12,
+        "hf_cache_root": str(tmp_path / "hf_cache"),
+        "local_files_only": False,
+        "auto_batch": True,
+        "cache_mode": "repo",
+        "device": "cuda",
+        "diarization_model": "pyannote/speaker-diarization-community-1",
+    }
+
+    first = _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+    second = _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    assert first == second
+    assert calls == [
+        {
+            "input_path": str(clips_dir),
+            "backend": "faster",
+            "model_name": "large-v3",
+            "compute_type": "float16",
+            "batch_size": 12,
+            "output_dir": str(reference_out_dir),
+            "speaker_mapping_path": str(speaker_mapping_path),
+            "min_speakers": None,
+            "max_speakers": None,
+            "write_srt": False,
+            "write_jsonl": True,
+            "hf_cache_root": str(tmp_path / "hf_cache"),
+            "speaker_bank_root": None,
+            "local_files_only": False,
+            "quiet": True,
+            "auto_batch": True,
+            "cache_mode": "repo",
+            "device": "cuda",
+            "diarization_model": "pyannote/speaker-diarization-community-1",
+            "speaker_bank_config": None,
+        }
+    ]
+
+    signature = json.loads((reference_out_dir / "cache_signature.json").read_text(encoding="utf-8"))
+    assert signature["device"] == "cuda"
+    assert signature["compute_type"] == "float16"
+
+
+def test_prepare_reference_outputs_invalidates_when_signature_changes(tmp_path, monkeypatch):
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    (clips_dir / "Alice.wav").write_bytes(b"alice")
+    reference_out_dir = tmp_path / "reference"
+    speaker_mapping_path = tmp_path / "speaker_mapping.json"
+    speaker_mapping_path.write_text('{"Alice":"Alice"}', encoding="utf-8")
+    calls = {"run_transcribe": 0}
+
+    def fake_run_transcribe(**kwargs):
+        calls["run_transcribe"] += 1
+        output_dir = Path(kwargs["output_dir"])
+        jsonl_dir = output_dir / clips_dir.stem
+        jsonl_dir.mkdir(parents=True, exist_ok=True)
+        (jsonl_dir / f"{clips_dir.stem}.jsonl").write_text(
+            '{"speaker":"Alice","start":0.0,"end":1.0,"text":"hello","words":[]}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(multitrack_eval, "release_runtime_caches", lambda: None)
+    monkeypatch.setattr(multitrack_eval, "run_transcribe", fake_run_transcribe)
+
+    defaults = {
+        "backend": "faster",
+        "model_name": "large-v3",
+        "compute_type": "float16",
+        "batch_size": 8,
+        "hf_cache_root": str(tmp_path / "hf_cache"),
+        "local_files_only": False,
+        "auto_batch": True,
+        "cache_mode": "repo",
+        "device": "cuda",
+        "diarization_model": "pyannote/speaker-diarization-community-1",
+    }
+
+    _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+    _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+
+    updated_defaults = dict(defaults)
+    updated_defaults["compute_type"] = "int8_float16"
+    _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=updated_defaults,
+        device_override=None,
+        local_files_only_override=None,
+    )
+    _prepare_reference_outputs(
+        clips_dir=clips_dir,
+        reference_out_dir=reference_out_dir,
+        speaker_mapping_path=speaker_mapping_path,
+        defaults=updated_defaults,
+        device_override="cpu",
+        local_files_only_override=None,
+    )
+
+    signature = json.loads((reference_out_dir / "cache_signature.json").read_text(encoding="utf-8"))
+    assert calls["run_transcribe"] == 3
+    assert signature["compute_type"] == "int8_float16"
+    assert signature["device"] == "cpu"
