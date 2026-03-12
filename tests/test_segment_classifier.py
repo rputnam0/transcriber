@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from pathlib import Path
+from zipfile import ZipFile
 
 import numpy as np
 import pytest
 
+import transcriber.segment_classifier as segment_classifier
 from transcriber.segment_classifier import (
     AudioAugmentationConfig,
     ClassifierDataset,
@@ -18,6 +22,7 @@ from transcriber.segment_classifier import (
     build_classifier_dataset_from_bank,
     load_labeled_records,
     load_classifier_dataset,
+    materialize_classifier_dataset_from_mixed_base,
     merge_classifier_datasets,
     relabel_classifier_dataset_sources,
     save_classifier_dataset,
@@ -373,6 +378,7 @@ def test_dataset_cache_signature_includes_transcript_roots(tmp_path):
         excluded_speakers=[],
         augmentation=AudioAugmentationConfig(),
         diarization_model_name="pyannote/speaker-diarization-community-1",
+        include_base_samples=True,
     )
     signature_b = _build_dataset_cache_signature(
         session_sources=[session_dir],
@@ -394,6 +400,7 @@ def test_dataset_cache_signature_includes_transcript_roots(tmp_path):
         excluded_speakers=[],
         augmentation=AudioAugmentationConfig(),
         diarization_model_name="pyannote/speaker-diarization-community-1",
+        include_base_samples=True,
     )
 
     assert signature_a != signature_b
@@ -594,3 +601,133 @@ def test_build_classifier_dataset_from_bank_returns_dataset(tmp_path):
     dataset, summary = built
     assert dataset.samples == 2
     assert summary["source"] == "speaker_bank"
+
+
+def test_prepare_extracted_session_source_reuses_cached_extraction(tmp_path):
+    session_zip = tmp_path / "Session 10.zip"
+    with ZipFile(session_zip, "w") as archive:
+        archive.writestr("alice.ogg", b"audio")
+
+    cache_root = tmp_path / "cache"
+    events: list[dict] = []
+
+    first = segment_classifier._prepare_extracted_session_source(
+        session_zip,
+        cache_root=cache_root,
+        progress_callback=lambda **kwargs: events.append(dict(kwargs)),
+    )
+    second = segment_classifier._prepare_extracted_session_source(
+        session_zip,
+        cache_root=cache_root,
+        progress_callback=lambda **kwargs: events.append(dict(kwargs)),
+    )
+
+    assert first == second
+    assert (first / "alice.ogg").exists()
+    assert [event["status"] for event in events] == [
+        "extraction_cache_miss",
+        "extraction_cache_hit",
+    ]
+
+
+def test_materialize_classifier_dataset_from_mixed_base_reuses_cached_variant(
+    tmp_path, monkeypatch
+):
+    mixed_base_dir = tmp_path / "mixed_base"
+    mixed_base_dir.mkdir()
+    (mixed_base_dir / "mixed.wav").write_bytes(b"fake")
+    (mixed_base_dir / "prepared_windows.jsonl").write_text(
+        json.dumps(
+            {
+                "session": "Session_10",
+                "mixed_path": str(mixed_base_dir / "mixed.wav"),
+                "accepted_segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "duration": 1.0,
+                        "speaker": "Alice",
+                        "raw_label": "SPEAKER_00",
+                        "dominant_share": 0.9,
+                        "top1_power": 0.3,
+                        "top2_power": 0.05,
+                        "active_speakers": 1,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (mixed_base_dir / "dataset_summary.json").write_text(
+        json.dumps(
+            {
+                "artifact_id": "mixed-base-artifact",
+                "quality_filters": {
+                    "clipping_fraction_max": 0.005,
+                    "silence_fraction_max": 0.80,
+                },
+                "source_groups": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {"extract": 0}
+
+    monkeypatch.setattr(
+        segment_classifier,
+        "_load_audio_array",
+        lambda path: (np.zeros(16000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(segment_classifier, "build_waveform_augmenter", lambda *args, **kwargs: object())
+
+    import transcriber.diarization as diarization
+
+    def fake_extract_embeddings_for_segments(_audio_path, segments, **kwargs):
+        calls["extract"] += 1
+        return (
+            [
+                SimpleNamespace(index=index, embedding=np.asarray([1.0, 0.0], dtype=np.float32))
+                for index, _segment in enumerate(segments)
+            ],
+            {},
+        )
+
+    monkeypatch.setattr(diarization, "extract_embeddings_for_segments", fake_extract_embeddings_for_segments)
+
+    output_dir = tmp_path / "light_variant"
+    first_dataset, first_summary = materialize_classifier_dataset_from_mixed_base(
+        mixed_base_dir=mixed_base_dir,
+        dataset_cache_dir=output_dir,
+        hf_token=None,
+        force_device="cpu",
+        quiet=True,
+        batch_size=4,
+        workers=1,
+        augmentation_profile="light",
+        augmentation_copies=1,
+        include_base_samples=False,
+        reuse_cached_dataset=True,
+    )
+    second_dataset, second_summary = materialize_classifier_dataset_from_mixed_base(
+        mixed_base_dir=mixed_base_dir,
+        dataset_cache_dir=output_dir,
+        hf_token=None,
+        force_device="cpu",
+        quiet=True,
+        batch_size=4,
+        workers=1,
+        augmentation_profile="light",
+        augmentation_copies=1,
+        include_base_samples=False,
+        reuse_cached_dataset=True,
+    )
+
+    assert first_dataset.samples == 1
+    assert first_dataset.domains == ["mixed_aug"]
+    assert first_dataset.sources == ["mixed_aug"]
+    assert second_dataset.samples == 1
+    assert calls["extract"] == 1
+    assert first_summary["materialization_mode"] == "mixed_base_derived"
+    assert second_summary["materialization_signature"] == first_summary["materialization_signature"]
