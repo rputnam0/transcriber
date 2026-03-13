@@ -120,6 +120,27 @@ def test_discover_session_transcript_rejects_unrelated_fuzzy_match(tmp_path):
     assert discovered is None
 
 
+def test_load_audio_array_falls_back_to_ffmpeg_loader(monkeypatch, tmp_path):
+    audio_path = tmp_path / "broken.ogg"
+    audio_path.write_bytes(b"broken")
+
+    def fake_read(_path):
+        raise RuntimeError("soundfile failed")
+
+    monkeypatch.setattr("soundfile.read", fake_read)
+    monkeypatch.setattr(
+        segment_classifier,
+        "load_audio_mono",
+        lambda path, sample_rate=16000: np.ones(sample_rate, dtype=np.float32),
+    )
+
+    waveform, sample_rate = segment_classifier._load_audio_array(audio_path)
+
+    assert sample_rate == 16000
+    assert waveform.shape == (16000,)
+    assert np.allclose(waveform, 1.0)
+
+
 def test_discover_session_transcript_rejects_non_session_source_names(tmp_path):
     outputs_root = tmp_path / "outputs"
     outputs_root.mkdir(parents=True)

@@ -24,6 +24,7 @@ from .segment_classifier import (
     load_segment_classifier,
     train_segment_classifier_from_multitrack,
 )
+from .session_reassignment import apply_profile_to_segments
 from .speaker_bank import SpeakerBank, SpeakerBankConfig
 from .segments import (
     SegmentWindow,
@@ -829,6 +830,118 @@ def _resolve_speaker_bank_settings(
             config.match_aggregation = str(sb_cfg.get("match_aggregation"))
         if sb_cfg.get("min_segments_per_label") is not None:
             config.min_segments_per_label = int(sb_cfg.get("min_segments_per_label"))
+        repair_cfg = sb_cfg.get("repair") or {}
+        if isinstance(repair_cfg, dict) and repair_cfg:
+            if repair_cfg.get("enabled") is not None:
+                config.repair_enabled = bool(repair_cfg.get("enabled"))
+            if repair_cfg.get("merge_same_raw_gap_seconds") is not None:
+                config.repair_merge_same_raw_gap_seconds = float(
+                    repair_cfg.get("merge_same_raw_gap_seconds")
+                )
+            if repair_cfg.get("snap_boundary_seconds") is not None:
+                config.repair_snap_boundary_seconds = float(
+                    repair_cfg.get("snap_boundary_seconds")
+                )
+            if repair_cfg.get("max_overlap_trim_seconds") is not None:
+                config.repair_max_overlap_trim_seconds = float(
+                    repair_cfg.get("max_overlap_trim_seconds")
+                )
+            if repair_cfg.get("split_on_word_gap_seconds") is not None:
+                config.repair_split_on_word_gap_seconds = float(
+                    repair_cfg.get("split_on_word_gap_seconds")
+                )
+            if repair_cfg.get("max_seed_overlap_seconds") is not None:
+                config.repair_max_seed_overlap_seconds = float(
+                    repair_cfg.get("max_seed_overlap_seconds")
+                )
+            if repair_cfg.get("min_segment_duration_seconds") is not None:
+                config.repair_min_segment_duration_seconds = float(
+                    repair_cfg.get("min_segment_duration_seconds")
+                )
+        session_graph_cfg = sb_cfg.get("session_graph") or {}
+        if isinstance(session_graph_cfg, dict) and session_graph_cfg:
+            if session_graph_cfg.get("enabled") is not None:
+                config.session_graph_enabled = bool(session_graph_cfg.get("enabled"))
+            if session_graph_cfg.get("candidate_top_k") is not None:
+                config.session_graph_candidate_top_k = int(
+                    session_graph_cfg.get("candidate_top_k")
+                )
+            if session_graph_cfg.get("candidate_floor") is not None:
+                config.session_graph_candidate_floor = float(
+                    session_graph_cfg.get("candidate_floor")
+                )
+            if session_graph_cfg.get("knn") is not None:
+                config.session_graph_knn = int(session_graph_cfg.get("knn"))
+            if session_graph_cfg.get("min_similarity") is not None:
+                config.session_graph_min_similarity = float(
+                    session_graph_cfg.get("min_similarity")
+                )
+            if session_graph_cfg.get("anchor_weight") is not None:
+                config.session_graph_anchor_weight = float(
+                    session_graph_cfg.get("anchor_weight")
+                )
+            if session_graph_cfg.get("temporal_weight") is not None:
+                config.session_graph_temporal_weight = float(
+                    session_graph_cfg.get("temporal_weight")
+                )
+            if session_graph_cfg.get("temporal_tau_seconds") is not None:
+                config.session_graph_temporal_tau_seconds = float(
+                    session_graph_cfg.get("temporal_tau_seconds")
+                )
+            if session_graph_cfg.get("temporal_max_gap_seconds") is not None:
+                config.session_graph_temporal_max_gap_seconds = float(
+                    session_graph_cfg.get("temporal_max_gap_seconds")
+                )
+            if session_graph_cfg.get("same_raw_label_weight") is not None:
+                config.session_graph_same_raw_label_weight = float(
+                    session_graph_cfg.get("same_raw_label_weight")
+                )
+            if session_graph_cfg.get("same_top1_weight") is not None:
+                config.session_graph_same_top1_weight = float(
+                    session_graph_cfg.get("same_top1_weight")
+                )
+            if session_graph_cfg.get("alpha") is not None:
+                config.session_graph_alpha = float(session_graph_cfg.get("alpha"))
+            if session_graph_cfg.get("max_iters") is not None:
+                config.session_graph_max_iters = int(session_graph_cfg.get("max_iters"))
+            if session_graph_cfg.get("tolerance") is not None:
+                config.session_graph_tolerance = float(session_graph_cfg.get("tolerance"))
+            if session_graph_cfg.get("strong_seed_score") is not None:
+                config.session_graph_strong_seed_score = float(
+                    session_graph_cfg.get("strong_seed_score")
+                )
+            if session_graph_cfg.get("strong_seed_margin") is not None:
+                config.session_graph_strong_seed_margin = float(
+                    session_graph_cfg.get("strong_seed_margin")
+                )
+            if session_graph_cfg.get("override_min_confidence") is not None:
+                config.session_graph_override_min_confidence = float(
+                    session_graph_cfg.get("override_min_confidence")
+                )
+            if session_graph_cfg.get("override_min_margin") is not None:
+                config.session_graph_override_min_margin = float(
+                    session_graph_cfg.get("override_min_margin")
+                )
+            if session_graph_cfg.get("override_min_delta") is not None:
+                config.session_graph_override_min_delta = float(
+                    session_graph_cfg.get("override_min_delta")
+                )
+            pair_overrides = session_graph_cfg.get("pair_overrides")
+            if isinstance(pair_overrides, dict):
+                normalized_pair_overrides = {}
+                for pair_key, override_values in pair_overrides.items():
+                    if not isinstance(override_values, dict):
+                        continue
+                    normalized_values = {}
+                    for name, value in override_values.items():
+                        if value is None:
+                            continue
+                        try:
+                            normalized_values[str(name)] = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                    normalized_pair_overrides[str(pair_key)] = normalized_values
+                config.session_graph_pair_overrides = normalized_pair_overrides
         cluster_cfg = sb_cfg.get("cluster") or {}
         if cluster_cfg.get("method"):
             config.cluster_method = str(cluster_cfg.get("method"))
@@ -1765,12 +1878,6 @@ def run_transcribe(
     ) -> Dict[str, object]:
         file_path = Path(file_key)
         file_name = file_path.name
-        summary: Dict[str, object] = {
-            "attempted": 0,
-            "matched": 0,
-            "matches": {},
-            "segment_counts": {"matched": 0, "unknown": 0},
-        }
         logger.debug(
             "Speaker bank apply start file=%s embeddings=%d labels=%s",
             file_name,
@@ -1783,402 +1890,46 @@ def run_transcribe(
                 "No speaker bank configured for %s",
                 file_name,
             )
-            return summary
+            return {
+                "attempted": 0,
+                "matched": 0,
+                "matches": {},
+                "segment_counts": {"matched": 0, "unknown": 0},
+            }
         if not speaker_bank_config.use_existing:
             logger.debug(
                 "Speaker bank configured to skip existing matches for %s",
                 file_name,
             )
-            return summary
+            return {
+                "attempted": 0,
+                "matched": 0,
+                "matches": {},
+                "segment_counts": {"matched": 0, "unknown": 0},
+            }
+        if extract_embeddings_for_segments_fn is None:
+            logger.warning("Segment embedding extraction is unavailable for %s", file_name)
+            return {
+                "attempted": 0,
+                "matched": 0,
+                "matches": {},
+                "segment_counts": {"matched": 0, "unknown": 0},
+            }
 
-        threshold = float(speaker_bank_config.threshold)
-        margin_required = max(float(speaker_bank_config.scoring_margin), 0.0)
-        radius_factor = float(speaker_bank_config.radius_factor)
-
-        # Track raw diarization labels per segment
-        label_to_segments: Dict[str, List[int]] = defaultdict(list)
-        segment_labels: Dict[int, Optional[str]] = {}
-        for idx, seg in enumerate(segments):
-            raw_label = seg.get("speaker")
-            seg["speaker_raw"] = raw_label
-            segment_labels[idx] = raw_label
-            if raw_label:
-                label_to_segments[raw_label].append(idx)
-
-        segment_matches: Dict[int, Dict[str, object]] = {}
-        label_stats: Dict[str, Dict[str, object]] = {}
-
-        if speaker_bank_config.match_per_segment and segments:
-
-            def _segment_level_match() -> (
-                Tuple[Dict[int, Dict[str, object]], Dict[str, Dict[str, object]], Dict[str, object]]
-            ):
-                payload_by_label: Dict[str, List[Tuple[int, float, float, str]]] = defaultdict(list)
-                label_stats_local: Dict[str, Dict[str, object]] = {}
-                for idx, seg in enumerate(segments):
-                    raw_label = segment_labels[idx]
-                    if not raw_label:
-                        continue
-                    start = float(seg.get("start") or 0.0)
-                    end = float(seg.get("end") or 0.0)
-                    if end <= start:
-                        continue
-                    payload_by_label[raw_label].append((idx, start, end, raw_label))
-                    stats = label_stats_local.setdefault(
-                        raw_label,
-                        {
-                            "segments_total": 0,
-                            "segments_indices": [],
-                            "matches_by_speaker": defaultdict(list),
-                            "aggregation": speaker_bank_config.match_aggregation.lower(),
-                        },
-                    )
-                    stats["segments_total"] += 1
-                    stats["segments_indices"].append(idx)
-
-                if not payload_by_label:
-                    return {}, {}, {"embedded": 0, "skipped": 0, "total": 0}
-
-                seg_matches: Dict[int, Dict[str, object]] = {}
-                for payload_items in payload_by_label.values():
-                    for idx, *_ in payload_items:
-                        seg_matches[idx] = {
-                            "accepted": False,
-                            "match": None,
-                            "top_score": None,
-                            "second_best": None,
-                            "margin": None,
-                            "candidates": [],
-                        }
-
-                embed_summary: Dict[str, object] = {
-                    "embedded": 0,
-                    "skipped": 0,
-                    "total": 0,
-                    "labels": {},
-                }
-                for raw_label, payload_items in payload_by_label.items():
-                    payload = [(start, end, label) for _, start, end, label in payload_items]
-                    label_index_map = [idx for idx, *_ in payload_items]
-                    try:
-                        if extract_embeddings_for_segments_fn is None:
-                            continue
-                        embed_results, label_summary = extract_embeddings_for_segments_fn(
-                            file_key,
-                            payload,
-                            hf_token=hf_token,
-                            force_device=speaker_bank_embed_device,
-                            quiet=quiet,
-                            pre_pad=speaker_bank_config.pre_pad,
-                            post_pad=speaker_bank_config.post_pad,
-                            batch_size=speaker_bank_config.embed_batch_size,
-                            workers=speaker_bank_config.embed_workers,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Segment embedding extraction failed for %s (%s): %s",
-                            file_name,
-                            raw_label,
-                            exc,
-                        )
-                        embed_summary.setdefault("errors", {})[raw_label] = str(exc)
-                        continue
-
-                    for field in ("embedded", "skipped", "total"):
-                        embed_summary[field] = int(embed_summary.get(field, 0)) + int(
-                            label_summary.get(field, 0)
-                        )
-                    for field in ("device", "sample_rate"):
-                        if field in label_summary and field not in embed_summary:
-                            embed_summary[field] = label_summary[field]
-                    embed_summary["labels"][raw_label] = label_summary
-
-                    for result in embed_results:
-                        if result.index >= len(label_index_map):
-                            continue
-                        seg_idx = label_index_map[result.index]
-                        classifier_prediction = None
-                        if segment_classifier is not None:
-                            segment_duration = max(float(result.end) - float(result.start), 0.0)
-                            classifier_min_confidence, classifier_min_margin = (
-                                _segment_classifier_thresholds(
-                                    duration=segment_duration,
-                                    base_confidence=float(
-                                        speaker_bank_config.classifier_min_confidence
-                                    ),
-                                    base_margin=float(speaker_bank_config.classifier_min_margin),
-                                )
-                            )
-                            classifier_prediction = segment_classifier.predict(
-                                result.embedding,
-                                min_confidence=classifier_min_confidence,
-                                min_margin=classifier_min_margin,
-                            )
-                        if classifier_prediction is not None:
-                            seg_matches[seg_idx] = {
-                                "accepted": True,
-                                "match": {
-                                    "speaker": classifier_prediction.speaker,
-                                    "cluster_id": None,
-                                    "score": classifier_prediction.score,
-                                    "distance": None,
-                                    "margin": classifier_prediction.margin,
-                                    "second_best": classifier_prediction.second_best,
-                                    "source": "segment_classifier",
-                                },
-                                "top_score": classifier_prediction.score,
-                                "second_best": classifier_prediction.second_best,
-                                "margin": classifier_prediction.margin,
-                                "candidates": classifier_prediction.candidates,
-                            }
-                            continue
-                        candidates = speaker_bank.score_candidates(
-                            result.embedding,
-                            radius_factor=radius_factor,
-                            as_norm_enabled=speaker_bank_config.scoring_as_norm_enabled,
-                            as_norm_cohort_size=speaker_bank_config.scoring_as_norm_cohort_size,
-                        )
-                        top1 = candidates[0] if candidates else None
-                        top2_score = candidates[1]["score"] if len(candidates) > 1 else None
-                        margin_value = (
-                            (top1["score"] - top2_score)
-                            if top1 and top2_score is not None
-                            else (top1["score"] if top1 else None)
-                        )
-                        accepted = bool(
-                            top1
-                            and top1["score"] >= threshold
-                            and (margin_value if margin_value is not None else 0.0)
-                            >= margin_required
-                        )
-                        match_payload = None
-                        if accepted and top1:
-                            match_payload = {
-                                "speaker": top1["speaker"],
-                                "cluster_id": top1["cluster_id"],
-                                "score": top1["score"],
-                                "distance": top1["distance"],
-                                "margin": margin_value,
-                                "second_best": top2_score,
-                                "source": f"segment_{top1.get('source', 'centroid')}",
-                            }
-                        seg_matches[seg_idx] = {
-                            "accepted": accepted,
-                            "match": match_payload,
-                            "top_score": top1["score"] if top1 else None,
-                            "second_best": top2_score,
-                            "margin": margin_value,
-                            "candidates": candidates,
-                        }
-
-                # Aggregation per label
-                for label, stats in label_stats_local.items():
-                    selection, aggregate_stats = _aggregate_segment_label_candidates(
-                        stats.get("segments_indices", []),
-                        seg_matches,
-                        aggregation=str(stats.get("aggregation") or "mean"),
-                        threshold=threshold,
-                        margin_required=margin_required,
-                        min_segments_per_label=speaker_bank_config.min_segments_per_label,
-                    )
-                    stats.update(aggregate_stats)
-                    stats["selection"] = selection
-
-                debug_payload = {
-                    "embedding": embed_summary,
-                    "labels": {
-                        label: {
-                            "segments_total": stats.get("segments_total"),
-                            "segments_embedded": stats.get("segments_embedded"),
-                            "segments_matched": stats.get("segments_matched"),
-                            "aggregation": stats.get("aggregation"),
-                            "margin": stats.get("margin"),
-                        }
-                        for label, stats in label_stats_local.items()
-                    },
-                }
-                return seg_matches, label_stats_local, debug_payload
-
-            segment_matches, label_stats, segment_debug = _segment_level_match()
-            if segment_debug:
-                summary["segment_debug"] = segment_debug
-        else:
-            for label, indices in label_to_segments.items():
-                label_stats[label] = {
-                    "segments_total": len(indices),
-                    "segments_matched": 0,
-                    "aggregation": speaker_bank_config.match_aggregation.lower(),
-                    "matches_by_speaker": {},
-                    "selection": None,
-                }
-
-        # Begin determining label-level matches
-        label_matches: Dict[str, Optional[Dict[str, object]]] = {}
-        for label, stats in label_stats.items():
-            selection = stats.get("selection")
-            if selection:
-                match_dict = {
-                    "speaker": selection.get("speaker"),
-                    "cluster_id": selection.get("cluster_id"),
-                    "score": selection.get("score"),
-                    "score_max": selection.get("score_max"),
-                    "distance": selection.get("distance"),
-                    "margin": selection.get("margin"),
-                    "second_best": selection.get("second_best"),
-                    "source": selection.get("source"),
-                }
-                label_matches[label] = match_dict
-            else:
-                label_matches[label] = None
-
-        # Fallback to diar-label embeddings for any remaining labels
-        for label, vector in embeddings.items():
-            if label in label_matches and label_matches[label]:
-                continue
-            stats_for_label = label_stats.get(label) or {}
-            try:
-                match = speaker_bank.match(
-                    vector,
-                    threshold=threshold,
-                    radius_factor=radius_factor,
-                    margin=margin_required,
-                    as_norm_enabled=speaker_bank_config.scoring_as_norm_enabled,
-                    as_norm_cohort_size=speaker_bank_config.scoring_as_norm_cohort_size,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logging.getLogger("transcriber").warning(
-                    "Speaker bank match failed for %s (%s): %s",
-                    file_name,
-                    label,
-                    exc,
-                )
-                match = None
-            if match:
-                match["source"] = "label_vector"
-                label_matches[label] = match
-                continue
-            if segment_classifier is not None:
-                label_segment_count = int(stats_for_label.get("segments_total") or 0)
-                classifier_min_confidence, classifier_min_margin = _label_classifier_thresholds(
-                    segment_count=label_segment_count,
-                    base_confidence=float(speaker_bank_config.classifier_min_confidence),
-                    base_margin=float(speaker_bank_config.classifier_min_margin),
-                )
-                classifier_prediction = segment_classifier.predict(
-                    vector,
-                    min_confidence=classifier_min_confidence,
-                    min_margin=classifier_min_margin,
-                )
-                if classifier_prediction is not None:
-                    label_matches[label] = {
-                        "speaker": classifier_prediction.speaker,
-                        "cluster_id": None,
-                        "score": classifier_prediction.score,
-                        "score_max": classifier_prediction.score,
-                        "distance": None,
-                        "margin": classifier_prediction.margin,
-                        "second_best": classifier_prediction.second_best,
-                        "source": "label_classifier",
-                    }
-                    continue
-            label_matches[label] = match
-
-        summary["attempted"] = len(label_matches)
-        summary["matched"] = sum(1 for match in label_matches.values() if match)
-
-        matched_segments = 0
-        unknown_segments = 0
-
-        for label, match in label_matches.items():
-            # Record label stats for summary
-            if label in label_stats:
-                stats = label_stats[label]
-                summary.setdefault("label_stats", {})[label] = {
-                    "segments_total": stats.get("segments_total"),
-                    "segments_matched": stats.get("segments_matched"),
-                    "aggregation": stats.get("aggregation"),
-                    "margin": stats.get("margin"),
-                }
-            else:
-                summary.setdefault("label_stats", {})[label] = {}
-
-            summary["matches"][label] = match
-
-            segment_indices = label_to_segments.get(label, [])
-            for idx in segment_indices:
-                seg = segments[idx]
-                seg_match_info = segment_matches.get(idx)
-                segment_level_match = None
-                if (
-                    seg_match_info
-                    and seg_match_info.get("accepted")
-                    and seg_match_info.get("match")
-                ):
-                    segment_level_match = dict(seg_match_info["match"])
-                    segment_level_match["label"] = label
-
-                effective_match = segment_level_match
-                if not effective_match and match:
-                    effective_match = {
-                        "speaker": match["speaker"],
-                        "score": match.get("score"),
-                        "cluster_id": match.get("cluster_id"),
-                        "distance": match.get("distance"),
-                        "margin": match.get("margin"),
-                        "second_best": match.get("second_best"),
-                        "source": match.get("source") or "speaker_bank",
-                        "label": label,
-                    }
-
-                if effective_match:
-                    _set_segment_speaker_label(seg, effective_match["speaker"])
-                    seg["speaker_match"] = effective_match
-                    seg["speaker_match_source"] = effective_match.get("source", "speaker_bank")
-                    seg["speaker_match_score"] = seg["speaker_match"].get("score")
-                    seg["speaker_match_distance"] = seg["speaker_match"].get("distance")
-                    seg["speaker_match_cluster"] = seg["speaker_match"].get("cluster_id")
-                    matched_segments += 1
-                else:
-                    _set_segment_speaker_label(seg, "unknown")
-                    seg["speaker_match"] = {
-                        "speaker": None,
-                        "score": None,
-                        "cluster_id": None,
-                        "distance": None,
-                        "source": "speaker_bank",
-                        "label": label,
-                    }
-                    seg["speaker_match_score"] = None
-                    seg["speaker_match_distance"] = None
-                    seg["speaker_match_cluster"] = None
-                    seg["speaker_match_source"] = "speaker_bank"
-                    unknown_segments += 1
-
-        # Segments without labels default to unknown
-        for idx, seg in enumerate(segments):
-            if segment_labels.get(idx) is None:
-                if not seg.get("speaker"):
-                    _set_segment_speaker_label(seg, "unknown")
-                    unknown_segments += 1
-                seg.setdefault(
-                    "speaker_match",
-                    {
-                        "speaker": None,
-                        "score": None,
-                        "cluster_id": None,
-                        "distance": None,
-                        "source": "speaker_bank",
-                        "label": None,
-                    },
-                )
-                seg.setdefault("speaker_match_source", "speaker_bank")
-                seg.setdefault("speaker_match_score", None)
-                seg.setdefault("speaker_match_distance", None)
-                seg.setdefault("speaker_match_cluster", None)
-
-        summary["segment_counts"]["matched"] = matched_segments
-        summary["segment_counts"]["unknown"] = unknown_segments
-
+        relabeled_segments, summary, _ = apply_profile_to_segments(
+            audio_path=file_key,
+            segments=segments,
+            label_embeddings=embeddings,
+            speaker_bank=speaker_bank,
+            speaker_bank_config=speaker_bank_config,
+            segment_classifier=segment_classifier,
+            extract_embeddings_for_segments_fn=extract_embeddings_for_segments_fn,
+            hf_token=hf_token,
+            diarization_model_name=diarization_model or speaker_bank_config.diarization_model,
+            force_device=speaker_bank_embed_device,
+            quiet=quiet,
+        )
+        segments[:] = relabeled_segments
         if summary["attempted"]:
             logging.getLogger("transcriber").info(
                 "Speaker bank matched %d/%d diar speakers for %s",
@@ -2189,8 +1940,8 @@ def run_transcribe(
         logger.debug(
             "Speaker bank apply complete file=%s matched_segments=%d unknown_segments=%d",
             file_name,
-            matched_segments,
-            unknown_segments,
+            int(summary["segment_counts"].get("matched") or 0),
+            int(summary["segment_counts"].get("unknown") or 0),
         )
         return summary
 
@@ -2231,6 +1982,37 @@ def run_transcribe(
                 "match_per_segment": speaker_bank_config.match_per_segment,
                 "match_aggregation": speaker_bank_config.match_aggregation,
                 "min_segments_per_label": speaker_bank_config.min_segments_per_label,
+                "repair": {
+                    "enabled": speaker_bank_config.repair_enabled,
+                    "merge_same_raw_gap_seconds": speaker_bank_config.repair_merge_same_raw_gap_seconds,
+                    "snap_boundary_seconds": speaker_bank_config.repair_snap_boundary_seconds,
+                    "max_overlap_trim_seconds": speaker_bank_config.repair_max_overlap_trim_seconds,
+                    "split_on_word_gap_seconds": speaker_bank_config.repair_split_on_word_gap_seconds,
+                    "max_seed_overlap_seconds": speaker_bank_config.repair_max_seed_overlap_seconds,
+                    "min_segment_duration_seconds": speaker_bank_config.repair_min_segment_duration_seconds,
+                },
+                "session_graph": {
+                    "enabled": speaker_bank_config.session_graph_enabled,
+                    "candidate_top_k": speaker_bank_config.session_graph_candidate_top_k,
+                    "candidate_floor": speaker_bank_config.session_graph_candidate_floor,
+                    "knn": speaker_bank_config.session_graph_knn,
+                    "min_similarity": speaker_bank_config.session_graph_min_similarity,
+                    "anchor_weight": speaker_bank_config.session_graph_anchor_weight,
+                    "temporal_weight": speaker_bank_config.session_graph_temporal_weight,
+                    "temporal_tau_seconds": speaker_bank_config.session_graph_temporal_tau_seconds,
+                    "temporal_max_gap_seconds": speaker_bank_config.session_graph_temporal_max_gap_seconds,
+                    "same_raw_label_weight": speaker_bank_config.session_graph_same_raw_label_weight,
+                    "same_top1_weight": speaker_bank_config.session_graph_same_top1_weight,
+                    "alpha": speaker_bank_config.session_graph_alpha,
+                    "max_iters": speaker_bank_config.session_graph_max_iters,
+                    "tolerance": speaker_bank_config.session_graph_tolerance,
+                    "strong_seed_score": speaker_bank_config.session_graph_strong_seed_score,
+                    "strong_seed_margin": speaker_bank_config.session_graph_strong_seed_margin,
+                    "override_min_confidence": speaker_bank_config.session_graph_override_min_confidence,
+                    "override_min_margin": speaker_bank_config.session_graph_override_min_margin,
+                    "override_min_delta": speaker_bank_config.session_graph_override_min_delta,
+                    "pair_overrides": speaker_bank_config.session_graph_pair_overrides,
+                },
                 "prototypes_enabled": speaker_bank_config.prototypes_enabled,
                 "prototypes_per_cluster": speaker_bank_config.prototypes_per_cluster,
                 "prototypes_method": speaker_bank_config.prototypes_method,

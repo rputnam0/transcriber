@@ -17,6 +17,7 @@ from transcriber.multitrack_eval import (
     extract_session_stems,
     score_word_speaker_alignment,
     select_candidate_windows,
+    summarize_graph_pair_diagnostics,
 )
 
 
@@ -62,6 +63,44 @@ def test_score_word_speaker_alignment_uses_word_timestamps():
     assert metrics["correct_words"] == 2
     assert metrics["accuracy"] == 2 / 3
     assert metrics["confusion"]["Alice"]["Carol"] == 1
+
+
+def test_summarize_graph_pair_diagnostics_reports_pre_post_confusion_delta():
+    diagnostics = summarize_graph_pair_diagnostics(
+        {
+            "confusion": {
+                "Cyrus Schwert": {"Cletus Cobbington": 4},
+                "Dungeon Master": {"Kaladen Shash": 1},
+            }
+        },
+        {
+            "confusion": {
+                "Cyrus Schwert": {"Cletus Cobbington": 2},
+                "Dungeon Master": {"Kaladen Shash": 3},
+            }
+        },
+        {
+            "graph": {
+                "pairs": {
+                    "Cletus Cobbington::Cyrus Schwert": {
+                        "overrides_attempted": 3,
+                        "overrides_accepted": 2,
+                        "rescued_unknowns": 1,
+                    }
+                }
+            }
+        },
+    )
+
+    assert diagnostics["Cletus Cobbington::Cyrus Schwert"] == {
+        "overrides_attempted": 3,
+        "overrides_accepted": 2,
+        "rescued_unknowns": 1,
+        "pre_confusions": 4,
+        "post_confusions": 2,
+        "delta_confusions": -2,
+    }
+    assert diagnostics["Dungeon Master::Kaladen Shash"]["delta_confusions"] == 2
 
 
 class _FakeSpeakerBank:
@@ -174,6 +213,7 @@ def test_apply_profile_to_cached_segments_relabels_words_and_segments():
         },
     ]
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={
             "SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32),
@@ -312,6 +352,7 @@ def test_apply_profile_to_cached_segments_supports_score_fusion():
     ]
 
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={"SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32)},
         segment_embeddings=[
@@ -423,6 +464,7 @@ def test_apply_profile_to_cached_segments_uses_label_classifier_for_short_segmen
     ]
 
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={"SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32)},
         segment_embeddings=[

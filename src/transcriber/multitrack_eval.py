@@ -9,23 +9,20 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from zipfile import ZipFile
 
 import numpy as np
 
 from .cli import (
-    _aggregate_segment_label_candidates,
-    _label_classifier_thresholds,
     _load_yaml_or_json,
     _resolve_speaker_bank_paths,
     _resolve_speaker_bank_settings,
-    _segment_classifier_thresholds,
-    _set_segment_speaker_label,
     run_transcribe,
 )
 from .consolidate import choose_speaker, consolidate, save_outputs
 from .segment_classifier import load_labeled_records, load_segment_classifier
+from .session_reassignment import apply_profile_to_segments
 from .speaker_bank import SpeakerBank
 from .diarization import (
     extract_embeddings_for_segments,
@@ -33,6 +30,9 @@ from .diarization import (
     release_runtime_caches,
 )
 from .prep_artifacts import artifact_id_for_payload, build_path_identity
+
+
+NON_SPEAKER_LABELS = {"", "unknown", "<unmatched>"}
 
 
 @dataclass
@@ -70,27 +70,43 @@ def load_jsonl_records(path: Path) -> List[dict]:
 def extract_words_from_jsonl(path: Path) -> List[WordSpan]:
     words: List[WordSpan] = []
     for record in load_jsonl_records(path):
-        segment_speaker = record.get("speaker")
-        raw_words = record.get("words") or []
-        if not isinstance(raw_words, list):
+        words.extend(_extract_words_from_segment_record(record))
+    words.sort(key=lambda item: (item.start, item.end, item.text))
+    return words
+
+
+def _extract_words_from_segment_record(record: Mapping[str, object]) -> List[WordSpan]:
+    words: List[WordSpan] = []
+    segment_speaker = record.get("speaker")
+    raw_words = record.get("words") or []
+    if not isinstance(raw_words, list):
+        return words
+    for word in raw_words:
+        if not isinstance(word, dict):
             continue
-        for word in raw_words:
-            if not isinstance(word, dict):
-                continue
-            start = word.get("start")
-            end = word.get("end")
-            text = str(word.get("word") or word.get("text") or "").strip()
-            speaker = word.get("speaker") or segment_speaker
-            if start is None or end is None or not text or not speaker:
-                continue
-            words.append(
-                WordSpan(
-                    speaker=str(speaker),
-                    start=float(start),
-                    end=float(end),
-                    text=text,
-                )
+        start = word.get("start")
+        end = word.get("end")
+        text = str(word.get("word") or word.get("text") or "").strip()
+        speaker = word.get("speaker") or segment_speaker
+        if start is None or end is None or not text or not speaker:
+            continue
+        words.append(
+            WordSpan(
+                speaker=str(speaker),
+                start=float(start),
+                end=float(end),
+                text=text,
             )
+        )
+    return words
+
+
+def extract_words_from_segments(records: Sequence[Mapping[str, object]]) -> List[WordSpan]:
+    words: List[WordSpan] = []
+    for record in records:
+        segment_speaker = record.get("speaker")
+        _ = segment_speaker
+        words.extend(_extract_words_from_segment_record(record))
     words.sort(key=lambda item: (item.start, item.end, item.text))
     return words
 
@@ -241,6 +257,76 @@ def score_word_speaker_alignment(
             for speaker in sorted(per_speaker_total)
         },
         "confusion": {speaker: dict(counts) for speaker, counts in sorted(confusion.items())},
+    }
+
+
+def _normalized_pair_key(left: object, right: object) -> str | None:
+    left_name = str(left or "").strip()
+    right_name = str(right or "").strip()
+    if not left_name or not right_name or left_name == right_name:
+        return None
+    ordered = sorted([left_name, right_name])
+    return f"{ordered[0]}::{ordered[1]}"
+
+
+def _confusion_pair_counts(confusion: Mapping[str, object]) -> Dict[str, int]:
+    pair_counts: Counter[str] = Counter()
+    for actual, predicted_counts in dict(confusion or {}).items():
+        actual_name = str(actual or "").strip()
+        if actual_name.lower() in NON_SPEAKER_LABELS:
+            continue
+        for predicted, value in dict(predicted_counts or {}).items():
+            predicted_name = str(predicted or "").strip()
+            if predicted_name.lower() in NON_SPEAKER_LABELS or predicted_name == actual_name:
+                continue
+            pair_key = _normalized_pair_key(actual_name, predicted_name)
+            if not pair_key:
+                continue
+            pair_counts[pair_key] += int(value or 0)
+    return dict(pair_counts)
+
+
+def summarize_graph_pair_diagnostics(
+    pre_graph_metrics: Optional[Mapping[str, object]],
+    post_graph_metrics: Mapping[str, object],
+    speaker_bank_summary: Optional[Mapping[str, object]],
+) -> Dict[str, Dict[str, int]]:
+    pre_confusions = _confusion_pair_counts(
+        dict(pre_graph_metrics or {}).get("confusion") or {}
+    )
+    post_confusions = _confusion_pair_counts(
+        dict(post_graph_metrics or {}).get("confusion") or {}
+    )
+    graph_pairs = dict(dict(speaker_bank_summary or {}).get("graph", {}).get("pairs") or {})
+    pair_keys = set(pre_confusions) | set(post_confusions) | set(graph_pairs)
+    diagnostics: Dict[str, Dict[str, int]] = {}
+    for pair_key in sorted(pair_keys):
+        pair_summary = dict(graph_pairs.get(pair_key) or {})
+        pre_count = int(pre_confusions.get(pair_key, 0))
+        post_count = int(post_confusions.get(pair_key, 0))
+        diagnostics[pair_key] = {
+            "overrides_attempted": int(pair_summary.get("overrides_attempted") or 0),
+            "overrides_accepted": int(pair_summary.get("overrides_accepted") or 0),
+            "rescued_unknowns": int(pair_summary.get("rescued_unknowns") or 0),
+            "pre_confusions": pre_count,
+            "post_confusions": post_count,
+            "delta_confusions": post_count - pre_count,
+        }
+    return diagnostics
+
+
+def _aggregate_graph_pair_diagnostics(
+    pair_diagnostics: Sequence[Mapping[str, Mapping[str, object]]],
+) -> Dict[str, Dict[str, int]]:
+    aggregate: Dict[str, Counter[str]] = defaultdict(Counter)
+    for item in pair_diagnostics:
+        for pair_key, metrics in dict(item or {}).items():
+            counter = aggregate[str(pair_key)]
+            for metric_name, value in dict(metrics or {}).items():
+                counter[str(metric_name)] += int(value or 0)
+    return {
+        pair_key: dict(counter)
+        for pair_key, counter in sorted(aggregate.items(), key=lambda item: item[0])
     }
 
 
@@ -720,6 +806,7 @@ def _fuse_candidate_scores(
 
 
 def apply_profile_to_cached_segments(
+    audio_path: Path,
     segments: Sequence[dict],
     *,
     label_embeddings: Dict[str, np.ndarray],
@@ -727,306 +814,25 @@ def apply_profile_to_cached_segments(
     speaker_bank: Optional[SpeakerBank],
     speaker_bank_config: object,
     segment_classifier: object | None = None,
+    hf_token: Optional[str] = None,
+    diarization_model_name: Optional[str] = None,
+    force_device: Optional[str] = None,
+    quiet: bool = True,
 ) -> Tuple[List[dict], Dict[str, object]]:
-    relabeled = copy.deepcopy(list(segments))
-    summary: Dict[str, object] = {
-        "attempted": 0,
-        "matched": 0,
-        "matches": {},
-        "segment_counts": {"matched": 0, "unknown": 0},
-    }
-    if speaker_bank is None or speaker_bank_config is None:
-        return relabeled, summary
-    if not getattr(speaker_bank_config, "use_existing", True):
-        return relabeled, summary
-
-    threshold = float(getattr(speaker_bank_config, "threshold", 0.0))
-    margin_required = max(float(getattr(speaker_bank_config, "scoring_margin", 0.0)), 0.0)
-    radius_factor = float(getattr(speaker_bank_config, "radius_factor", 0.0))
-    fusion_mode = str(
-        getattr(speaker_bank_config, "classifier_fusion_mode", "fallback") or "fallback"
-    ).lower()
-    classifier_weight = float(getattr(speaker_bank_config, "classifier_fusion_weight", 0.70))
-    bank_weight = float(getattr(speaker_bank_config, "classifier_bank_weight", 0.30))
-
-    label_to_segments: Dict[str, List[int]] = defaultdict(list)
-    segment_labels: Dict[int, Optional[str]] = {}
-    for index, segment in enumerate(relabeled):
-        raw_label = segment.get("speaker_raw") or segment.get("speaker")
-        segment["speaker_raw"] = raw_label
-        segment_labels[index] = str(raw_label) if raw_label else None
-        if raw_label:
-            label_to_segments[str(raw_label)].append(index)
-
-    label_stats: Dict[str, Dict[str, object]] = {}
-    for label, indices in label_to_segments.items():
-        label_stats[label] = {
-            "segments_total": len(indices),
-            "segments_indices": list(indices),
-            "aggregation": str(getattr(speaker_bank_config, "match_aggregation", "mean")).lower(),
-        }
-
-    segment_matches: Dict[int, Dict[str, object]] = {
-        index: {
-            "accepted": False,
-            "match": None,
-            "top_score": None,
-            "second_best": None,
-            "margin": None,
-            "candidates": [],
-        }
-        for index in range(len(relabeled))
-    }
-
-    for item in segment_embeddings:
-        classifier_prediction = None
-        classifier_candidates: List[Dict[str, object]] = []
-        bank_candidates: List[Dict[str, object]] = []
-        if segment_classifier is not None:
-            classifier_candidates = segment_classifier.score_candidates(item.embedding)
-            classifier_min_confidence, classifier_min_margin = _segment_classifier_thresholds(
-                duration=max(float(item.end) - float(item.start), 0.0),
-                base_confidence=float(
-                    getattr(speaker_bank_config, "classifier_min_confidence", 0.0)
-                ),
-                base_margin=float(getattr(speaker_bank_config, "classifier_min_margin", 0.0)),
-            )
-            classifier_prediction = segment_classifier.predict(
-                item.embedding,
-                min_confidence=classifier_min_confidence,
-                min_margin=classifier_min_margin,
-            )
-        if classifier_prediction is not None and fusion_mode == "fallback":
-            segment_matches[item.segment_index] = {
-                "accepted": True,
-                "match": {
-                    "speaker": classifier_prediction.speaker,
-                    "cluster_id": None,
-                    "score": classifier_prediction.score,
-                    "distance": None,
-                    "margin": classifier_prediction.margin,
-                    "second_best": classifier_prediction.second_best,
-                    "source": "segment_classifier",
-                },
-                "top_score": classifier_prediction.score,
-                "second_best": classifier_prediction.second_best,
-                "margin": classifier_prediction.margin,
-                "candidates": classifier_prediction.candidates,
-            }
-            continue
-
-        bank_candidates = speaker_bank.score_candidates(
-            item.embedding,
-            radius_factor=radius_factor,
-            as_norm_enabled=bool(getattr(speaker_bank_config, "scoring_as_norm_enabled", False)),
-            as_norm_cohort_size=int(getattr(speaker_bank_config, "scoring_as_norm_cohort_size", 0)),
-        )
-        if fusion_mode == "score_sum" and classifier_candidates:
-            candidates = _fuse_candidate_scores(
-                classifier_candidates,
-                bank_candidates,
-                classifier_weight=classifier_weight,
-                bank_weight=bank_weight,
-            )
-        else:
-            candidates = bank_candidates
-        top1 = candidates[0] if candidates else None
-        top2_score = candidates[1]["score"] if len(candidates) > 1 else None
-        margin_value = (
-            (top1["score"] - top2_score)
-            if top1 and top2_score is not None
-            else (top1["score"] if top1 else None)
-        )
-        accepted = bool(
-            top1
-            and top1["score"] >= threshold
-            and (margin_value if margin_value is not None else 0.0) >= margin_required
-        )
-        match_payload = None
-        if accepted and top1:
-            match_payload = {
-                "speaker": top1["speaker"],
-                "cluster_id": top1["cluster_id"],
-                "score": top1["score"],
-                "distance": top1["distance"],
-                "margin": margin_value,
-                "second_best": top2_score,
-                "source": (
-                    "segment_fusion"
-                    if fusion_mode == "score_sum" and classifier_candidates
-                    else f"segment_{top1.get('source', 'centroid')}"
-                ),
-            }
-        segment_matches[item.segment_index] = {
-            "accepted": accepted,
-            "match": match_payload,
-            "top_score": top1["score"] if top1 else None,
-            "second_best": top2_score,
-            "margin": margin_value,
-            "candidates": candidates,
-        }
-
-    label_matches: Dict[str, Optional[Dict[str, object]]] = {}
-    for label, stats in label_stats.items():
-        selection, aggregate_stats = _aggregate_segment_label_candidates(
-            stats.get("segments_indices", []),
-            segment_matches,
-            aggregation=str(stats.get("aggregation") or "mean"),
-            threshold=threshold,
-            margin_required=margin_required,
-            min_segments_per_label=int(getattr(speaker_bank_config, "min_segments_per_label", 1)),
-        )
-        stats.update(aggregate_stats)
-        stats["selection"] = selection
-        if selection:
-            label_matches[label] = {
-                "speaker": selection.get("speaker"),
-                "cluster_id": selection.get("cluster_id"),
-                "score": selection.get("score"),
-                "score_max": selection.get("score_max"),
-                "distance": selection.get("distance"),
-                "margin": selection.get("margin"),
-                "second_best": selection.get("second_best"),
-                "source": selection.get("source"),
-            }
-        else:
-            label_matches[label] = None
-
-    for label, vector in label_embeddings.items():
-        if label in label_matches and label_matches[label]:
-            continue
-        stats_for_label = label_stats.get(label) or {}
-        match = speaker_bank.match(
-            vector,
-            threshold=threshold,
-            radius_factor=radius_factor,
-            margin=margin_required,
-            as_norm_enabled=bool(getattr(speaker_bank_config, "scoring_as_norm_enabled", False)),
-            as_norm_cohort_size=int(getattr(speaker_bank_config, "scoring_as_norm_cohort_size", 0)),
-        )
-        if match:
-            match["source"] = "label_vector"
-            label_matches[label] = match
-            continue
-        if segment_classifier is not None:
-            classifier_min_confidence, classifier_min_margin = _label_classifier_thresholds(
-                segment_count=int(stats_for_label.get("segments_total") or 0),
-                base_confidence=float(
-                    getattr(speaker_bank_config, "classifier_min_confidence", 0.0)
-                ),
-                base_margin=float(getattr(speaker_bank_config, "classifier_min_margin", 0.0)),
-            )
-            classifier_prediction = segment_classifier.predict(
-                vector,
-                min_confidence=classifier_min_confidence,
-                min_margin=classifier_min_margin,
-            )
-            if classifier_prediction is not None:
-                label_matches[label] = {
-                    "speaker": classifier_prediction.speaker,
-                    "cluster_id": None,
-                    "score": classifier_prediction.score,
-                    "score_max": classifier_prediction.score,
-                    "distance": None,
-                    "margin": classifier_prediction.margin,
-                    "second_best": classifier_prediction.second_best,
-                    "source": "label_classifier",
-                }
-                continue
-        label_matches[label] = match
-
-    summary["attempted"] = len(label_matches)
-    summary["matched"] = sum(1 for match in label_matches.values() if match)
-
-    matched_segments = 0
-    unknown_segments = 0
-    for label, match in label_matches.items():
-        summary["matches"][label] = match
-        summary.setdefault("label_stats", {})[label] = {
-            "segments_total": (label_stats.get(label) or {}).get("segments_total"),
-            "segments_matched": (label_stats.get(label) or {}).get("segments_matched"),
-            "aggregation": (label_stats.get(label) or {}).get("aggregation"),
-            "margin": (label_stats.get(label) or {}).get("margin"),
-        }
-        for index in label_to_segments.get(label, []):
-            segment = relabeled[index]
-            seg_match_info = segment_matches.get(index) or {}
-            top_candidates = [
-                {
-                    "speaker": candidate.get("speaker"),
-                    "score": candidate.get("score"),
-                    "source": candidate.get("source"),
-                }
-                for candidate in list(seg_match_info.get("candidates") or [])[:2]
-            ]
-            segment_level_match = None
-            if seg_match_info.get("accepted") and seg_match_info.get("match"):
-                segment_level_match = dict(seg_match_info["match"])
-                segment_level_match["label"] = label
-
-            effective_match = segment_level_match
-            if not effective_match and match:
-                effective_match = {
-                    "speaker": match["speaker"],
-                    "score": match.get("score"),
-                    "cluster_id": match.get("cluster_id"),
-                    "distance": match.get("distance"),
-                    "margin": match.get("margin"),
-                    "second_best": match.get("second_best"),
-                    "source": match.get("source") or "speaker_bank",
-                    "label": label,
-                }
-
-            if effective_match:
-                _set_segment_speaker_label(segment, effective_match["speaker"])
-                segment["speaker_match"] = effective_match
-                segment["speaker_match_source"] = effective_match.get("source", "speaker_bank")
-                segment["speaker_match_score"] = segment["speaker_match"].get("score")
-                segment["speaker_match_distance"] = segment["speaker_match"].get("distance")
-                segment["speaker_match_cluster"] = segment["speaker_match"].get("cluster_id")
-                segment["speaker_match_candidates"] = top_candidates
-                matched_segments += 1
-            else:
-                _set_segment_speaker_label(segment, "unknown")
-                segment["speaker_match"] = {
-                    "speaker": None,
-                    "score": None,
-                    "cluster_id": None,
-                    "distance": None,
-                    "source": "speaker_bank",
-                    "label": label,
-                }
-                segment["speaker_match_score"] = None
-                segment["speaker_match_distance"] = None
-                segment["speaker_match_cluster"] = None
-                segment["speaker_match_source"] = "speaker_bank"
-                segment["speaker_match_candidates"] = top_candidates
-                unknown_segments += 1
-
-    for index, segment in enumerate(relabeled):
-        if segment_labels.get(index) is None:
-            if not segment.get("speaker"):
-                _set_segment_speaker_label(segment, "unknown")
-                unknown_segments += 1
-            segment.setdefault(
-                "speaker_match",
-                {
-                    "speaker": None,
-                    "score": None,
-                    "cluster_id": None,
-                    "distance": None,
-                    "source": "speaker_bank",
-                    "label": None,
-                },
-            )
-            segment.setdefault("speaker_match_source", "speaker_bank")
-            segment.setdefault("speaker_match_score", None)
-            segment.setdefault("speaker_match_distance", None)
-            segment.setdefault("speaker_match_cluster", None)
-            segment.setdefault("speaker_match_candidates", [])
-
-    summary["segment_counts"]["matched"] = matched_segments
-    summary["segment_counts"]["unknown"] = unknown_segments
+    relabeled, summary, _ = apply_profile_to_segments(
+        audio_path=str(audio_path),
+        segments=segments,
+        label_embeddings=label_embeddings,
+        speaker_bank=speaker_bank,
+        speaker_bank_config=speaker_bank_config,
+        segment_classifier=segment_classifier,
+        extract_embeddings_for_segments_fn=extract_embeddings_for_segments,
+        hf_token=hf_token,
+        diarization_model_name=diarization_model_name,
+        force_device=force_device,
+        quiet=quiet,
+        precomputed_segment_embeddings=segment_embeddings,
+    )
     return relabeled, summary
 
 
@@ -1295,13 +1101,40 @@ def evaluate_multitrack_session(
                 _load_clip_stem_arrays(clip_paths, clip_labels),
             )
             purity_path.write_text(json.dumps(diarization_purity, indent=2), encoding="utf-8")
+        pre_graph_segments = copy.deepcopy(raw_segments)
+        pre_graph_summary: Optional[Dict[str, object]] = None
+        if speaker_bank_config is not None and getattr(speaker_bank_config, "session_graph_enabled", False):
+            pre_graph_config = copy.deepcopy(speaker_bank_config)
+            pre_graph_config.session_graph_enabled = False
+            pre_graph_segments, pre_graph_summary = apply_profile_to_cached_segments(
+                mixed_path,
+                raw_segments,
+                label_embeddings=_load_embedding_map(label_embedding_path),
+                segment_embeddings=_load_cached_segment_embeddings(segment_embedding_path),
+                speaker_bank=speaker_bank,
+                speaker_bank_config=pre_graph_config,
+                segment_classifier=segment_classifier,
+                hf_token=_speaker_hf_token(),
+                diarization_model_name=str(defaults.get("diarization_model") or ""),
+                force_device=device_override or (
+                    str(defaults.get("device")) if defaults.get("device") else None
+                ),
+                quiet=True,
+            )
         relabeled_segments, speaker_bank_summary = apply_profile_to_cached_segments(
+            mixed_path,
             raw_segments,
             label_embeddings=_load_embedding_map(label_embedding_path),
             segment_embeddings=_load_cached_segment_embeddings(segment_embedding_path),
             speaker_bank=speaker_bank,
             speaker_bank_config=speaker_bank_config,
             segment_classifier=segment_classifier,
+            hf_token=_speaker_hf_token(),
+            diarization_model_name=str(defaults.get("diarization_model") or ""),
+            force_device=device_override or (
+                str(defaults.get("device")) if defaults.get("device") else None
+            ),
+            quiet=True,
         )
         consolidated_pairs = consolidate([(str(mixed_path), relabeled_segments)])
         final_predicted_dir = save_outputs(
@@ -1315,8 +1148,18 @@ def evaluate_multitrack_session(
         )
         predicted_jsonl = final_predicted_dir / f"{mixed_path.stem}.jsonl"
         reference_words = extract_words_from_jsonl(reference_jsonl)
-        predicted_words = extract_words_from_jsonl(predicted_jsonl)
+        predicted_words = extract_words_from_segments(relabeled_segments)
         metrics = score_word_speaker_alignment(reference_words, predicted_words)
+        pre_graph_metrics = (
+            score_word_speaker_alignment(reference_words, extract_words_from_segments(pre_graph_segments))
+            if pre_graph_summary is not None
+            else None
+        )
+        graph_pair_diagnostics = summarize_graph_pair_diagnostics(
+            pre_graph_metrics,
+            metrics,
+            speaker_bank_summary,
+        )
 
         result = {
             "window": window,
@@ -1333,7 +1176,11 @@ def evaluate_multitrack_session(
             "reference_word_count": len(reference_words),
             "predicted_word_count": len(predicted_words),
             "metrics": metrics,
+            "metrics_post_graph": metrics,
+            "metrics_pre_graph": pre_graph_metrics,
+            "graph_pair_diagnostics": graph_pair_diagnostics,
             "speaker_bank": speaker_bank_summary,
+            "speaker_bank_pre_graph": pre_graph_summary,
             "diarization_purity": {
                 key: value for key, value in diarization_purity.items() if key != "records"
             },
@@ -1348,6 +1195,9 @@ def evaluate_multitrack_session(
         "cache_root": str(prepared_root),
         "windows": windows,
         "results": results,
+        "graph_pair_diagnostics": _aggregate_graph_pair_diagnostics(
+            [dict(result.get("graph_pair_diagnostics") or {}) for result in results]
+        ),
     }
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
