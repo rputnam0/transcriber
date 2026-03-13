@@ -41,6 +41,7 @@ class DownstreamContext:
     diarization_model: str
     local_files_only: bool
     eval_specs: List[EvalSpec]
+    eval_final_specs: List[EvalSpec]
     mining_eval_specs: List[EvalSpec]
     short_slice_session: str
     short_slice_window: Mapping[str, object]
@@ -305,6 +306,7 @@ def _load_context(
     short_slice = dict(canonical_suite.get("short_segment_slice") or {})
 
     eval_specs = _parse_eval_specs(recipe.get("eval_dev") or recipe.get("eval") or [])
+    eval_final_specs = _parse_eval_specs(recipe.get("eval_final") or [])
     mining_eval_specs = _parse_eval_specs(
         recipe.get("mining_heuristic_eval") or recipe.get("eval_dev") or recipe.get("eval") or []
     )
@@ -331,6 +333,7 @@ def _load_context(
         ),
         local_files_only=bool(recipe.get("local_files_only")),
         eval_specs=eval_specs,
+        eval_final_specs=eval_final_specs,
         mining_eval_specs=mining_eval_specs,
         short_slice_session=str(short_slice.get("source_session") or ""),
         short_slice_window=dict(short_slice.get("window") or {}),
@@ -591,14 +594,15 @@ def _resolve_phase_b_hard_negative_settings(
 
 
 def _forbidden_eval_sessions(context: DownstreamContext) -> List[str]:
+    all_eval_specs = context.eval_specs + context.eval_final_specs + context.mining_eval_specs
     return sorted(
         {
             _normalize_session_name(spec.name)
-            for spec in context.eval_specs + context.mining_eval_specs
+            for spec in all_eval_specs
         }
         | {
             _normalize_session_name(spec.session_zip.stem)
-            for spec in context.eval_specs + context.mining_eval_specs
+            for spec in all_eval_specs
         }
     )
 

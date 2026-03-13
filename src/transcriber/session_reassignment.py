@@ -475,24 +475,29 @@ def repair_diarization_segments(
             repaired.append(segment)
             continue
         chunks: List[List[Dict[str, object]]] = []
+        chunk_overlap_flags: List[bool] = []
         current: List[Dict[str, object]] = [words[0]]
-        internal_overlap_heavy = False
+        current_overlap_heavy = False
         for word in words[1:]:
             prev = current[-1]
             gap = float(word["start"]) - float(prev["end"])
             raw_changed = str(word.get("speaker_raw") or "") != str(prev.get("speaker_raw") or "")
             if raw_changed or gap >= float(config.split_on_word_gap_seconds):
-                if raw_changed or gap > float(config.max_seed_overlap_seconds):
-                    internal_overlap_heavy = True
+                boundary_overlap_heavy = raw_changed or gap > float(
+                    config.max_seed_overlap_seconds
+                )
                 chunks.append(current)
+                chunk_overlap_flags.append(current_overlap_heavy or boundary_overlap_heavy)
                 current = [word]
+                current_overlap_heavy = boundary_overlap_heavy
             else:
                 current.append(word)
         if current:
             chunks.append(current)
+            chunk_overlap_flags.append(current_overlap_heavy)
         if len(chunks) > 1:
             split_segments += 1
-        for chunk in chunks:
+        for chunk, chunk_overlap_heavy in zip(chunks, chunk_overlap_flags):
             start = float(chunk[0]["start"])
             end = float(chunk[-1]["end"])
             raw_label = str(chunk[0].get("speaker_raw") or "").strip()
@@ -507,9 +512,9 @@ def repair_diarization_segments(
             chunk_segment["text"] = _segment_text(chunk)
             chunk_segment["words"] = chunk
             chunk_segment["speaker_repair_was_split"] = len(chunks) > 1
-            chunk_segment["speaker_repair_overlap_heavy"] = bool(internal_overlap_heavy)
+            chunk_segment["speaker_repair_overlap_heavy"] = bool(chunk_overlap_heavy)
             chunk_segment["speaker_repair_origin"] = "repair_diarization_segments"
-            if internal_overlap_heavy:
+            if chunk_overlap_heavy:
                 overlap_heavy += 1
             repaired.append(chunk_segment)
 

@@ -360,7 +360,7 @@ def build_hard_negative_dataset(
                     style_profile_name=style_profile_name,
                     style_score_threshold=style_score_threshold,
                 )
-            ][:style_target]
+            ][: min(style_target, current_pair_cap)]
             selected_ids = {id(item[0]) for item in style_selected}
             capped.extend(style_selected)
             remaining_slots = max(current_pair_cap - len(style_selected), 0)
@@ -372,7 +372,7 @@ def build_hard_negative_dataset(
     speaker_cap_value = (
         max(int(per_speaker_cap), 0) if per_speaker_cap is not None else None
     )
-    if speaker_cap_value:
+    if speaker_cap_value is not None:
         by_speaker: Dict[str, List[Tuple[Dict[str, object], np.ndarray]]] = defaultdict(list)
         for item in capped:
             by_speaker[str(item[0]["speaker"])].append(item)

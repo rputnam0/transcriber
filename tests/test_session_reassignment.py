@@ -124,6 +124,38 @@ def test_repair_diarization_segments_splits_trims_and_merges():
     assert repaired[1]["speaker_repair_overlap_heavy"] is True
 
 
+def test_repair_diarization_segments_marks_only_boundary_chunks_overlap_heavy():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 1.90,
+            "speaker": "SPEAKER_00",
+            "speaker_raw": "SPEAKER_00",
+            "text": "alpha beta gamma delta",
+            "words": [
+                {"start": 0.00, "end": 0.20, "word": "alpha", "speaker": "SPEAKER_00"},
+                {"start": 0.25, "end": 0.45, "word": "beta", "speaker": "SPEAKER_00"},
+                {"start": 0.85, "end": 1.25, "word": "gamma", "speaker": "SPEAKER_00"},
+                {"start": 1.30, "end": 1.90, "word": "delta", "speaker": "SPEAKER_01"},
+            ],
+        },
+    ]
+
+    repaired, summary = repair_diarization_segments(
+        segments,
+        config=DiarizationRepairConfig(enabled=True, max_seed_overlap_seconds=0.50),
+    )
+
+    assert len(repaired) == 3
+    assert summary["split_segments"] == 1
+    assert repaired[0]["speaker_raw"] == "SPEAKER_00"
+    assert repaired[1]["speaker_raw"] == "SPEAKER_00"
+    assert repaired[2]["speaker_raw"] == "SPEAKER_01"
+    assert repaired[0]["speaker_repair_overlap_heavy"] is False
+    assert repaired[1]["speaker_repair_overlap_heavy"] is True
+    assert repaired[2]["speaker_repair_overlap_heavy"] is True
+
+
 def test_apply_profile_to_segments_session_graph_rescues_unknown_segment():
     segments = [
         {

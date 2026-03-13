@@ -94,10 +94,14 @@ def _baseline_fixture(tmp_path: Path) -> dict[str, Path]:
     session22_zip.write_bytes(b"zip")
     session61_zip = tmp_path / "Session 61.zip"
     session61_zip.write_bytes(b"zip")
+    session58_zip = tmp_path / "Session 58.zip"
+    session58_zip.write_bytes(b"zip")
     session22_txt = tmp_path / "Session 22.txt"
     session22_txt.write_text("{}", encoding="utf-8")
     session61_txt = tmp_path / "Session 61.txt"
     session61_txt.write_text("{}", encoding="utf-8")
+    session58_txt = tmp_path / "Session 58.txt"
+    session58_txt.write_text("{}", encoding="utf-8")
 
     recipe_path = tmp_path / "recipe.json"
     _write_json(
@@ -131,6 +135,13 @@ def _baseline_fixture(tmp_path: Path) -> dict[str, Path]:
                     "session_zip": str(session61_zip),
                     "transcript": str(session61_txt),
                 },
+            ],
+            "eval_final": [
+                {
+                    "name": "Session58",
+                    "session_zip": str(session58_zip),
+                    "transcript": str(session58_txt),
+                }
             ],
             "hard_negative_candidate_variants": ["mixed_raw"],
             "seed_confusion_pairs": [["Cyrus Schwert", "Cletus Cobbington"]],
@@ -576,6 +587,70 @@ def test_hard_negative_refresh_rejects_eval_session_records(tmp_path, monkeypatc
             sessions=["Session_61"],
         )
         records = [{"speaker": "Player Alice", "source_session": "Session61"}]
+        return dataset, records, {"selected": 1, "tracked_pairs": []}
+
+    monkeypatch.setattr(
+        downstream_retrain_doe,
+        "build_hard_negative_dataset",
+        leaky_build_hard_negative_dataset,
+    )
+
+    with pytest.raises(RuntimeError, match="train on eval sessions"):
+        downstream_retrain_doe.run_downstream_retrain_doe(
+            baseline_summary_path=fixture["baseline_summary_path"],
+            spec_path=spec_path,
+            output_dir=tmp_path / "doe_output",
+            device="cpu",
+        )
+
+
+def test_hard_negative_refresh_rejects_final_eval_session_records(tmp_path, monkeypatch):
+    fixture = _baseline_fixture(tmp_path)
+    spec_path = _spec_path(
+        tmp_path,
+        {
+            "dev_only": True,
+            "phase_a": {
+                "family_sweep": [{"name": "knn_k7", "classifier": {"model_name": "knn", "classifier_n_neighbors": 7}}],
+                "calibration": {"top_n": 1, "thresholds": [0.36], "classifier_min_margins": [0.06]},
+            },
+            "phase_b": {
+                "candidate_variants": ["mixed_raw"],
+                "experiments": [{"name": "control_current", "hard_negative": {}}],
+            },
+        },
+    )
+
+    metric_map = {
+        ("knn_k7", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
+        ("knn_k7", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
+        ("knn_k7", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
+        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
+        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+        ("control_current", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
+        ("control_current", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
+        ("control_current", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+    }
+    monkeypatch.setattr(
+        downstream_retrain_doe,
+        "evaluate_multitrack_session",
+        _evaluate_stub(metric_map),
+    )
+    monkeypatch.setattr(
+        downstream_retrain_doe,
+        "train_segment_classifier_from_dataset",
+        _training_stub,
+    )
+
+    def leaky_build_hard_negative_dataset(**kwargs):
+        dataset = _dataset(
+            ["Player Alice"],
+            domains=["hard_negative"],
+            sources=["hard_negative"],
+            sessions=["Session_58"],
+        )
+        records = [{"speaker": "Player Alice", "source_session": "Session58"}]
         return dataset, records, {"selected": 1, "tracked_pairs": []}
 
     monkeypatch.setattr(

@@ -274,6 +274,62 @@ def test_build_hard_negative_dataset_applies_per_speaker_cap(tmp_path):
     assert cyrus_records[0]["score_margin"] is None
 
 
+def test_build_hard_negative_dataset_respects_zero_per_speaker_cap(tmp_path):
+    candidate_pool_dir = tmp_path / "mixed_candidates"
+    save_candidate_pool(
+        candidate_pool_dir,
+        records=[
+            {
+                "speaker": "Cyrus Schwert",
+                "second_speaker": "Cletus Cobbington",
+                "rejection": "low_share",
+                "dominant_share": 0.60,
+                "active_speakers": 2,
+                "top1_power": 0.81,
+                "top2_power": 0.70,
+                "window_index": 1,
+                "session": "Session 48",
+                "start": 0.0,
+                "end": 1.0,
+            },
+            {
+                "speaker": "Cletus Cobbington",
+                "second_speaker": "Cyrus Schwert",
+                "rejection": "not_dominant",
+                "dominant_share": 0.61,
+                "active_speakers": 2,
+                "top1_power": 0.80,
+                "top2_power": 0.71,
+                "window_index": 2,
+                "session": "Session 49",
+                "start": 1.0,
+                "end": 2.0,
+            },
+        ],
+        embeddings=[
+            np.asarray([0.9, 0.1], dtype=np.float32),
+            np.asarray([0.1, 0.9], dtype=np.float32),
+        ],
+    )
+
+    dataset, records, summary = build_hard_negative_dataset(
+        eval_summaries=[],
+        candidate_pool_dirs=[candidate_pool_dir],
+        base_dataset_samples=50,
+        seed_pairs=[["Cyrus Schwert", "Cletus Cobbington"]],
+        top_confusion_pairs=0,
+        min_mixed_dominant_share=0.55,
+        per_pair_cap=2,
+        per_speaker_cap=0,
+        max_fraction=1.0,
+    )
+
+    assert dataset is None
+    assert records == []
+    assert summary["selected"] == 0
+    assert summary["limits"]["per_speaker_cap"] == 0
+
+
 def test_build_hard_negative_dataset_applies_pair_specific_caps(tmp_path):
     candidate_pool_dir = tmp_path / "mixed_candidates"
     save_candidate_pool(
@@ -356,6 +412,69 @@ def test_build_hard_negative_dataset_applies_pair_specific_caps(tmp_path):
     assert dataset.samples == 2
     assert sorted(dataset.labels) == ["Dungeon Master", "Kaladen Shash"]
     assert summary["limits"]["pair_caps"] == {"Dungeon Master::Kaladen Shash": 1}
+
+
+def test_build_hard_negative_dataset_style_selection_respects_pair_cap(tmp_path):
+    candidate_pool_dir = tmp_path / "mixed_candidates"
+    save_candidate_pool(
+        candidate_pool_dir,
+        records=[
+            {
+                "speaker": "Cyrus Schwert",
+                "second_speaker": "Cletus Cobbington",
+                "rejection": "low_share",
+                "dominant_share": 0.58,
+                "active_speakers": 6,
+                "top1_power": 0.82,
+                "top2_power": 0.76,
+                "window_index": 3,
+                "session": "Session 61",
+                "start": 8.0,
+                "end": 9.0,
+                "style_profile": "session61_like",
+                "style_score": 0.92,
+            },
+            {
+                "speaker": "Cyrus Schwert",
+                "second_speaker": "Cletus Cobbington",
+                "rejection": "low_share",
+                "dominant_share": 0.59,
+                "active_speakers": 6,
+                "top1_power": 0.84,
+                "top2_power": 0.78,
+                "window_index": 4,
+                "session": "Session 61",
+                "start": 10.0,
+                "end": 11.0,
+                "style_profile": "session61_like",
+                "style_score": 0.91,
+            },
+        ],
+        embeddings=[
+            np.asarray([1.0, 0.0], dtype=np.float32),
+            np.asarray([0.95, 0.05], dtype=np.float32),
+        ],
+    )
+
+    dataset, records, summary = build_hard_negative_dataset(
+        eval_summaries=[],
+        candidate_pool_dirs=[candidate_pool_dir],
+        base_dataset_samples=20,
+        seed_pairs=[["Cyrus Schwert", "Cletus Cobbington"]],
+        top_confusion_pairs=0,
+        min_mixed_dominant_share=0.55,
+        per_pair_cap=1,
+        max_fraction=1.0,
+        style_profile_name="session61_like",
+        style_score_threshold=0.70,
+        min_style_samples_per_pair=5,
+    )
+
+    assert dataset is not None
+    assert dataset.samples == 1
+    assert len(records) == 1
+    assert summary["selected"] == 1
+    assert summary["by_style_threshold"] == {"at_or_above_threshold": 1}
 
 
 def test_build_hard_negative_dataset_tracks_pair_caps_without_seed_pairs(tmp_path):
