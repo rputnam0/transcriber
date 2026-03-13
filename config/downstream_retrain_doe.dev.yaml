@@ -1,0 +1,120 @@
+dev_only: true
+
+acceptance:
+  session61_matched_accuracy_gain: 0.01
+  session22_accuracy_regression_max: 0.01
+
+phase_a:
+  family_sweep:
+    - name: knn_k5
+      notes: Evaluate a smaller KNN neighborhood for tighter local decision boundaries.
+      classifier:
+        model_name: knn
+        classifier_n_neighbors: 5
+
+    - name: knn_k7
+      notes: Re-evaluate the current KNN winner as the family-sweep control.
+      classifier:
+        model_name: knn
+        classifier_n_neighbors: 7
+
+    - name: knn_k9
+      notes: Test a slightly smoother KNN neighborhood.
+      classifier:
+        model_name: knn
+        classifier_n_neighbors: 9
+
+    - name: knn_k11
+      notes: Test a broader KNN neighborhood before moving away from the family.
+      classifier:
+        model_name: knn
+        classifier_n_neighbors: 11
+
+    - name: lda_knn_k7
+      notes: Try a projected KNN backend with the smaller neighborhood.
+      classifier:
+        model_name: lda_knn
+        classifier_n_neighbors: 7
+
+    - name: lda_knn_k11
+      notes: Try a projected KNN backend with the broader neighborhood.
+      classifier:
+        model_name: lda_knn
+        classifier_n_neighbors: 11
+
+    - name: lda_logreg_c0_5
+      notes: Try projected logistic regression with a smaller regularization constant.
+      classifier:
+        model_name: lda_logreg
+        classifier_c: 0.5
+
+    - name: lda_logreg_c1_0
+      notes: Try projected logistic regression at the default regularization strength.
+      classifier:
+        model_name: lda_logreg
+        classifier_c: 1.0
+
+    - name: lda_logreg_c2_0
+      notes: Try projected logistic regression with a looser regularization constant.
+      classifier:
+        model_name: lda_logreg
+        classifier_c: 2.0
+
+  calibration:
+    top_n: 2
+    thresholds: [0.34, 0.36, 0.38]
+    classifier_min_margins: [0.04, 0.06, 0.08]
+
+phase_b:
+  candidate_variants:
+    - mixed_raw
+  experiments:
+    - name: control_current
+      notes: Rebuild hard negatives with the current pair-cap recipe as the control.
+      hard_negative: {}
+
+    - name: dm_boundary_v1
+      notes: Add extra Dungeon Master boundary pairs without changing the style threshold.
+      hard_negative:
+        pair_caps:
+          - pair: ["Cletus Cobbington", "Dungeon Master"]
+            value: 30
+          - pair: ["Cyrus Schwert", "Dungeon Master"]
+            value: 30
+          - pair: ["David Tanglethorn", "Dungeon Master"]
+            value: 30
+
+    - name: cyrus_precision_v1
+      notes: Increase Cyrus-heavy pair coverage and require slightly more Session61-like style pressure.
+      hard_negative:
+        pair_caps:
+          - pair: ["Cletus Cobbington", "Cyrus Schwert"]
+            value: 80
+          - pair: ["Cyrus Schwert", "Leopold Magnus"]
+            value: 80
+        hard_negative_style_score_threshold: 0.50
+
+    - name: session61_style_v1
+      notes: Bias selection toward more Session61-like windows while shrinking the supplement fraction.
+      hard_negative:
+        hard_negative_style_score_threshold: 0.55
+        hard_negative_min_style_samples_per_pair: 20
+        hard_negative_max_fraction: 0.15
+
+    - name: combined_precision_v1
+      notes: Combine the Dungeon Master boundary caps, Cyrus-heavy caps, and the tighter Session61-style settings.
+      hard_negative:
+        pair_caps:
+          - pair: ["Cletus Cobbington", "Dungeon Master"]
+            value: 30
+          - pair: ["Cyrus Schwert", "Dungeon Master"]
+            value: 30
+          - pair: ["David Tanglethorn", "Dungeon Master"]
+            value: 30
+          - pair: ["Cletus Cobbington", "Cyrus Schwert"]
+            value: 80
+          - pair: ["Cyrus Schwert", "Leopold Magnus"]
+            value: 80
+        hard_negative_style_score_threshold: 0.55
+        hard_negative_min_style_samples_per_pair: 20
+        hard_negative_max_fraction: 0.15

@@ -1,0 +1,84 @@
+output_root: .outputs/speaker_id_baseline_prod
+hf_cache_root: ./.hf_cache
+extracted_session_cache_root: data/.cache/extracted_sessions
+mixed_base_cache_root: data/.cache/mixed_base
+metrics_log_path: .outputs/speaker_id_baseline_prod/stage_metrics_iter2.jsonl
+resume: true
+stages:
+  - variants
+  - hard_negatives
+  - train
+  - eval
+
+base_config: config/transcriber.yaml
+speaker_mapping: config/speaker_mapping.yaml
+diarization_model: pyannote/speaker-diarization-community-1
+
+device: cuda
+quiet: true
+batch_size: 8
+workers: 1
+
+training_inputs:
+  - data/prod/Audio
+
+transcript_roots:
+  - data/prod/Transcripts
+
+eval:
+  - name: Session22
+    session_zip: data/prod/Audio/Session 22.zip
+    transcript: data/prod/Transcripts/Session 22/Session 22.txt
+  - name: Session61
+    session_zip: data/prod/Audio/Session 61.zip
+    transcript: data/prod/Transcripts/Session 61/Session 61.txt
+
+core_speakers:
+  - Dungeon Master
+  - David Tanglethorn
+  - Leopold Magnus
+  - Kaladen Shash
+  - Cyrus Schwert
+  - Cletus Cobbington
+
+excluded_speakers:
+  - B. Ver
+
+baseline_pack:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+build_variants:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+hard_negative_candidate_variants:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+seed_confusion_pairs:
+  - ["Cyrus Schwert", "Cletus Cobbington"]
+  - ["Cyrus Schwert", "Leopold Magnus"]
+  - ["David Tanglethorn", "Cletus Cobbington"]
+  - ["David Tanglethorn", "Dungeon Master"]
+  - ["Kaladen Shash", "Dungeon Master"]
+  - ["Kaladen Shash", "Leopold Magnus"]
+  - ["Kaladen Shash", "Cletus Cobbington"]
+  - ["Leopold Magnus", "Cletus Cobbington"]
+  - ["Dungeon Master", "Cletus Cobbington"]
+
+top_confusion_pairs: 10
+hard_negative_per_pair_cap: 125
+hard_negative_max_fraction: 0.30
+
+current_winner:
+  model_name: knn
+  classifier_c: 1.0
+  classifier_n_neighbors: 7
+  classifier_min_margin: 0.06
+  threshold: 0.36
+  match_aggregation: vote
+  min_segments_per_label: 2

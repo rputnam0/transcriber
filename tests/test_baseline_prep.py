@@ -44,6 +44,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     session_dir = training_root / "Session_10"
     session_dir.mkdir(parents=True)
     (session_dir / "alice.ogg").write_bytes(b"audio")
+    final_training_dir = training_root / "Session_48"
+    final_training_dir.mkdir(parents=True)
+    (final_training_dir / "alice.ogg").write_bytes(b"audio")
     transcripts_root = tmp_path / "transcripts"
     transcripts_root.mkdir()
 
@@ -55,6 +58,14 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     eval_zip.write_bytes(b"zip")
     eval_transcript = tmp_path / "Session_22.jsonl"
     eval_transcript.write_text("{}", encoding="utf-8")
+    final_eval_zip = tmp_path / "Session_48.zip"
+    final_eval_zip.write_bytes(b"zip")
+    final_eval_transcript = tmp_path / "Session_48.jsonl"
+    final_eval_transcript.write_text("{}", encoding="utf-8")
+    mining_eval_zip = tmp_path / "Session_61.zip"
+    mining_eval_zip.write_bytes(b"zip")
+    mining_eval_transcript = tmp_path / "Session_61.jsonl"
+    mining_eval_transcript.write_text("{}", encoding="utf-8")
 
     recipe_path = tmp_path / "baseline_recipe.json"
     recipe_path.write_text(
@@ -69,15 +80,49 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 "training_inputs": [str(training_root)],
                 "transcript_roots": [str(transcripts_root)],
                 "core_speakers": ["Player Alice", "Player Bob"],
-                "eval": [
+                "eval_dev": [
                     {
                         "name": "Session22",
                         "session_zip": str(eval_zip),
                         "transcript": str(eval_transcript),
                     }
                 ],
+                "eval_final": [
+                    {
+                        "name": "Session48",
+                        "session_zip": str(final_eval_zip),
+                        "transcript": str(final_eval_transcript),
+                    }
+                ],
+                "mining_heuristic_eval": [
+                    {
+                        "name": "Session61",
+                        "session_zip": str(mining_eval_zip),
+                        "transcript": str(mining_eval_transcript),
+                    }
+                ],
                 "baseline_pack": ["mixed_raw", "light_x1", "discord_x1"],
                 "build_variants": ["mixed_raw", "light_x1", "discord_x1"],
+                "top_confusion_pairs": 0,
+                "hard_negative_pair_caps": [
+                    {"pair": ["Player Alice", "Player Bob"], "value": 1}
+                ],
+                "current_winner": {
+                    "threshold": 0.36,
+                    "classifier_min_margin": 0.06,
+                    "match_aggregation": "vote",
+                    "min_segments_per_label": 2,
+                },
+                "speaker_bank_overrides": {
+                    "repair": {"enabled": True, "split_on_word_gap_seconds": 0.40},
+                    "session_graph": {
+                        "enabled": True,
+                        "alpha": 0.80,
+                        "pair_overrides": {
+                            "Player Alice::Player Bob": {"override_min_confidence": 0.45}
+                        },
+                    },
+                },
                 "resume": True,
             }
         ),
@@ -116,6 +161,7 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     )
 
     build_calls = {"multitrack": 0, "materialize": 0}
+    hard_negative_call: dict[str, object] = {}
 
     def _write_dataset_artifacts(dataset_cache_dir: Path, dataset: ClassifierDataset, *, mixed_base: bool) -> dict:
         dataset_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -294,15 +340,32 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                         "matched_accuracy": 0.88,
                         "confusion": {"Player Alice": {"Player Bob": 1}},
                     },
+                    "metrics_pre_graph": {
+                        "accuracy": 0.72,
+                        "coverage": 0.9,
+                        "matched_accuracy": 0.80,
+                        "confusion": {"Player Alice": {"Player Bob": 2}},
+                    },
                 }
             ],
             "summary_path": str(output_dir / "summary.json"),
             "windows_override_used": bool(windows_override),
+            "graph_pair_diagnostics": {
+                "Player Alice::Player Bob": {
+                    "overrides_attempted": 1,
+                    "overrides_accepted": 1,
+                    "rescued_unknowns": 1,
+                    "pre_confusions": 2,
+                    "post_confusions": 1,
+                    "delta_confusions": -1,
+                }
+            },
         }
         Path(summary["summary_path"]).write_text(json.dumps(summary), encoding="utf-8")
         return summary
 
     def fake_build_hard_negative_dataset(**kwargs):
+        hard_negative_call.update(kwargs)
         records = [
             {
                 "speaker": "Player Alice",
@@ -313,9 +376,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 "active_speakers": 2,
                 "top1_power": 0.8,
                 "top2_power": 0.7,
-                "score_margin": 0.05,
-                "selection_reason": "eval_top2_margin",
-                "source_kind": "eval",
+                "score_margin": None,
+                "selection_reason": "mixed_rejection_low_share",
+                "source_kind": "mixed_candidate_pool",
                 "start": 0.0,
                 "end": 1.0,
             }
@@ -361,10 +424,25 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     assert Path(first_summary["base_training_manifest_path"]).exists()
     assert Path(first_summary["final_training_manifest_path"]).exists()
     assert Path(first_summary["eval_manifest_path"]).exists()
+    assert Path(first_summary["dev_eval_manifest_path"]).exists()
+    assert Path(first_summary["final_eval_manifest_path"]).exists()
+    assert Path(first_summary["comparison_summary_path"]).exists()
     assert Path(first_summary["hard_negative_manifest_path"]).exists()
     assert Path(first_summary["narrow_doe_recipe_path"]).exists()
     assert Path(first_summary["stage_metrics_path"]).exists()
     assert "short_segment_slice" in first_summary["canonical_eval"]
+    assert first_summary["dev_eval"]["Session22"]["graph_pair_diagnostics"] == {
+        "Player Alice::Player Bob": {
+            "overrides_attempted": 1,
+            "overrides_accepted": 1,
+            "rescued_unknowns": 1,
+            "pre_confusions": 2,
+            "post_confusions": 1,
+            "delta_confusions": -1,
+        }
+    }
+    assert first_summary["canonical_eval"]["Session22"]["mean_accuracy_pre_graph"] == 0.72
+    assert first_summary["canonical_eval"]["Session22"]["mean_matched_accuracy_pre_graph"] == 0.80
     assert set(first_summary["stage_manifests"]) == {
         "bank",
         "mixed_base",
@@ -374,6 +452,36 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         "eval",
     }
     assert second_summary["stage_manifests"] == first_summary["stage_manifests"]
+    eval_manifest = json.loads(Path(first_summary["eval_manifest_path"]).read_text(encoding="utf-8"))
+    final_eval_manifest = json.loads(
+        Path(first_summary["final_eval_manifest_path"]).read_text(encoding="utf-8")
+    )
+    comparison_summary = json.loads(
+        Path(first_summary["comparison_summary_path"]).read_text(encoding="utf-8")
+    )
+    eval_config = json.loads(Path(eval_manifest["config_path"]).read_text(encoding="utf-8"))
+    assert eval_manifest["build_params"]["match_aggregation"] == "vote"
+    assert final_eval_manifest["canonical_suite"] == {"sessions": ["Session48"]}
+    assert comparison_summary["dev_sessions"] == ["Session22"]
+    assert comparison_summary["final_sessions"] == ["Session48"]
+    assert eval_config["speaker_bank"]["match_aggregation"] == "vote"
+    assert eval_config["speaker_bank"]["repair"]["enabled"] is True
+    assert eval_config["speaker_bank"]["repair"]["split_on_word_gap_seconds"] == 0.40
+    assert eval_config["speaker_bank"]["session_graph"]["enabled"] is True
+    assert eval_config["speaker_bank"]["session_graph"]["alpha"] == 0.80
+    assert eval_config["speaker_bank"]["session_graph"]["pair_overrides"] == {
+        "Player Alice::Player Bob": {"override_min_confidence": 0.45}
+    }
+    assert hard_negative_call["top_confusion_pairs"] == 0
+    assert hard_negative_call["pair_caps"] == {("Player Alice", "Player Bob"): 1}
+    assert not Path(
+        first_summary["output_root"],
+        "materialized_inputs",
+        "train_inputs",
+        "Session_48",
+    ).exists()
+    assert Path(first_summary["mining_heuristic_eval_manifest_path"]).exists()
+    assert Path(hard_negative_call["eval_summaries"][0]["session_zip"]).stem == "Session_61"
 
     final_dataset, final_summary = load_classifier_dataset(
         Path(first_summary["final_training_manifest_path"]).parent
@@ -391,3 +499,66 @@ def test_selected_stage_names_respects_from_stage_with_stage_subset():
     )
 
     assert selected == ["train", "eval"]
+
+
+def test_prepare_baseline_rejects_final_holdout_in_mining_heuristic_eval(tmp_path):
+    training_root = tmp_path / "training"
+    session_dir = training_root / "Session_10"
+    session_dir.mkdir(parents=True)
+    (session_dir / "alice.ogg").write_bytes(b"audio")
+    transcripts_root = tmp_path / "transcripts"
+    transcripts_root.mkdir()
+
+    speaker_mapping_path = tmp_path / "speaker_mapping.json"
+    speaker_mapping_path.write_text("{}", encoding="utf-8")
+    base_config_path = tmp_path / "transcriber.json"
+    base_config_path.write_text("{}", encoding="utf-8")
+    final_eval_zip = tmp_path / "Session_48.zip"
+    final_eval_zip.write_bytes(b"zip")
+    final_eval_transcript = tmp_path / "Session_48.jsonl"
+    final_eval_transcript.write_text("{}", encoding="utf-8")
+
+    recipe_path = tmp_path / "baseline_recipe_invalid.json"
+    recipe_path.write_text(
+        json.dumps(
+            {
+                "output_root": str(tmp_path / "baseline_output"),
+                "hf_cache_root": str(tmp_path / "hf_cache"),
+                "speaker_mapping": str(speaker_mapping_path),
+                "base_config": str(base_config_path),
+                "training_inputs": [str(training_root)],
+                "transcript_roots": [str(transcripts_root)],
+                "eval_dev": [
+                    {
+                        "name": "Session22",
+                        "session_zip": str(tmp_path / "Session_22.zip"),
+                        "transcript": str(tmp_path / "Session_22.jsonl"),
+                    }
+                ],
+                "eval_final": [
+                    {
+                        "name": "Session48",
+                        "session_zip": str(final_eval_zip),
+                        "transcript": str(final_eval_transcript),
+                    }
+                ],
+                "mining_heuristic_eval": [
+                    {
+                        "name": "Session48",
+                        "session_zip": str(final_eval_zip),
+                        "transcript": str(final_eval_transcript),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "Session_22.zip").write_bytes(b"zip")
+    (tmp_path / "Session_22.jsonl").write_text("{}", encoding="utf-8")
+
+    try:
+        baseline_prep.prepare_baseline(recipe_path=recipe_path)
+    except RuntimeError as exc:
+        assert "eval_final sessions must not appear in mining_heuristic_eval" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected prepare_baseline to reject final holdout reuse")

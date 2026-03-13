@@ -17,6 +17,7 @@ from .prep_artifacts import (
     build_source_session_speaker_breakdown,
     collect_input_file_identities,
     current_git_commit,
+    load_candidate_pool,
     load_manifest,
     stage_manifest_is_reusable,
     StageMetricsLogger,
@@ -75,8 +76,42 @@ DEFAULT_CURRENT_WINNER = {
     "classifier_n_neighbors": 7,
     "classifier_min_margin": 0.03,
     "threshold": 0.40,
+    "match_aggregation": "mean",
     "min_segments_per_label": 2,
 }
+
+
+def _recipe_int(recipe: Mapping[str, object], key: str, default: int) -> int:
+    value = recipe.get(key)
+    if value is None:
+        return int(default)
+    return int(value)
+
+
+def _recipe_pair_value_map(
+    recipe: Mapping[str, object],
+    key: str,
+) -> Dict[Tuple[str, str], float]:
+    parsed: Dict[Tuple[str, str], float] = {}
+    for item in list(recipe.get(key) or []):
+        if not isinstance(item, Mapping):
+            continue
+        pair = list(item.get("pair") or [])
+        if len(pair) != 2:
+            continue
+        try:
+            value = float(item.get("value"))
+        except (TypeError, ValueError):
+            continue
+        parsed[(str(pair[0]), str(pair[1]))] = value
+    return parsed
+
+
+def _recipe_float(recipe: Mapping[str, object], key: str, default: float) -> float:
+    value = recipe.get(key)
+    if value is None:
+        return float(default)
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -113,6 +148,193 @@ def _parse_eval_specs(raw_specs: Sequence[Mapping[str, object]]) -> List[EvalSpe
             )
         )
     return specs
+
+
+def _resolve_eval_groups(recipe: Mapping[str, object]) -> Dict[str, List[EvalSpec]]:
+    legacy_specs = _parse_eval_specs(recipe.get("eval") or [])
+    dev_specs = _parse_eval_specs(recipe.get("eval_dev") or recipe.get("eval") or [])
+    final_specs = _parse_eval_specs(recipe.get("eval_final") or [])
+    mining_specs = _parse_eval_specs(
+        recipe.get("mining_heuristic_eval") or recipe.get("eval_dev") or recipe.get("eval") or []
+    )
+    if not dev_specs and legacy_specs:
+        dev_specs = legacy_specs
+    return {
+        "eval_dev": dev_specs,
+        "eval_final": final_specs,
+        "mining_heuristic_eval": mining_specs,
+    }
+
+
+def _normalized_session_name(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _spec_session_names(specs: Sequence[EvalSpec]) -> set[str]:
+    return {_normalized_session_name(spec.name) for spec in specs if _normalized_session_name(spec.name)}
+
+
+def _spec_session_stems(specs: Sequence[EvalSpec]) -> set[str]:
+    return {
+        _normalized_session_name(spec.session_zip.stem)
+        for spec in specs
+        if _normalized_session_name(spec.session_zip.stem)
+    }
+
+
+def _collect_eval_input_identities(specs: Sequence[EvalSpec]) -> List[Dict[str, object]]:
+    if not specs:
+        return []
+    return collect_input_file_identities(
+        [spec.session_zip for spec in specs] + [spec.transcript for spec in specs],
+        hash_contents=False,
+    )
+
+
+def _assert_eval_groups_are_disjoint(
+    *,
+    eval_dev_specs: Sequence[EvalSpec],
+    eval_final_specs: Sequence[EvalSpec],
+    mining_heuristic_eval_specs: Sequence[EvalSpec],
+) -> None:
+    final_stems = _spec_session_stems(eval_final_specs)
+    if not final_stems:
+        return
+    overlap_with_dev = final_stems & _spec_session_stems(eval_dev_specs)
+    if overlap_with_dev:
+        raise RuntimeError(
+            "eval_final sessions must not appear in eval_dev: "
+            + ", ".join(sorted(overlap_with_dev))
+        )
+    overlap_with_mining = final_stems & _spec_session_stems(mining_heuristic_eval_specs)
+    if overlap_with_mining:
+        raise RuntimeError(
+            "eval_final sessions must not appear in mining_heuristic_eval: "
+            + ", ".join(sorted(overlap_with_mining))
+        )
+
+
+def _assert_training_sources_exclude_sessions(
+    *,
+    training_sources: Sequence[Path],
+    forbidden_session_stems: Sequence[str],
+    context: str,
+) -> None:
+    forbidden = {_normalized_session_name(item) for item in forbidden_session_stems}
+    present = sorted(
+        {
+            source.stem
+            for source in training_sources
+            if _normalized_session_name(source.stem) in forbidden
+        }
+    )
+    if present:
+        raise RuntimeError(
+            f"{context} unexpectedly includes final holdout sessions: " + ", ".join(present)
+        )
+
+
+def _assert_candidate_pool_excludes_sessions(
+    *,
+    candidate_pool_dirs: Sequence[Path],
+    forbidden_session_stems: Sequence[str],
+) -> None:
+    forbidden = {_normalized_session_name(item) for item in forbidden_session_stems}
+    leaked: set[str] = set()
+    for candidate_dir in candidate_pool_dirs:
+        records, _ = load_candidate_pool(candidate_dir)
+        for record in records:
+            session_name = _normalized_session_name(record.get("session"))
+            if session_name in forbidden:
+                leaked.add(str(record.get("session") or ""))
+    if leaked:
+        raise RuntimeError(
+            "Final holdout sessions leaked into mixed-base candidate mining: "
+            + ", ".join(sorted(leaked))
+        )
+
+
+def _assert_records_exclude_sessions(
+    *,
+    records: Sequence[Mapping[str, object]],
+    forbidden_session_stems: Sequence[str],
+    field_name: str,
+    context: str,
+) -> None:
+    forbidden = {_normalized_session_name(item) for item in forbidden_session_stems}
+    leaked = sorted(
+        {
+            str(record.get(field_name) or "")
+            for record in records
+            if _normalized_session_name(record.get(field_name)) in forbidden
+        }
+    )
+    if leaked:
+        raise RuntimeError(f"{context} leaked final holdout sessions: " + ", ".join(leaked))
+
+
+def _run_eval_suite(
+    *,
+    suite_name: str,
+    suite_specs: Sequence[EvalSpec],
+    short_slice: Optional[Tuple[EvalSpec, Mapping[str, object]]],
+    output_root: Path,
+    prepared_eval_root: Path,
+    speaker_mapping_path: Path,
+    config_path: Path,
+    window_seconds: float,
+    hop_seconds: float,
+    top_k: int,
+    min_speakers: int,
+    device: str,
+    local_files_only: bool,
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    _ = suite_name
+    suite_eval: Dict[str, object] = {}
+    suite_summaries: List[Dict[str, object]] = []
+    for spec in suite_specs:
+        summary = evaluate_multitrack_session(
+            session_zip=spec.session_zip,
+            session_jsonl=spec.transcript,
+            output_dir=output_root / spec.name,
+            cache_root=prepared_eval_root / spec.name,
+            speaker_mapping_path=speaker_mapping_path,
+            config_path=config_path,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+            top_k=top_k,
+            min_speakers=min_speakers,
+            device_override=device,
+            local_files_only_override=True if local_files_only else None,
+        )
+        suite_eval[spec.name] = _summarize_eval(summary)
+        suite_summaries.append(summary)
+    if short_slice:
+        short_spec, short_window = short_slice
+        suite_stems = _spec_session_stems(suite_specs)
+        if _normalized_session_name(short_spec.session_zip.stem) in suite_stems:
+            short_summary = evaluate_multitrack_session(
+                session_zip=short_spec.session_zip,
+                session_jsonl=short_spec.transcript,
+                output_dir=output_root / "short_segment_slice",
+                cache_root=prepared_eval_root / "short_segment_slice",
+                speaker_mapping_path=speaker_mapping_path,
+                config_path=config_path,
+                window_seconds=window_seconds,
+                hop_seconds=hop_seconds,
+                top_k=1,
+                min_speakers=min_speakers,
+                device_override=device,
+                local_files_only_override=True if local_files_only else None,
+                windows_override=[dict(short_window)],
+            )
+            suite_eval["short_segment_slice"] = {
+                **_summarize_eval(short_summary),
+                "source_session": short_spec.name,
+                "window": dict(short_window),
+            }
+            suite_summaries.append(short_summary)
+    return suite_eval, suite_summaries
 
 
 def _collect_training_sources(input_roots: Sequence[Path], excluded_stems: Sequence[str]) -> List[Path]:
@@ -152,7 +374,9 @@ def _write_eval_config(
     speaker_mapping_path: Path,
     classifier_min_margin: float,
     threshold: float,
+    match_aggregation: str,
     min_segments_per_label: int,
+    speaker_bank_overrides: Optional[Mapping[str, object]] = None,
 ) -> Path:
     payload = dict(base_config)
     payload["hf_cache_root"] = str(hf_cache_root)
@@ -164,12 +388,25 @@ def _write_eval_config(
     speaker_bank_cfg["path"] = profile_name
     speaker_bank_cfg["threshold"] = float(threshold)
     speaker_bank_cfg["match_per_segment"] = True
-    speaker_bank_cfg["match_aggregation"] = "mean"
+    speaker_bank_cfg["match_aggregation"] = str(match_aggregation or "mean")
     speaker_bank_cfg["min_segments_per_label"] = int(min_segments_per_label)
     classifier_cfg = dict(speaker_bank_cfg.get("classifier") or {})
     classifier_cfg["min_confidence"] = 0.0
     classifier_cfg["min_margin"] = float(classifier_min_margin)
     speaker_bank_cfg["classifier"] = classifier_cfg
+    for key, value in dict(speaker_bank_overrides or {}).items():
+        if key == "classifier":
+            classifier_override = dict(value or {})
+            merged_classifier = dict(speaker_bank_cfg.get("classifier") or {})
+            merged_classifier.update(classifier_override)
+            speaker_bank_cfg["classifier"] = merged_classifier
+            continue
+        if key in {"repair", "session_graph"} and isinstance(value, Mapping):
+            merged_nested = dict(speaker_bank_cfg.get(key) or {})
+            merged_nested.update(dict(value))
+            speaker_bank_cfg[key] = merged_nested
+            continue
+        speaker_bank_cfg[key] = value
     payload["speaker_bank"] = speaker_bank_cfg
     return _json_write(output_path, payload)
 
@@ -238,6 +475,19 @@ def _summarize_eval(summary: Mapping[str, object]) -> Dict[str, object]:
     results = list(summary.get("results") or [])
     accuracy_values = [float(item.get("metrics", {}).get("accuracy") or 0.0) for item in results]
     coverage_values = [float(item.get("metrics", {}).get("coverage") or 0.0) for item in results]
+    matched_accuracy_values = [
+        float(item.get("metrics", {}).get("matched_accuracy") or 0.0) for item in results
+    ]
+    pre_graph_accuracy_values = [
+        float(item.get("metrics_pre_graph", {}).get("accuracy") or 0.0)
+        for item in results
+        if item.get("metrics_pre_graph") is not None
+    ]
+    pre_graph_matched_accuracy_values = [
+        float(item.get("metrics_pre_graph", {}).get("matched_accuracy") or 0.0)
+        for item in results
+        if item.get("metrics_pre_graph") is not None
+    ]
     confusion: Dict[str, Dict[str, int]] = {}
     for item in results:
         for speaker, counts in dict(item.get("metrics", {}).get("confusion") or {}).items():
@@ -247,7 +497,23 @@ def _summarize_eval(summary: Mapping[str, object]) -> Dict[str, object]:
     return {
         "mean_accuracy": (sum(accuracy_values) / len(accuracy_values)) if accuracy_values else 0.0,
         "mean_coverage": (sum(coverage_values) / len(coverage_values)) if coverage_values else 0.0,
+        "mean_matched_accuracy": (
+            (sum(matched_accuracy_values) / len(matched_accuracy_values))
+            if matched_accuracy_values
+            else 0.0
+        ),
+        "mean_accuracy_pre_graph": (
+            (sum(pre_graph_accuracy_values) / len(pre_graph_accuracy_values))
+            if pre_graph_accuracy_values
+            else None
+        ),
+        "mean_matched_accuracy_pre_graph": (
+            (sum(pre_graph_matched_accuracy_values) / len(pre_graph_matched_accuracy_values))
+            if pre_graph_matched_accuracy_values
+            else None
+        ),
         "confusion": confusion,
+        "graph_pair_diagnostics": dict(summary.get("graph_pair_diagnostics") or {}),
     }
 
 
@@ -390,27 +656,43 @@ def prepare_baseline(
         else None
     )
     base_config = _load_yaml_or_json(str(base_config_path)) if base_config_path else {}
-    eval_specs = _parse_eval_specs(recipe.get("eval") or [])
-    if not eval_specs:
-        raise RuntimeError("Baseline prep requires at least one eval session")
+    eval_groups = _resolve_eval_groups(recipe)
+    eval_dev_specs = list(eval_groups["eval_dev"])
+    eval_final_specs = list(eval_groups["eval_final"])
+    mining_heuristic_eval_specs = list(eval_groups["mining_heuristic_eval"])
+    if not eval_dev_specs:
+        raise RuntimeError("Baseline prep requires at least one eval_dev session")
+    _assert_eval_groups_are_disjoint(
+        eval_dev_specs=eval_dev_specs,
+        eval_final_specs=eval_final_specs,
+        mining_heuristic_eval_specs=mining_heuristic_eval_specs,
+    )
 
-    excluded_stems = [spec.session_zip.stem for spec in eval_specs]
+    excluded_stems = sorted(
+        _spec_session_stems(eval_dev_specs)
+        | _spec_session_stems(eval_final_specs)
+        | _spec_session_stems(mining_heuristic_eval_specs)
+    )
     training_sources = _collect_training_sources(
         [Path(str(path)).expanduser().resolve() for path in (recipe.get("training_inputs") or [])],
         excluded_stems=excluded_stems,
     )
     if not training_sources:
         raise RuntimeError("No training session sources were found for baseline prep")
+    _assert_training_sources_exclude_sessions(
+        training_sources=training_sources,
+        forbidden_session_stems=sorted(_spec_session_stems(eval_final_specs)),
+        context="Training input materialization",
+    )
     transcript_roots = [
         Path(str(path)).expanduser().resolve() for path in (recipe.get("transcript_roots") or [])
     ]
     recipe_root = base_output_root / "materialized_inputs"
     training_input_dir = _materialize_training_dir(training_sources, recipe_root / "train_inputs")
     input_identities = collect_input_file_identities(training_sources + transcript_roots)
-    eval_input_identities = collect_input_file_identities(
-        [spec.session_zip for spec in eval_specs] + [spec.transcript for spec in eval_specs],
-        hash_contents=False,
-    )
+    eval_dev_input_identities = _collect_eval_input_identities(eval_dev_specs)
+    eval_final_input_identities = _collect_eval_input_identities(eval_final_specs)
+    mining_eval_input_identities = _collect_eval_input_identities(mining_heuristic_eval_specs)
     core_speakers = list(recipe.get("core_speakers") or [])
     excluded_speakers = list(recipe.get("excluded_speakers") or [])
     git_commit = current_git_commit(cwd=Path(__file__).resolve().parents[2])
@@ -1031,6 +1313,10 @@ def prepare_baseline(
     base_balance_summary = dict(base_training_summary.get("balance") or {})
 
     current_winner = {**DEFAULT_CURRENT_WINNER, **dict(recipe.get("current_winner") or {})}
+    speaker_bank_overrides = {
+        **dict(recipe.get("speaker_bank_overrides") or {}),
+        **dict(current_winner.get("speaker_bank_overrides") or {}),
+    }
     eval_window_seconds = float(recipe.get("eval_window_seconds") or 300.0)
     eval_hop_seconds = float(recipe.get("eval_hop_seconds") or 60.0)
     eval_top_k = int(recipe.get("eval_top_k") or 3)
@@ -1042,22 +1328,36 @@ def prepare_baseline(
         "min_speakers": eval_min_speakers,
         "threshold": float(current_winner["threshold"]),
         "classifier_min_margin": float(current_winner["classifier_min_margin"]),
+        "match_aggregation": str(current_winner["match_aggregation"]),
         "min_segments_per_label": int(current_winner["min_segments_per_label"]),
+        "speaker_bank_overrides": speaker_bank_overrides,
     }
     short_spec, short_window = _derive_short_segment_slice(
-        eval_specs,
+        eval_dev_specs,
         speaker_mapping=speaker_mapping,
         window_seconds=eval_window_seconds,
         hop_seconds=eval_hop_seconds,
         top_k=eval_top_k,
         min_speakers=eval_min_speakers,
     )
-    canonical_suite = {
-        "sessions": [spec.name for spec in eval_specs],
+    dev_canonical_suite = {
+        "sessions": [spec.name for spec in eval_dev_specs],
         "short_segment_slice": {
             "source_session": short_spec.name,
             "window": short_window,
         },
+    }
+    final_canonical_suite = {
+        "sessions": [spec.name for spec in eval_final_specs],
+    }
+    mining_heuristic_suite = {
+        "sessions": [spec.name for spec in mining_heuristic_eval_specs],
+        "short_segment_slice": (
+            {"source_session": short_spec.name, "window": short_window}
+            if _normalized_session_name(short_spec.session_zip.stem)
+            in _spec_session_stems(mining_heuristic_eval_specs)
+            else None
+        ),
     }
     prepared_eval_root = base_output_root / "prepared_eval"
 
@@ -1068,13 +1368,35 @@ def prepare_baseline(
         ],
         "current_winner": current_winner,
         "eval_params": eval_params,
-        "canonical_suite": canonical_suite,
+        "mining_heuristic_suite": mining_heuristic_suite,
+        "mining_eval_input_identities": mining_eval_input_identities,
+        "eval_final_sessions": sorted(_spec_session_stems(eval_final_specs)),
         "seed_pairs": list(recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]),
-        "top_confusion_pairs": int(recipe.get("top_confusion_pairs") or 5),
-        "hard_negative_max_margin": float(recipe.get("hard_negative_max_margin") or 0.12),
-        "hard_negative_min_dominant_share": float(recipe.get("hard_negative_min_dominant_share") or 0.55),
-        "hard_negative_per_pair_cap": int(recipe.get("hard_negative_per_pair_cap") or 75),
-        "hard_negative_max_fraction": float(recipe.get("hard_negative_max_fraction") or 0.20),
+        "top_confusion_pairs": _recipe_int(recipe, "top_confusion_pairs", 5),
+        "hard_negative_max_margin": _recipe_float(recipe, "hard_negative_max_margin", 0.12),
+        "hard_negative_min_dominant_share": _recipe_float(
+            recipe, "hard_negative_min_dominant_share", 0.55
+        ),
+        "hard_negative_per_pair_cap": _recipe_int(recipe, "hard_negative_per_pair_cap", 75),
+        "hard_negative_pair_caps": {
+            f"{left}::{right}": int(value)
+            for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
+        },
+        "hard_negative_per_speaker_cap": (
+            int(recipe["hard_negative_per_speaker_cap"])
+            if recipe.get("hard_negative_per_speaker_cap") is not None
+            else None
+        ),
+        "hard_negative_max_fraction": _recipe_float(recipe, "hard_negative_max_fraction", 0.20),
+        "hard_negative_style_profile_name": str(
+            recipe.get("hard_negative_style_profile_name") or "session61_like"
+        ),
+        "hard_negative_style_score_threshold": _recipe_float(
+            recipe, "hard_negative_style_score_threshold", 0.70
+        ),
+        "hard_negative_min_style_samples_per_pair": _recipe_int(
+            recipe, "hard_negative_min_style_samples_per_pair", 40
+        ),
     }
     hard_negative_reused, hard_negative_outputs = _maybe_reuse_stage("hard_negatives", hard_negative_signature)
     if not hard_negative_reused:
@@ -1106,12 +1428,12 @@ def prepare_baseline(
         mining_eval_manifest = build_artifact_manifest(
             artifact_type="eval",
             diarization_model=diarization_model,
-            source_sessions=[spec.name for spec in eval_specs],
-            input_file_identities=eval_input_identities,
+            source_sessions=[spec.name for spec in mining_heuristic_eval_specs],
+            input_file_identities=mining_eval_input_identities,
             build_params={
                 **eval_params,
                 "stage": "hard_negative_mining",
-                "canonical_suite": canonical_suite,
+                "canonical_suite": mining_heuristic_suite,
             },
             parent_artifacts=[str(base_training_manifest["artifact_id"])],
             git_commit=git_commit,
@@ -1120,7 +1442,7 @@ def prepare_baseline(
             base_output_root
             / "artifacts"
             / "eval"
-            / "hard_negative_mining"
+            / "mining_heuristic_eval"
             / str(mining_eval_manifest["artifact_id"])
         )
         mining_eval_config_path = _write_eval_config(
@@ -1132,53 +1454,38 @@ def prepare_baseline(
             speaker_mapping_path=speaker_mapping_path,
             classifier_min_margin=float(current_winner["classifier_min_margin"]),
             threshold=float(current_winner["threshold"]),
+            match_aggregation=str(current_winner["match_aggregation"]),
             min_segments_per_label=int(current_winner["min_segments_per_label"]),
+            speaker_bank_overrides=speaker_bank_overrides,
         )
         mining_eval: Dict[str, object] = {}
         mining_eval_summaries: List[Dict[str, object]] = []
-        for spec in eval_specs:
-            summary = evaluate_multitrack_session(
-                session_zip=spec.session_zip,
-                session_jsonl=spec.transcript,
-                output_dir=mining_eval_artifact_dir / spec.name,
-                cache_root=prepared_eval_root / spec.name,
-                speaker_mapping_path=speaker_mapping_path,
-                config_path=mining_eval_config_path,
-                window_seconds=eval_window_seconds,
-                hop_seconds=eval_hop_seconds,
-                top_k=eval_top_k,
-                min_speakers=eval_min_speakers,
-                device_override=device,
-                local_files_only_override=True if recipe.get("local_files_only") else None,
-            )
-            mining_eval[spec.name] = _summarize_eval(summary)
-            mining_eval_summaries.append(summary)
-        short_summary = evaluate_multitrack_session(
-            session_zip=short_spec.session_zip,
-            session_jsonl=short_spec.transcript,
-            output_dir=mining_eval_artifact_dir / "short_segment_slice",
-            cache_root=prepared_eval_root / "short_segment_slice",
+        mining_eval, mining_eval_summaries = _run_eval_suite(
+            suite_name="mining_heuristic_eval",
+            suite_specs=mining_heuristic_eval_specs,
+            short_slice=(
+                (short_spec, short_window)
+                if _normalized_session_name(short_spec.session_zip.stem)
+                in _spec_session_stems(mining_heuristic_eval_specs)
+                else None
+            ),
+            output_root=mining_eval_artifact_dir,
+            prepared_eval_root=prepared_eval_root / "mining_heuristic_eval",
             speaker_mapping_path=speaker_mapping_path,
             config_path=mining_eval_config_path,
             window_seconds=eval_window_seconds,
             hop_seconds=eval_hop_seconds,
-            top_k=1,
+            top_k=eval_top_k,
             min_speakers=eval_min_speakers,
-            device_override=device,
-            local_files_only_override=True if recipe.get("local_files_only") else None,
-            windows_override=[short_window],
+            device=device,
+            local_files_only=bool(recipe.get("local_files_only")),
         )
-        mining_eval["short_segment_slice"] = {
-            **_summarize_eval(short_summary),
-            "source_session": short_spec.name,
-            "window": short_window,
-        }
-        mining_eval_summaries.append(short_summary)
         mining_eval_manifest = {
             **mining_eval_manifest,
             "artifact_dir": str(mining_eval_artifact_dir),
             "config_path": str(mining_eval_config_path),
-            "canonical_suite": canonical_suite,
+            "canonical_suite": mining_heuristic_suite,
+            "heuristic_eval": mining_eval,
             "canonical_eval": mining_eval,
             "summary_paths": [
                 str(summary.get("summary_path") or "") for summary in mining_eval_summaries
@@ -1186,6 +1493,12 @@ def prepare_baseline(
         }
         mining_eval_manifest_path = mining_eval_artifact_dir / "eval_manifest.json"
         save_manifest(mining_eval_manifest_path, mining_eval_manifest)
+        _assert_candidate_pool_excludes_sessions(
+            candidate_pool_dirs=[
+                Path(str(variant_manifests[name]["dataset_dir"])) for name in candidate_variant_names
+            ],
+            forbidden_session_stems=sorted(_spec_session_stems(eval_final_specs)),
+        )
         hard_negative_dataset, hard_negative_records, hard_negative_summary = build_hard_negative_dataset(
             eval_summaries=mining_eval_summaries,
             candidate_pool_dirs=[
@@ -1195,11 +1508,35 @@ def prepare_baseline(
             seed_pairs=list(
                 recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]
             ),
-            top_confusion_pairs=int(recipe.get("top_confusion_pairs") or 5),
-            max_eval_margin=float(recipe.get("hard_negative_max_margin") or 0.12),
-            min_mixed_dominant_share=float(recipe.get("hard_negative_min_dominant_share") or 0.55),
-            per_pair_cap=int(recipe.get("hard_negative_per_pair_cap") or 75),
-            max_fraction=float(recipe.get("hard_negative_max_fraction") or 0.20),
+            top_confusion_pairs=_recipe_int(recipe, "top_confusion_pairs", 5),
+            max_eval_margin=_recipe_float(recipe, "hard_negative_max_margin", 0.12),
+            min_mixed_dominant_share=_recipe_float(recipe, "hard_negative_min_dominant_share", 0.55),
+            per_pair_cap=_recipe_int(recipe, "hard_negative_per_pair_cap", 75),
+            pair_caps={
+                (left, right): int(value)
+                for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
+            },
+            per_speaker_cap=(
+                int(recipe["hard_negative_per_speaker_cap"])
+                if recipe.get("hard_negative_per_speaker_cap") is not None
+                else None
+            ),
+            max_fraction=_recipe_float(recipe, "hard_negative_max_fraction", 0.20),
+            style_profile_name=str(
+                recipe.get("hard_negative_style_profile_name") or "session61_like"
+            ),
+            style_score_threshold=_recipe_float(
+                recipe, "hard_negative_style_score_threshold", 0.70
+            ),
+            min_style_samples_per_pair=_recipe_int(
+                recipe, "hard_negative_min_style_samples_per_pair", 40
+            ),
+        )
+        _assert_records_exclude_sessions(
+            records=hard_negative_records,
+            forbidden_session_stems=sorted(_spec_session_stems(eval_final_specs)),
+            field_name="source_session",
+            context="Hard-negative records",
         )
         hard_negative_manifest = None
         hard_negative_dir = base_output_root / "artifacts" / "datasets" / "hard_negative"
@@ -1263,6 +1600,7 @@ def prepare_baseline(
             "mining_profile_dir": str(mining_profile_dir),
             "mining_profile_name": mining_profile_name,
             "mining_training_summary_path": str(mining_training_summary_path),
+            "mining_heuristic_eval_manifest_path": str(mining_eval_manifest_path),
             "mining_eval_manifest_path": str(mining_eval_manifest_path),
             "hard_negative_manifest_path": (
                 str(hard_negative_dir / "hard_negative_manifest.json") if hard_negative_manifest else ""
@@ -1298,11 +1636,18 @@ def prepare_baseline(
     mining_profile_dir = Path(str(hard_negative_outputs["mining_profile_dir"]))
     mining_profile_name = str(hard_negative_outputs["mining_profile_name"])
     mining_training_summary_path = Path(str(hard_negative_outputs["mining_training_summary_path"]))
-    mining_eval_manifest_path = Path(str(hard_negative_outputs["mining_eval_manifest_path"]))
+    mining_eval_manifest_path = Path(
+        str(
+            hard_negative_outputs.get("mining_heuristic_eval_manifest_path")
+            or hard_negative_outputs["mining_eval_manifest_path"]
+        )
+    )
     mining_eval_manifest = load_manifest(mining_eval_manifest_path)
     if mining_eval_manifest is None:
         raise RuntimeError(f"Missing mining eval manifest: {mining_eval_manifest_path}")
-    mining_eval = dict(mining_eval_manifest.get("canonical_eval") or {})
+    mining_eval = dict(
+        mining_eval_manifest.get("heuristic_eval") or mining_eval_manifest.get("canonical_eval") or {}
+    )
     hard_negative_manifest_path_raw = str(hard_negative_outputs.get("hard_negative_manifest_path") or "")
     hard_negative_manifest = (
         load_manifest(Path(hard_negative_manifest_path_raw))
@@ -1441,9 +1786,11 @@ def prepare_baseline(
 
     eval_signature = {
         "final_training_artifact_id": final_training_manifest["artifact_id"],
-        "eval_input_identities": eval_input_identities,
+        "eval_dev_input_identities": eval_dev_input_identities,
+        "eval_final_input_identities": eval_final_input_identities,
         "eval_params": eval_params,
-        "canonical_suite": canonical_suite,
+        "dev_canonical_suite": dev_canonical_suite,
+        "final_canonical_suite": final_canonical_suite,
         "baseline_profile_name": baseline_profile_name,
     }
     eval_reused, eval_outputs = _maybe_reuse_stage("eval", eval_signature)
@@ -1451,28 +1798,28 @@ def prepare_baseline(
         if "eval" not in selected_stage_names:
             raise RuntimeError("Eval outputs are unavailable and eval is outside the requested stage range")
         stage_logger.log(stage="eval", status="stage_started", cache_hit=False)
-        eval_manifest = build_artifact_manifest(
+        dev_eval_manifest = build_artifact_manifest(
             artifact_type="eval",
             diarization_model=diarization_model,
-            source_sessions=[spec.name for spec in eval_specs],
-            input_file_identities=eval_input_identities,
+            source_sessions=[spec.name for spec in eval_dev_specs],
+            input_file_identities=eval_dev_input_identities,
             build_params={
                 **eval_params,
-                "stage": "canonical_baseline",
-                "canonical_suite": canonical_suite,
+                "stage": "canonical_dev",
+                "canonical_suite": dev_canonical_suite,
             },
             parent_artifacts=[str(final_training_manifest["artifact_id"])],
             git_commit=git_commit,
         )
-        eval_artifact_dir = (
+        dev_eval_artifact_dir = (
             base_output_root
             / "artifacts"
             / "eval"
-            / "canonical_baseline"
-            / str(eval_manifest["artifact_id"])
+            / "canonical_dev"
+            / str(dev_eval_manifest["artifact_id"])
         )
-        eval_config_path = _write_eval_config(
-            eval_artifact_dir / "baseline_eval_config.json",
+        dev_eval_config_path = _write_eval_config(
+            dev_eval_artifact_dir / "baseline_eval_config.json",
             base_config=base_config,
             hf_cache_root=hf_cache_root,
             profile_name=baseline_profile_name,
@@ -1480,58 +1827,113 @@ def prepare_baseline(
             speaker_mapping_path=speaker_mapping_path,
             classifier_min_margin=float(current_winner["classifier_min_margin"]),
             threshold=float(current_winner["threshold"]),
+            match_aggregation=str(current_winner["match_aggregation"]),
             min_segments_per_label=int(current_winner["min_segments_per_label"]),
+            speaker_bank_overrides=speaker_bank_overrides,
         )
-        canonical_eval: Dict[str, object] = {}
-        eval_summaries: List[Dict[str, object]] = []
-        for spec in eval_specs:
-            summary = evaluate_multitrack_session(
-                session_zip=spec.session_zip,
-                session_jsonl=spec.transcript,
-                output_dir=eval_artifact_dir / spec.name,
-                cache_root=prepared_eval_root / spec.name,
-                speaker_mapping_path=speaker_mapping_path,
-                config_path=eval_config_path,
-                window_seconds=eval_window_seconds,
-                hop_seconds=eval_hop_seconds,
-                top_k=eval_top_k,
-                min_speakers=eval_min_speakers,
-                device_override=device,
-                local_files_only_override=True if recipe.get("local_files_only") else None,
-            )
-            canonical_eval[spec.name] = _summarize_eval(summary)
-            eval_summaries.append(summary)
-        short_summary = evaluate_multitrack_session(
-            session_zip=short_spec.session_zip,
-            session_jsonl=short_spec.transcript,
-            output_dir=eval_artifact_dir / "short_segment_slice",
-            cache_root=prepared_eval_root / "short_segment_slice",
+        dev_eval, dev_eval_summaries = _run_eval_suite(
+            suite_name="eval_dev",
+            suite_specs=eval_dev_specs,
+            short_slice=(short_spec, short_window),
+            output_root=dev_eval_artifact_dir,
+            prepared_eval_root=prepared_eval_root / "dev",
             speaker_mapping_path=speaker_mapping_path,
-            config_path=eval_config_path,
+            config_path=dev_eval_config_path,
             window_seconds=eval_window_seconds,
             hop_seconds=eval_hop_seconds,
-            top_k=1,
+            top_k=eval_top_k,
             min_speakers=eval_min_speakers,
-            device_override=device,
-            local_files_only_override=True if recipe.get("local_files_only") else None,
-            windows_override=[short_window],
+            device=device,
+            local_files_only=bool(recipe.get("local_files_only")),
         )
-        canonical_eval["short_segment_slice"] = {
-            **_summarize_eval(short_summary),
-            "source_session": short_spec.name,
-            "window": short_window,
+        dev_eval_manifest = {
+            **dev_eval_manifest,
+            "artifact_dir": str(dev_eval_artifact_dir),
+            "config_path": str(dev_eval_config_path),
+            "canonical_suite": dev_canonical_suite,
+            "canonical_eval": dev_eval,
+            "summary_paths": [str(summary.get("summary_path") or "") for summary in dev_eval_summaries],
         }
-        eval_summaries.append(short_summary)
-        eval_manifest = {
-            **eval_manifest,
-            "artifact_dir": str(eval_artifact_dir),
-            "config_path": str(eval_config_path),
-            "canonical_suite": canonical_suite,
-            "canonical_eval": canonical_eval,
-            "summary_paths": [str(summary.get("summary_path") or "") for summary in eval_summaries],
+        save_manifest(dev_eval_artifact_dir / "eval_manifest.json", dev_eval_manifest)
+        dev_eval_manifest_path = save_manifest(base_output_root / "dev_eval_manifest.json", dev_eval_manifest)
+
+        final_eval_manifest = build_artifact_manifest(
+            artifact_type="eval",
+            diarization_model=diarization_model,
+            source_sessions=[spec.name for spec in eval_final_specs],
+            input_file_identities=eval_final_input_identities,
+            build_params={
+                **eval_params,
+                "stage": "canonical_final",
+                "canonical_suite": final_canonical_suite,
+            },
+            parent_artifacts=[str(final_training_manifest["artifact_id"])],
+            git_commit=git_commit,
+        )
+        final_eval_artifact_dir = (
+            base_output_root
+            / "artifacts"
+            / "eval"
+            / "canonical_final"
+            / str(final_eval_manifest["artifact_id"])
+        )
+        final_eval_config_path = _write_eval_config(
+            final_eval_artifact_dir / "baseline_eval_config.json",
+            base_config=base_config,
+            hf_cache_root=hf_cache_root,
+            profile_name=baseline_profile_name,
+            diarization_model=diarization_model,
+            speaker_mapping_path=speaker_mapping_path,
+            classifier_min_margin=float(current_winner["classifier_min_margin"]),
+            threshold=float(current_winner["threshold"]),
+            match_aggregation=str(current_winner["match_aggregation"]),
+            min_segments_per_label=int(current_winner["min_segments_per_label"]),
+            speaker_bank_overrides=speaker_bank_overrides,
+        )
+        final_eval, final_eval_summaries = _run_eval_suite(
+            suite_name="eval_final",
+            suite_specs=eval_final_specs,
+            short_slice=None,
+            output_root=final_eval_artifact_dir,
+            prepared_eval_root=prepared_eval_root / "final",
+            speaker_mapping_path=speaker_mapping_path,
+            config_path=final_eval_config_path,
+            window_seconds=eval_window_seconds,
+            hop_seconds=eval_hop_seconds,
+            top_k=eval_top_k,
+            min_speakers=eval_min_speakers,
+            device=device,
+            local_files_only=bool(recipe.get("local_files_only")),
+        )
+        final_eval_manifest = {
+            **final_eval_manifest,
+            "artifact_dir": str(final_eval_artifact_dir),
+            "config_path": str(final_eval_config_path),
+            "canonical_suite": final_canonical_suite,
+            "canonical_eval": final_eval,
+            "summary_paths": [
+                str(summary.get("summary_path") or "") for summary in final_eval_summaries
+            ],
         }
-        eval_manifest_path = eval_artifact_dir / "eval_manifest.json"
-        save_manifest(eval_manifest_path, eval_manifest)
+        save_manifest(final_eval_artifact_dir / "eval_manifest.json", final_eval_manifest)
+        final_eval_manifest_path = save_manifest(
+            base_output_root / "final_eval_manifest.json",
+            final_eval_manifest,
+        )
+
+        comparison_summary = {
+            "dev_eval": dev_eval,
+            "final_eval": final_eval,
+            "dev_eval_manifest_path": str(dev_eval_manifest_path),
+            "final_eval_manifest_path": str(final_eval_manifest_path),
+            "dev_sessions": [spec.name for spec in eval_dev_specs],
+            "final_sessions": [spec.name for spec in eval_final_specs],
+            "short_segment_slice": dev_canonical_suite.get("short_segment_slice"),
+        }
+        comparison_summary_path = _json_write(
+            base_output_root / "comparison_summary.json",
+            comparison_summary,
+        )
         narrow_doe_recipe = {
             "bank_profile_dir": str(bank_profile_dir),
             "mining_profile_dir": str(mining_profile_dir),
@@ -1541,6 +1943,7 @@ def prepare_baseline(
             "hard_negative_dataset_dir": str(hard_negative_dir) if hard_negative_manifest else None,
             "model_family": str(current_winner["model_name"]),
             "classifier": current_winner,
+            "speaker_bank_overrides": speaker_bank_overrides,
             "selected_pack": selected_pack,
             "variant_dataset_dirs": {
                 name: str(manifest["dataset_dir"]) for name, manifest in variant_manifests.items()
@@ -1568,12 +1971,19 @@ def prepare_baseline(
                 str(hard_negative_dir / "hard_negative_manifest.json") if hard_negative_manifest else None
             ),
             "final_training_manifest_path": str(final_training_manifest_path),
+            "mining_heuristic_eval_manifest_path": str(mining_eval_manifest_path),
             "mining_eval_manifest_path": str(mining_eval_manifest_path),
-            "eval_manifest_path": str(eval_manifest_path),
+            "dev_eval_manifest_path": str(dev_eval_manifest_path),
+            "final_eval_manifest_path": str(final_eval_manifest_path),
+            "comparison_summary_path": str(comparison_summary_path),
+            "eval_manifest_path": str(dev_eval_manifest_path),
             "mining_training_summary_path": str(mining_training_summary_path),
             "final_training_summary_path": str(final_training_summary_path),
+            "mining_heuristic_eval": mining_eval,
             "mining_eval": mining_eval,
-            "canonical_eval": canonical_eval,
+            "dev_eval": dev_eval,
+            "final_eval": final_eval,
+            "canonical_eval": dev_eval,
             "quality_reports": {
                 "bank": str(bank_artifact_dir / "dataset" / "quality_report.json"),
                 "mixed_base": str(mixed_base_dir / "quality_report.json"),
@@ -1603,7 +2013,10 @@ def prepare_baseline(
         }
         baseline_summary_path = _json_write(base_output_root / "baseline_summary.json", baseline_summary)
         eval_outputs = {
-            "eval_manifest_path": str(eval_manifest_path),
+            "dev_eval_manifest_path": str(dev_eval_manifest_path),
+            "final_eval_manifest_path": str(final_eval_manifest_path),
+            "comparison_summary_path": str(comparison_summary_path),
+            "eval_manifest_path": str(dev_eval_manifest_path),
             "narrow_doe_recipe_path": str(narrow_doe_recipe_path),
             "baseline_summary_path": str(baseline_summary_path),
         }
@@ -1613,7 +2026,13 @@ def prepare_baseline(
                 stage="eval",
                 stage_signature=eval_signature,
                 outputs=eval_outputs,
-                required_paths=[eval_manifest_path, narrow_doe_recipe_path, baseline_summary_path],
+                required_paths=[
+                    dev_eval_manifest_path,
+                    final_eval_manifest_path,
+                    comparison_summary_path,
+                    narrow_doe_recipe_path,
+                    baseline_summary_path,
+                ],
                 parent_stages=["train"],
                 git_commit=git_commit,
             )
@@ -1622,7 +2041,7 @@ def prepare_baseline(
             stage="eval",
             status="stage_completed",
             cache_hit=False,
-            extra={"eval_manifest_path": str(eval_manifest_path)},
+            extra={"eval_manifest_path": str(dev_eval_manifest_path)},
         )
 
     baseline_summary_path = Path(str(eval_outputs["baseline_summary_path"]))

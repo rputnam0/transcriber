@@ -1,0 +1,108 @@
+output_root: .outputs/speaker_id_baseline_prod_graph
+hf_cache_root: ./.hf_cache
+extracted_session_cache_root: data/.cache/extracted_sessions
+mixed_base_cache_root: data/.cache/mixed_base
+metrics_log_path: .outputs/speaker_id_baseline_prod_graph/stage_metrics.jsonl
+resume: true
+
+base_config: config/transcriber.yaml
+speaker_mapping: config/speaker_mapping.yaml
+diarization_model: pyannote/speaker-diarization-community-1
+
+device: cuda
+quiet: true
+batch_size: 8
+workers: 1
+
+training_inputs:
+  - data/prod/Audio
+
+transcript_roots:
+  - data/prod/Transcripts
+
+eval:
+  - name: Session22
+    session_zip: data/prod/Audio/Session 22.zip
+    transcript: data/prod/Transcripts/Session 22/Session 22.txt
+  - name: Session61
+    session_zip: data/prod/Audio/Session 61.zip
+    transcript: data/prod/Transcripts/Session 61/Session 61.txt
+
+core_speakers:
+  - Dungeon Master
+  - David Tanglethorn
+  - Leopold Magnus
+  - Kaladen Shash
+  - Cyrus Schwert
+  - Cletus Cobbington
+
+excluded_speakers:
+  - B. Ver
+
+baseline_pack:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+build_variants:
+  - mixed_raw
+  - light_x1
+  - discord_x1
+
+hard_negative_candidate_variants:
+  - mixed_raw
+
+seed_confusion_pairs:
+  - ["Cyrus Schwert", "Cletus Cobbington"]
+  - ["Cyrus Schwert", "Leopold Magnus"]
+  - ["Kaladen Shash", "Leopold Magnus"]
+  - ["Kaladen Shash", "Dungeon Master"]
+  - ["David Tanglethorn", "Cletus Cobbington"]
+  - ["David Tanglethorn", "Leopold Magnus"]
+
+top_confusion_pairs: 0
+hard_negative_per_pair_cap: 60
+hard_negative_per_speaker_cap: 160
+hard_negative_max_fraction: 0.20
+hard_negative_style_profile_name: session61_like
+hard_negative_style_score_threshold: 0.45
+hard_negative_min_style_samples_per_pair: 10
+
+current_winner:
+  model_name: knn
+  classifier_c: 1.0
+  classifier_n_neighbors: 7
+  classifier_min_margin: 0.06
+  threshold: 0.36
+  match_aggregation: vote
+  min_segments_per_label: 2
+
+speaker_bank_overrides:
+  repair:
+    enabled: true
+    merge_same_raw_gap_seconds: 0.20
+    snap_boundary_seconds: 0.20
+    max_overlap_trim_seconds: 0.30
+    split_on_word_gap_seconds: 0.35
+    max_seed_overlap_seconds: 0.15
+    min_segment_duration_seconds: 0.35
+  session_graph:
+    enabled: true
+    candidate_top_k: 3
+    candidate_floor: 0.20
+    knn: 8
+    min_similarity: 0.25
+    anchor_weight: 1.0
+    temporal_weight: 0.35
+    temporal_tau_seconds: 0.75
+    temporal_max_gap_seconds: 2.0
+    same_raw_label_weight: 0.15
+    same_top1_weight: 0.10
+    alpha: 0.8
+    max_iters: 30
+    tolerance: 0.0001
+    strong_seed_score: 0.60
+    strong_seed_margin: 0.12
+    override_min_confidence: 0.1
+    override_min_margin: 0.0
+    override_min_delta: 0.03
