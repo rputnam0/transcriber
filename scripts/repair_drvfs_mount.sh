@@ -83,7 +83,7 @@ fi
   WATCH_MOUNT_DRIVE="$drive_letter" \
   WATCH_MOUNT_POINT="$mount_point" \
   WATCH_MOUNT_OPTIONS="$mount_options" \
-  sh -lc '
+  bash -lc '
     set -euo pipefail
     nsenter -t 1 -m -- umount -l "$WATCH_MOUNT_POINT" 2>/dev/null || true
     nsenter -t 1 -m -- mkdir -p "$WATCH_MOUNT_POINT"
