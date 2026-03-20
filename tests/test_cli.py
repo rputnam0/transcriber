@@ -167,3 +167,19 @@ def test_watch_task_kind_requests_postprocess_backfill(tmp_path):
         )
         is None
     )
+
+
+def test_iter_candidate_media_honors_exclude_globs(tmp_path):
+    root = tmp_path / "audio"
+    root.mkdir()
+    (root / "Session 62.zip").write_text("zip", encoding="utf-8")
+    session_dir = root / "Session 9"
+    session_dir.mkdir()
+    (session_dir / "1-joeeeenathan_0.wav").write_text("wav", encoding="utf-8")
+    (session_dir / "Session 9.wav").write_text("wav", encoding="utf-8")
+
+    found = cli._iter_candidate_media(root, ["**/[0-9]-*.wav"])
+
+    assert str(root / "Session 62.zip") in found
+    assert str(session_dir / "Session 9.wav") in found
+    assert str(session_dir / "1-joeeeenathan_0.wav") not in found

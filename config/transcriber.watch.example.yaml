@@ -12,6 +12,12 @@ watch_interval: 10
 watch_stability: 5
 output_dir: outputs
 
+# Optional glob patterns to skip while recursively scanning the watch root.
+# Useful when the watch root contains raw stems or other source artifacts that
+# should not be treated as new transcription jobs.
+watch_exclude_globs:
+  - "**/[0-9]-*.wav"
+
 # Speaker mapping can still be used to rename tracks when known.
 speaker_mapping: config/speaker_mapping.example.yaml
 

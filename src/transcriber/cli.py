@@ -9,9 +9,9 @@ import shutil
 import math
 import platform
 import numpy as np
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import yaml
 import time
@@ -2555,8 +2555,11 @@ def _watch_task_kind(
     return "postprocess"
 
 
-def _iter_candidate_media(root_dir: Path) -> list[str]:
+def _iter_candidate_media(
+    root_dir: Path, exclude_globs: Optional[Sequence[str]] = None
+) -> list[str]:
     ignore_dirs = {"quarantine", ".cache", "outputs"}
+    exclude_patterns = [pattern for pattern in (exclude_globs or []) if pattern]
     files: list[str] = []
     for f in root_dir.rglob("*"):
         if not f.is_file():
@@ -2565,6 +2568,11 @@ def _iter_candidate_media(root_dir: Path) -> list[str]:
         parts = set(p.name for p in f.parents)
         if parts & ignore_dirs:
             continue
+        if exclude_patterns:
+            rel_path = f.relative_to(root_dir).as_posix()
+            rel = PurePosixPath(rel_path)
+            if any(rel.match(pattern) for pattern in exclude_patterns):
+                continue
         if f.suffix.lower() == ".zip" or is_audio_file(f):
             files.append(str(f))
     files.sort()
@@ -2647,7 +2655,11 @@ def watch_and_transcribe(
                 "Watch: monitoring %s (every %ss, stability %ss)", root, interval, stability
             )
 
-            candidates = _iter_candidate_media(root)
+            watch_exclude_globs = []
+            if isinstance(cfg, dict):
+                watch_exclude_globs = list(cfg.get("watch_exclude_globs") or [])
+
+            candidates = _iter_candidate_media(root, watch_exclude_globs)
             pending: list[tuple[str, str]] = []
             for f in candidates:
                 task_kind = _watch_task_kind(f, args.output_dir, postprocess_config)
