@@ -29,3 +29,6 @@ data/
 config/speaker_mapping.yaml
 config/transcriber.yaml
 config/transcriber.watch.yaml
+
+# Local reference scripts
+docs/example.py

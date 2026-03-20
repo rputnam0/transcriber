@@ -80,3 +80,19 @@ local_files_only: false
 # Logging
 log_level: WARNING
 quiet: true
+
+# Optional LLM post-processing.
+# When enabled, transcription writes as usual and then generates:
+#   - raw markdown/text artifacts under summaries_dir/Session N/raw_txt/
+#   - formatted DOCX files under summaries_dir/Session N/
+# Watch mode retries incomplete post-processing via a completion marker.
+postprocess:
+  enabled: false
+  provider: google
+  model: gemini-2.5-flash
+  api_key_env: GOOGLE_API_KEY
+  prompts_dir: /mnt/g/My Drive/DND/Code/Simple LLM Summary/Prompts
+  summaries_dir: /mnt/g/My Drive/DND/Summaries
+  raw_text_subdir: raw_txt
+  calls_per_minute: 5
+  skip_existing: true

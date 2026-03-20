@@ -43,12 +43,15 @@ GPU-accelerated speech transcription powered by faster-whisper plus direct pyann
 ## Configuration
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.
 Local runtime configs copied from `config/*.example.yaml` are intentionally gitignored.
+- Optional `postprocess` config adds Google-backed transcript analysis, campaign-overview updates, and final summaries after transcription completes.
+- Post-process outputs land under `postprocess.summaries_dir/Session N/`, with raw markdown/text in `raw_txt/` plus formatted DOCX exports in the session folder.
 
 ## Watch Mode
 - Keep two configs: `config/transcriber.yaml` for interactive CLI runs, and `config/transcriber.watch.yaml` (copy from `config/transcriber.watch.example.yaml`) for the background watcher.
 - Launch the watcher interactively with `uv run transcribe --watch --config config/transcriber.watch.yaml`. Use `watch_input` (config) or `--watch-input` (CLI) when the directory you monitor differs from the one-shot `input`.
 - Config sticks after startup; restart the process (Ctrl+C and rerun). If you installed it with `scripts/install_watch_service.sh`, restart via `systemctl --user restart transcriber-watch.service`.
 - The bundled `scripts/watch_service_runner.sh` now passes the watch config automatically; override with `WATCH_CONFIG=/path/to/custom.yaml`.
+- When `postprocess.enabled: true`, watch mode retries incomplete summary generation via a separate completion marker instead of retranscribing the audio.
 - Logs go to stdout by default. Manually: pipe to a file and tail it (`uv run … --watch | tee -a watch.log`, then `tail -f watch.log`). For the systemd user service, follow logs with `journalctl --user -u transcriber-watch.service -f -o cat`.
 
 ## Speaker Mapping
@@ -80,6 +83,7 @@ Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; f
 ## Inputs & Outputs
 - Inputs: single audio (.wav, .mp3, .ogg, .flac, .m4a), directory (recursive), or ZIP (multi-track safe extract)
 - Outputs in `outputs/<INPUT_BASE>/`: `.txt`, `.srt`, `.jsonl`, `.diarization.json`, `.exclusive_diarization.json`
+- Optional post-processing adds `Session N/raw_txt/*.txt` plus `Session N/*.docx` under the configured summaries directory.
 - Generated transcripts and evaluation artifacts are local-only and should live under `.outputs/` or `transcripts/`, both of which are gitignored.
 
 ## Caching

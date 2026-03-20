@@ -108,6 +108,77 @@ def test_run_transcribe_normalises_segment_payload(monkeypatch, tmp_path):
     )
 
 
+def test_run_transcribe_runs_postprocess_when_enabled(monkeypatch, tmp_path):
+    from transcriber import cli as cli_mod
+    from transcriber.postprocess import PostProcessConfig
+    from transcriber.transcript_pipeline import TranscriptPipelineResult
+
+    fake_input = tmp_path / "session_32.wav"
+    fake_input.write_text("dummy", encoding="utf-8")
+    transcript_dir = tmp_path / "outputs" / "session_32"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / "session_32.txt"
+    transcript_path.write_text("Speaker 00 00:00:00 hello world\n", encoding="utf-8")
+
+    called: dict[str, object] = {}
+
+    monkeypatch.setattr(cli_mod, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli_mod, "_preload_cudnn_libs", lambda: None)
+    monkeypatch.setattr(cli_mod, "cleanup_tmp", lambda *_args: None)
+    monkeypatch.setattr(cli_mod, "gather_inputs", lambda path: ([str(fake_input)], None))
+    monkeypatch.setattr("transcriber.diarization._detect_device", lambda: "cpu")
+
+    def fake_save_outputs(**kwargs):
+        return transcript_dir
+
+    def fake_transcribe_with_faster_pipeline(*args, **kwargs):
+        return TranscriptPipelineResult(
+            segments=[{"start": 0.0, "end": 1.0, "text": "hello world", "speaker": "SPEAKER_00"}],
+            diarization_segments=[],
+            exclusive_diarization_segments=[],
+            speaker_embeddings={},
+            metadata={},
+        )
+
+    def fake_run_postprocess(path, config):
+        called["path"] = Path(path)
+        called["config"] = config
+
+    monkeypatch.setattr(cli_mod, "save_outputs", fake_save_outputs)
+    monkeypatch.setattr(
+        "transcriber.transcript_pipeline.transcribe_with_faster_pipeline",
+        fake_transcribe_with_faster_pipeline,
+    )
+    monkeypatch.setattr(cli_mod, "run_postprocess_for_transcript", fake_run_postprocess)
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    cli_mod.run_transcribe(
+        input_path=str(fake_input),
+        backend="faster",
+        model_name="tiny",
+        compute_type="int8",
+        batch_size=4,
+        output_dir=str(tmp_path / "outputs"),
+        hf_cache_root=None,
+        speaker_bank_root=None,
+        write_srt=False,
+        write_jsonl=False,
+        auto_batch=False,
+        speaker_bank_config=None,
+        postprocess_config=postprocess_config,
+    )
+
+    assert called["path"] == transcript_path
+    assert called["config"] is postprocess_config
+
+
 def test_aggregate_segment_label_candidates_uses_full_candidate_evidence():
     from transcriber.cli import _aggregate_segment_label_candidates
 

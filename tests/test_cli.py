@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from transcriber import cli
+from transcriber.postprocess import PostProcessConfig
 from transcriber.speaker_bank import SpeakerBankConfig
 
 
@@ -130,3 +132,38 @@ def test_single_file_speaker_overrides_faster_labels(monkeypatch, tmp_path):
 
     segs = captured["per_file_segments"][0][1]
     assert segs[0]["speaker"] == "Narrator"
+
+
+def test_watch_task_kind_requests_postprocess_backfill(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 32"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    (transcript_root / "Session 32.txt").write_text("hello", encoding="utf-8")
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 32.wav"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+    )
+
+    assert action == "postprocess"
+
+    marker = Path(postprocess_config.summaries_dir) / "Session 32" / "session_32.postprocess.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+
+    assert (
+        cli._watch_task_kind(
+            str(tmp_path / "incoming" / "Session 32.wav"),
+            str(tmp_path / "outputs"),
+            postprocess_config,
+        )
+        is None
+    )

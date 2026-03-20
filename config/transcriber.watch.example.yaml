@@ -21,3 +21,15 @@ cache_root:
 local_files_only: false
 log_level: WARNING
 quiet: true
+
+# Optional LLM post-processing for completed transcripts.
+postprocess:
+  enabled: false
+  provider: google
+  model: gemini-2.5-flash
+  api_key_env: GOOGLE_API_KEY
+  prompts_dir: /mnt/g/My Drive/DND/Code/Simple LLM Summary/Prompts
+  summaries_dir: /mnt/g/My Drive/DND/Summaries
+  raw_text_subdir: raw_txt
+  calls_per_minute: 5
+  skip_existing: true

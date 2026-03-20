@@ -9,7 +9,7 @@ setup:
 	pre-commit install
 
 lint:
-	uv run ruff . && uv run black --check .
+	uv run ruff check . && uv run black --check .
 
 test:
 	uv run pytest -q

@@ -20,6 +20,12 @@ from tqdm import tqdm
 from .audio import cleanup_tmp, gather_inputs, is_audio_file, load_audio_mono
 from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
 from .consolidate import consolidate, save_outputs, choose_speaker
+from .postprocess import (
+    PostProcessConfig,
+    expected_completion_marker_path,
+    resolve_postprocess_config,
+    run_postprocess_for_transcript,
+)
 from .segment_classifier import (
     load_segment_classifier,
     train_segment_classifier_from_multitrack,
@@ -839,9 +845,7 @@ def _resolve_speaker_bank_settings(
                     repair_cfg.get("merge_same_raw_gap_seconds")
                 )
             if repair_cfg.get("snap_boundary_seconds") is not None:
-                config.repair_snap_boundary_seconds = float(
-                    repair_cfg.get("snap_boundary_seconds")
-                )
+                config.repair_snap_boundary_seconds = float(repair_cfg.get("snap_boundary_seconds"))
             if repair_cfg.get("max_overlap_trim_seconds") is not None:
                 config.repair_max_overlap_trim_seconds = float(
                     repair_cfg.get("max_overlap_trim_seconds")
@@ -863,9 +867,7 @@ def _resolve_speaker_bank_settings(
             if session_graph_cfg.get("enabled") is not None:
                 config.session_graph_enabled = bool(session_graph_cfg.get("enabled"))
             if session_graph_cfg.get("candidate_top_k") is not None:
-                config.session_graph_candidate_top_k = int(
-                    session_graph_cfg.get("candidate_top_k")
-                )
+                config.session_graph_candidate_top_k = int(session_graph_cfg.get("candidate_top_k"))
             if session_graph_cfg.get("candidate_floor") is not None:
                 config.session_graph_candidate_floor = float(
                     session_graph_cfg.get("candidate_floor")
@@ -873,13 +875,9 @@ def _resolve_speaker_bank_settings(
             if session_graph_cfg.get("knn") is not None:
                 config.session_graph_knn = int(session_graph_cfg.get("knn"))
             if session_graph_cfg.get("min_similarity") is not None:
-                config.session_graph_min_similarity = float(
-                    session_graph_cfg.get("min_similarity")
-                )
+                config.session_graph_min_similarity = float(session_graph_cfg.get("min_similarity"))
             if session_graph_cfg.get("anchor_weight") is not None:
-                config.session_graph_anchor_weight = float(
-                    session_graph_cfg.get("anchor_weight")
-                )
+                config.session_graph_anchor_weight = float(session_graph_cfg.get("anchor_weight"))
             if session_graph_cfg.get("temporal_weight") is not None:
                 config.session_graph_temporal_weight = float(
                     session_graph_cfg.get("temporal_weight")
@@ -1772,6 +1770,7 @@ def run_transcribe(
     cache_mode: str | None = None,
     device: str | None = None,
     speaker_bank_config: SpeakerBankConfig | None = None,
+    postprocess_config: PostProcessConfig | None = None,
 ) -> None:
     # Ensure cuDNN/cuBLAS split libraries are visible to the loader
     _ensure_cuda_libs_on_path()
@@ -2465,8 +2464,13 @@ def run_transcribe(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to copy speaker bank PCA plot to %s: %s", target_pca, exc)
 
-    # Clean up extracted ZIP contents (prototype parity)
+    # Clean up extracted ZIP contents before any downstream processing.
     cleanup_tmp(tmp_root)
+
+    transcript_output_path = Path(final_out_dir) / f"{base}.txt"
+    if postprocess_config:
+        run_postprocess_for_transcript(transcript_output_path, postprocess_config)
+
     logging.getLogger("transcriber").warning(
         "Done. Outputs in %s", str(Path(final_out_dir).resolve())
     )
@@ -2535,6 +2539,22 @@ def _expected_txt_path_for_input(input_path: str, output_dir: str) -> Path:
     return Path(output_dir) / base / f"{base}.txt"
 
 
+def _watch_task_kind(
+    input_path: str,
+    output_dir: str,
+    postprocess_config: PostProcessConfig | None,
+) -> str | None:
+    transcript_path = _expected_txt_path_for_input(input_path, output_dir)
+    if not transcript_path.exists():
+        return "transcribe"
+    if postprocess_config is None:
+        return None
+    marker_path = expected_completion_marker_path(transcript_path, postprocess_config)
+    if marker_path.exists():
+        return None
+    return "postprocess"
+
+
 def _iter_candidate_media(root_dir: Path) -> list[str]:
     ignore_dirs = {"quarantine", ".cache", "outputs"}
     files: list[str] = []
@@ -2563,6 +2583,7 @@ def watch_and_transcribe(
     args: argparse.Namespace,
     cfg: Dict,
     speaker_bank_config: Optional[SpeakerBankConfig],
+    postprocess_config: Optional[PostProcessConfig],
 ) -> None:
     """Continuously scan an input directory for new audio/ZIP files and transcribe them.
 
@@ -2592,12 +2613,25 @@ def watch_and_transcribe(
                 time.sleep(interval)
                 continue
             root = Path(input_root)
-            if not root.exists():
+            try:
+                root_exists = root.exists()
+            except OSError as exc:
+                logger.error("Watch: cannot access %s: %s; sleeping %ss", root, exc, interval)
+                time.sleep(interval)
+                continue
+            if not root_exists:
                 logger.error("Watch: path does not exist: %s; sleeping %ss", root, interval)
                 time.sleep(interval)
                 continue
-            if not root.is_dir():
-                if root.is_file():
+            try:
+                root_is_dir = root.is_dir()
+                root_is_file = root.is_file()
+            except OSError as exc:
+                logger.error("Watch: cannot inspect %s: %s; sleeping %ss", root, exc, interval)
+                time.sleep(interval)
+                continue
+            if not root_is_dir:
+                if root_is_file:
                     parent = root.parent
                     logger.warning("Watch: INPUT is a file; watching parent directory: %s", parent)
                     root = parent
@@ -2614,20 +2648,20 @@ def watch_and_transcribe(
             )
 
             candidates = _iter_candidate_media(root)
-            pending: list[str] = []
+            pending: list[tuple[str, str]] = []
             for f in candidates:
-                expected_txt = _expected_txt_path_for_input(f, args.output_dir)
-                if expected_txt.exists():
+                task_kind = _watch_task_kind(f, args.output_dir, postprocess_config)
+                if task_kind is None:
                     continue
                 if not _file_is_stable(Path(f), stability):
                     continue
-                pending.append(f)
+                pending.append((task_kind, f))
 
             if pending:
                 logger.warning(
-                    "Watch: found %d new file(s); processing (e.g., %s)",
+                    "Watch: found %d pending item(s); processing (e.g., %s)",
                     len(pending),
-                    Path(pending[0]).name,
+                    Path(pending[0][1]).name,
                 )
                 outer = tqdm(
                     pending,
@@ -2639,34 +2673,41 @@ def watch_and_transcribe(
                 )
                 quarantine_dir = root / "quarantine"
                 quarantine_dir.mkdir(parents=True, exist_ok=True)
-                for f in outer:
+                for task_kind, f in outer:
                     try:
-                        run_transcribe(
-                            input_path=f,
-                            backend=args.backend,
-                            model_name=args.model,
-                            compute_type=args.compute_type,
-                            batch_size=args.batch_size,
-                            output_dir=args.output_dir,
-                            speaker_mapping_path=args.speaker_mapping,
-                            min_speakers=args.min_speakers,
-                            max_speakers=args.max_speakers,
-                            write_srt=not args.no_srt,
-                            write_jsonl=not args.no_jsonl,
-                            hf_cache_root=args.hf_cache_root or args.cache_root,
-                            speaker_bank_root=args.speaker_bank_root,
-                            cache_mode=args.cache_mode,
-                            local_files_only=args.local_files_only,
-                            single_file_speaker=args.single_file_speaker,
-                            pyannote_on_cpu=args.pyannote_on_cpu,
-                            diarization_model=getattr(args, "diarization_model", None),
-                            quiet=args.quiet,
-                            auto_batch=args.auto_batch,
-                            device=(
-                                None if getattr(args, "device", "auto") == "auto" else args.device
-                            ),
-                            speaker_bank_config=speaker_bank_config,
-                        )
+                        if task_kind == "postprocess":
+                            transcript_path = _expected_txt_path_for_input(f, args.output_dir)
+                            run_postprocess_for_transcript(transcript_path, postprocess_config)
+                        else:
+                            run_transcribe(
+                                input_path=f,
+                                backend=args.backend,
+                                model_name=args.model,
+                                compute_type=args.compute_type,
+                                batch_size=args.batch_size,
+                                output_dir=args.output_dir,
+                                speaker_mapping_path=args.speaker_mapping,
+                                min_speakers=args.min_speakers,
+                                max_speakers=args.max_speakers,
+                                write_srt=not args.no_srt,
+                                write_jsonl=not args.no_jsonl,
+                                hf_cache_root=args.hf_cache_root or args.cache_root,
+                                speaker_bank_root=args.speaker_bank_root,
+                                cache_mode=args.cache_mode,
+                                local_files_only=args.local_files_only,
+                                single_file_speaker=args.single_file_speaker,
+                                pyannote_on_cpu=args.pyannote_on_cpu,
+                                diarization_model=getattr(args, "diarization_model", None),
+                                quiet=args.quiet,
+                                auto_batch=args.auto_batch,
+                                device=(
+                                    None
+                                    if getattr(args, "device", "auto") == "auto"
+                                    else args.device
+                                ),
+                                speaker_bank_config=speaker_bank_config,
+                                postprocess_config=postprocess_config,
+                            )
                     except BaseException as exc:  # noqa: PIE786
                         msg = str(exc)
                         logger.error("Watch: failed to process %s: %s", f, msg)
@@ -3050,6 +3091,7 @@ def main():
     _setup_logging_and_warnings(args.log_level, args.quiet)
 
     speaker_bank_config, train_only_path = _resolve_speaker_bank_settings(cfg, args)
+    postprocess_config = resolve_postprocess_config(cfg)
 
     # Input may come from config; ensure it exists
     effective_input = args.input or (cfg.get("input") if isinstance(cfg, dict) else None)
@@ -3081,7 +3123,7 @@ def main():
         # Keep the service resilient: never exit on uncaught exceptions
         while True:
             try:
-                watch_and_transcribe(args, cfg, speaker_bank_config)
+                watch_and_transcribe(args, cfg, speaker_bank_config, postprocess_config)
             except KeyboardInterrupt:
                 logging.getLogger("transcriber").warning("Watch mode interrupted by user; exiting.")
                 break
@@ -3114,6 +3156,7 @@ def main():
         quiet=args.quiet,
         device=None if args.device == "auto" else args.device,
         speaker_bank_config=speaker_bank_config,
+        postprocess_config=postprocess_config,
     )
 
 
