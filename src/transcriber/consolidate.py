@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
@@ -114,47 +115,41 @@ def save_outputs(
     write_jsonl_file: bool = True,
 ) -> Path:
     out_dir = Path(output_dir)
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        # Fallback: use local ./outputs if the requested path is not writable
-        local_fallback = Path.cwd() / "outputs"
-        local_fallback.mkdir(parents=True, exist_ok=True)
-        out_dir = local_fallback
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Prototype text format: "<speaker> <HH:MM:SS> <text>" one per line
     txt_path = out_dir / f"{base_stem}.txt"
-    with txt_path.open("w", encoding="utf-8") as handle:
-        for ts, speaker, text in consolidated_pairs:
-            handle.write(f"{speaker} {ts} {text}\n")
+    transcript_lines = [f"{speaker} {ts} {text}\n" for ts, speaker, text in consolidated_pairs]
+    _atomic_write_text(txt_path, "".join(transcript_lines))
 
     if write_jsonl_file:
         jsonl_path = out_dir / f"{base_stem}.jsonl"
-        with jsonl_path.open("w", encoding="utf-8") as handle:
-            for filename, segments in per_file_segments:
-                file_label = Path(filename).name
-                for segment in segments:
-                    record = {
-                        "file": file_label,
-                        "start": float(segment.get("start") or 0.0),
-                        "end": float(segment.get("end") or 0.0),
-                        "speaker": segment.get("speaker"),
-                        "text": segment.get("text", "").strip(),
-                    }
-                    for meta_key in (
-                        "speaker_raw",
-                        "speaker_match_score",
-                        "speaker_match_distance",
-                        "speaker_match_cluster",
-                        "speaker_match_source",
-                    ):
-                        if meta_key in segment:
-                            record[meta_key] = segment.get(meta_key)
-                    if "speaker_match" in segment:
-                        record["speaker_match"] = segment["speaker_match"]
-                    if "words" in segment:
-                        record["words"] = segment["words"]
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        jsonl_lines: list[str] = []
+        for filename, segments in per_file_segments:
+            file_label = Path(filename).name
+            for segment in segments:
+                record = {
+                    "file": file_label,
+                    "start": float(segment.get("start") or 0.0),
+                    "end": float(segment.get("end") or 0.0),
+                    "speaker": segment.get("speaker"),
+                    "text": segment.get("text", "").strip(),
+                }
+                for meta_key in (
+                    "speaker_raw",
+                    "speaker_match_score",
+                    "speaker_match_distance",
+                    "speaker_match_cluster",
+                    "speaker_match_source",
+                ):
+                    if meta_key in segment:
+                        record[meta_key] = segment.get(meta_key)
+                if "speaker_match" in segment:
+                    record["speaker_match"] = segment["speaker_match"]
+                if "words" in segment:
+                    record["words"] = segment["words"]
+                jsonl_lines.append(json.dumps(record, ensure_ascii=False) + "\n")
+        _atomic_write_text(jsonl_path, "".join(jsonl_lines))
 
     if write_srt_file:
         srt_path = out_dir / f"{base_stem}.srt"
@@ -174,7 +169,7 @@ def save_outputs(
             for idx, (start, end, text) in enumerate(ordered, start=1)
             if text
         ]
-        write_srt(srt_path, srt_payload)
+        _atomic_write_srt(srt_path, srt_payload)
 
     if diar_by_file:
         diar_path = out_dir / f"{base_stem}.diarization.json"
@@ -189,7 +184,7 @@ def save_outputs(
             ]
             for filename, entries in diar_by_file.items()
         }
-        diar_path.write_text(json.dumps(serialisable, indent=2), encoding="utf-8")
+        _atomic_write_text(diar_path, json.dumps(serialisable, indent=2))
 
     if exclusive_diar_by_file:
         exclusive_path = out_dir / f"{base_stem}.exclusive_diarization.json"
@@ -204,6 +199,49 @@ def save_outputs(
             ]
             for filename, entries in exclusive_diar_by_file.items()
         }
-        exclusive_path.write_text(json.dumps(serialisable, indent=2), encoding="utf-8")
+        _atomic_write_text(exclusive_path, json.dumps(serialisable, indent=2))
 
     return out_dir
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    tmp_path = Path(tmp_file.name)
+    try:
+        with tmp_file:
+            tmp_file.write(text)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_srt(
+    path: Path,
+    items: List[Tuple[int, float, float, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    tmp_path = Path(tmp_file.name)
+    try:
+        tmp_file.close()
+        write_srt(tmp_path, items)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)

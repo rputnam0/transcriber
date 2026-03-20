@@ -12,6 +12,13 @@ from typing import Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
+_SPLIT_SESSION_PATTERN = re.compile(
+    r"session[\s_-]*(?P<session>\d+)[\s_-]+(?P<part>\d+)_(?P<total>\d+)",
+    re.IGNORECASE,
+)
+_SESSION_PATTERN = re.compile(r"session[\s_-]*(?P<session>\d+)", re.IGNORECASE)
+_PLAIN_NUMBER_PATTERN = re.compile(r"(?<!\d)(\d+)(?!\d)")
+
 _PROMPT_FILES = {
     "analysis_system_prompt": "analysis_system_prompt.txt",
     "analysis_prompt_template": "analysis_prompt_template.txt",
@@ -61,9 +68,36 @@ class PostProcessPaths:
 
 
 @dataclass(frozen=True)
+class SessionIdentity:
+    session_number: int
+    part_number: int | None = None
+    part_total: int | None = None
+
+    @property
+    def is_split(self) -> bool:
+        return self.part_number is not None and self.part_total is not None
+
+
+@dataclass(frozen=True)
+class TranscriptBundle:
+    identity: SessionIdentity
+    transcript_path: Path
+    source_transcript_paths: tuple[Path, ...]
+    missing_parts: tuple[int, ...] = ()
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.missing_parts
+
+
+@dataclass(frozen=True)
 class PostProcessResult:
     paths: PostProcessPaths
     created_marker: bool
+
+
+class SplitSessionPendingError(RuntimeError):
+    """Raised when a split-session transcript is waiting for remaining parts."""
 
 
 class _GoogleTextGenerator:
@@ -175,7 +209,7 @@ def build_postprocess_paths(
     config: PostProcessConfig,
 ) -> PostProcessPaths:
     transcript = Path(transcript_path).expanduser()
-    session_number = _extract_session_number(transcript)
+    session_number = parse_session_identity(transcript).session_number
     session_prefix = f"session_{session_number}"
     session_folder = config.summaries_dir / f"Session {session_number}"
     raw_text_folder = session_folder / config.raw_text_subdir
@@ -208,9 +242,17 @@ def run_postprocess_for_transcript(
         logger.info("Post-process already complete for session %s", paths.session_number)
         return PostProcessResult(paths=paths, created_marker=False)
 
+    transcript_bundle = resolve_transcript_bundle(paths.transcript_path)
+    if not transcript_bundle.is_complete:
+        missing = ", ".join(str(part) for part in transcript_bundle.missing_parts)
+        raise SplitSessionPendingError(
+            f"Split-session transcript for session {paths.session_number} is waiting for part(s): "
+            f"{missing}"
+        )
+
     prompts = _load_prompt_texts(config.prompts_dir)
     previous_campaign_overview = _resolve_previous_campaign_overview(paths, config, prompts)
-    transcript_text = _read_text(paths.transcript_path)
+    transcript_text = _read_transcript_bundle(transcript_bundle)
     client = _GoogleTextGenerator(config)
 
     analysis_text, _ = _materialize_text_and_docx(
@@ -254,6 +296,9 @@ def run_postprocess_for_transcript(
         "model": config.model,
         "session_number": paths.session_number,
         "transcript_path": str(paths.transcript_path),
+        "source_transcript_paths": [
+            str(path) for path in transcript_bundle.source_transcript_paths
+        ],
         "previous_campaign_overview_path": str(
             _resolve_previous_campaign_overview_path(paths, config)
         ),
@@ -268,6 +313,11 @@ def run_postprocess_for_transcript(
         },
         "summary_preview": summary_text[:200],
     }
+    if transcript_bundle.identity.is_split:
+        metadata["split_session"] = {
+            "part_total": transcript_bundle.identity.part_total,
+            "source_transcript_count": len(transcript_bundle.source_transcript_paths),
+        }
     _atomic_write_text(paths.completion_marker, json.dumps(metadata, indent=2) + "\n")
     logger.warning(
         "Post-process complete for session %s (summary=%s)",
@@ -398,24 +448,85 @@ def save_markdown_as_docx(markdown_text: str, docx_path: str | Path) -> None:
     _atomic_save_docx(document, Path(docx_path).expanduser())
 
 
-def _extract_session_number(path: Path) -> int:
-    session_pattern = re.compile(r"session[\s_-]*(\d+)", re.IGNORECASE)
-    plain_number_pattern = re.compile(r"(?<!\d)(\d+)(?!\d)")
-    candidates = [
+def parse_session_identity(path: str | Path) -> SessionIdentity:
+    transcript_path = Path(path).expanduser()
+    for candidate in _session_identity_candidates(transcript_path):
+        split_match = _SPLIT_SESSION_PATTERN.search(candidate)
+        if split_match:
+            return SessionIdentity(
+                session_number=int(split_match.group("session")),
+                part_number=int(split_match.group("part")),
+                part_total=int(split_match.group("total")),
+            )
+    for candidate in _session_identity_candidates(transcript_path):
+        session_match = _SESSION_PATTERN.search(candidate)
+        if session_match:
+            return SessionIdentity(session_number=int(session_match.group("session")))
+    for candidate in _session_identity_candidates(transcript_path):
+        number_match = _PLAIN_NUMBER_PATTERN.search(candidate)
+        if number_match:
+            return SessionIdentity(session_number=int(number_match.group(1)))
+    raise ValueError(f"Could not infer a session number from transcript path: {transcript_path}")
+
+
+def resolve_transcript_bundle(path: str | Path) -> TranscriptBundle:
+    transcript_path = Path(path).expanduser()
+    identity = parse_session_identity(transcript_path)
+    if not identity.is_split:
+        return TranscriptBundle(
+            identity=identity,
+            transcript_path=transcript_path,
+            source_transcript_paths=(transcript_path,),
+        )
+
+    output_root = transcript_path.parent.parent
+    by_part: dict[int, Path] = {}
+    for candidate in sorted(output_root.rglob("*.txt")):
+        try:
+            candidate_identity = parse_session_identity(candidate)
+        except ValueError:
+            continue
+        if candidate_identity.session_number != identity.session_number:
+            continue
+        if not candidate_identity.is_split:
+            continue
+        if candidate_identity.part_total != identity.part_total:
+            continue
+        if _transcription_marker_status(candidate) not in (None, "completed"):
+            continue
+        assert candidate_identity.part_number is not None
+        by_part.setdefault(candidate_identity.part_number, candidate)
+
+    source_transcript_paths: list[Path] = []
+    missing_parts: list[int] = []
+    assert identity.part_total is not None
+    for part_number in range(1, identity.part_total + 1):
+        candidate = by_part.get(part_number)
+        if candidate is None:
+            missing_parts.append(part_number)
+            continue
+        source_transcript_paths.append(candidate)
+
+    return TranscriptBundle(
+        identity=identity,
+        transcript_path=transcript_path,
+        source_transcript_paths=tuple(source_transcript_paths),
+        missing_parts=tuple(missing_parts),
+    )
+
+
+def split_session_ready_for_postprocess(path: str | Path) -> bool:
+    return resolve_transcript_bundle(path).is_complete
+
+
+def _session_identity_candidates(path: Path) -> tuple[str, ...]:
+    grandparent_name = path.parent.parent.name if path.parent.parent != path.parent else ""
+    return (
         path.stem,
         path.name,
         path.parent.name,
-        path.parent.parent.name,
-    ]
-    for candidate in candidates:
-        match = session_pattern.search(candidate)
-        if match:
-            return int(match.group(1))
-    for candidate in candidates:
-        match = plain_number_pattern.search(candidate)
-        if match:
-            return int(match.group(1))
-    raise ValueError(f"Could not infer a session number from transcript path: {path}")
+        grandparent_name,
+    )
 
 
 def _load_prompt_texts(prompts_dir: Path) -> dict[str, str]:
@@ -573,6 +684,37 @@ def _read_text(path: Path) -> str:
         raise
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Failed to read {path}: {exc}") from exc
+
+
+def _read_transcript_bundle(bundle: TranscriptBundle) -> str:
+    chunks = []
+    for path in bundle.source_transcript_paths:
+        chunk = _read_text(path).strip()
+        if chunk:
+            chunks.append(chunk)
+    combined = "\n\n".join(chunks).strip()
+    if not combined:
+        raise RuntimeError(
+            f"Refusing to run post-processing with an empty transcript bundle for {bundle.transcript_path}"
+        )
+    return combined
+
+
+def _transcription_completion_marker_path(transcript_path: str | Path) -> Path:
+    transcript = Path(transcript_path).expanduser()
+    return transcript.parent / f"{transcript.stem}.transcribe.json"
+
+
+def _transcription_marker_status(transcript_path: str | Path) -> str | None:
+    marker_path = _transcription_completion_marker_path(transcript_path)
+    if not marker_path.exists():
+        return None
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "invalid"
+    status = str(payload.get("status") or "").strip().lower()
+    return status or "invalid"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

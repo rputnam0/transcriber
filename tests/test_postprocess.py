@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from docx import Document
 
 from transcriber import postprocess as postprocess_mod
@@ -32,6 +33,11 @@ def _write_prompt_files(prompts_dir: Path) -> None:
     prompts_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in prompt_files.items():
         (prompts_dir / filename).write_text(content, encoding="utf-8")
+
+
+def _write_transcription_marker(transcript_path: Path, status: str) -> None:
+    marker_path = transcript_path.parent / f"{transcript_path.stem}.transcribe.json"
+    marker_path.write_text(json.dumps({"status": status}), encoding="utf-8")
 
 
 def test_run_postprocess_for_transcript_creates_outputs(monkeypatch, tmp_path):
@@ -125,3 +131,138 @@ def test_postprocess_delay_seconds_allows_no_throttle(tmp_path):
     )
 
     assert config.delay_seconds == 0.0
+
+
+def test_split_session_ready_for_postprocess_requires_all_parts(tmp_path):
+    transcript_path = tmp_path / "transcripts" / "Session 28 1_2" / "Session 28 1_2.txt"
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text("part one", encoding="utf-8")
+
+    assert postprocess_mod.split_session_ready_for_postprocess(transcript_path) is False
+
+
+def test_split_session_ready_for_postprocess_requires_completed_part_markers(tmp_path):
+    transcript_root = tmp_path / "transcripts"
+    part_one = transcript_root / "Session 28 1_2" / "Session 28 1_2.txt"
+    part_two = transcript_root / "Session 28 2_2" / "Session 28 2_2.txt"
+    part_one.parent.mkdir(parents=True, exist_ok=True)
+    part_two.parent.mkdir(parents=True, exist_ok=True)
+    part_one.write_text("part one", encoding="utf-8")
+    part_two.write_text("part two", encoding="utf-8")
+    _write_transcription_marker(part_one, "completed")
+    _write_transcription_marker(part_two, "in_progress")
+
+    assert postprocess_mod.split_session_ready_for_postprocess(part_one) is False
+
+
+def test_run_postprocess_for_split_transcript_raises_until_all_parts_exist(monkeypatch, tmp_path):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    transcript_path = tmp_path / "transcripts" / "Session 28 1_2" / "Session 28 1_2.txt"
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text("part one", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+    )
+
+    class DummyGenerator:
+        def __init__(self, _cfg):
+            pytest.fail("Generator should not run while split-session parts are missing.")
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+
+    with pytest.raises(postprocess_mod.SplitSessionPendingError):
+        postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
+
+
+def test_run_postprocess_for_split_transcript_waits_for_completed_part_markers(
+    monkeypatch,
+    tmp_path,
+):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    transcript_root = tmp_path / "transcripts"
+    part_one = transcript_root / "Session 28 1_2" / "Session 28 1_2.txt"
+    part_two = transcript_root / "Session 28 2_2" / "Session 28 2_2.txt"
+    part_one.parent.mkdir(parents=True, exist_ok=True)
+    part_two.parent.mkdir(parents=True, exist_ok=True)
+    part_one.write_text("part one", encoding="utf-8")
+    part_two.write_text("part two", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+    _write_transcription_marker(part_one, "completed")
+    _write_transcription_marker(part_two, "in_progress")
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+    )
+
+    class DummyGenerator:
+        def __init__(self, _cfg):
+            pytest.fail("Generator should not run while a split-session part is still in progress.")
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+
+    with pytest.raises(postprocess_mod.SplitSessionPendingError):
+        postprocess_mod.run_postprocess_for_transcript(part_one, config)
+
+
+def test_run_postprocess_for_split_transcript_stitches_parts(monkeypatch, tmp_path):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    transcript_root = tmp_path / "transcripts"
+    part_one = transcript_root / "Session 28 1_2" / "Session 28 1_2.txt"
+    part_two = transcript_root / "Session 28 2_2" / "Session 28 2_2.txt"
+    part_one.parent.mkdir(parents=True, exist_ok=True)
+    part_two.parent.mkdir(parents=True, exist_ok=True)
+    part_one.write_text("Speaker 00 00:00:00 Part one\n", encoding="utf-8")
+    part_two.write_text("Speaker 00 00:05:00 Part two\n", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+    _write_transcription_marker(part_one, "completed")
+    _write_transcription_marker(part_two, "completed")
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+    )
+
+    class DummyGenerator:
+        calls: list[tuple[str, str | None]] = []
+
+        def __init__(self, cfg):
+            assert cfg is config
+
+        def generate(self, *, prompt: str, system_instruction: str | None = None) -> str:
+            self.calls.append((prompt, system_instruction))
+            if len(self.calls) == 1:
+                assert "Part one" in prompt
+                assert "Part two" in prompt
+                assert prompt.index("Part one") < prompt.index("Part two")
+                return "# Analysis\n\nSplit session stitched."
+            if len(self.calls) == 2:
+                return "<campaign_overview># Campaign Overview\n\nUpdated.</campaign_overview>"
+            return "<Summary># Summary\n\nCombined session.</Summary>"
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+
+    result = postprocess_mod.run_postprocess_for_transcript(part_two, config)
+
+    assert result.paths.session_folder == summaries_dir / "Session 28"
+    assert result.paths.summary_txt == (
+        summaries_dir / "Session 28" / "raw_txt" / "session_28_summary_output.txt"
+    )
+    marker = json.loads(result.paths.completion_marker.read_text(encoding="utf-8"))
+    assert marker["source_transcript_paths"] == [str(part_one), str(part_two)]
+    assert marker["split_session"] == {"part_total": 2, "source_transcript_count": 2}

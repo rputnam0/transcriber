@@ -138,6 +138,7 @@ def test_watch_task_kind_requests_postprocess_backfill(tmp_path):
     transcript_root = tmp_path / "outputs" / "Session 32"
     transcript_root.mkdir(parents=True, exist_ok=True)
     (transcript_root / "Session 32.txt").write_text("hello", encoding="utf-8")
+    (transcript_root / "Session 32.jsonl").write_text("{}", encoding="utf-8")
 
     postprocess_config = PostProcessConfig(
         enabled=True,
@@ -235,6 +236,131 @@ def test_watch_task_kind_skips_historical_transcript_without_backfill(tmp_path):
         str(tmp_path / "Audio" / "Session 7" / "ALgqyzm1qUOD_data.zip"),
         str(output_dir),
         postprocess_config,
+    )
+
+    assert action is None
+
+
+def test_watch_task_kind_retries_postprocess_for_marked_transcript(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 44"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Session 44.txt"
+    transcript_path.write_text("hello", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 44.wav"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+        watch_postprocess_backfill=False,
+    )
+
+    assert action == "postprocess"
+
+
+def test_watch_task_kind_retranscribes_expected_transcript_with_incomplete_marker(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 51"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Session 51.txt"
+    transcript_path.write_text("partial", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"in_progress"}',
+        encoding="utf-8",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 51.wav"),
+        str(tmp_path / "outputs"),
+        None,
+    )
+
+    assert action == "transcribe"
+
+
+def test_watch_task_kind_skips_legacy_expected_transcript_without_marker(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 52"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    (transcript_root / "Session 52.txt").write_text("done", encoding="utf-8")
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 52.wav"),
+        str(tmp_path / "outputs"),
+        None,
+    )
+
+    assert action is None
+
+
+def test_watch_task_kind_waits_for_all_split_parts_before_postprocess(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 28 1_2"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Session 28 1_2.txt"
+    transcript_path.write_text("part one", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 28 1_2.wav"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+        watch_postprocess_backfill=False,
+    )
+
+    assert action is None
+
+
+def test_watch_task_kind_waits_for_completed_split_part_markers(tmp_path):
+    part_one_root = tmp_path / "outputs" / "Session 28 1_2"
+    part_two_root = tmp_path / "outputs" / "Session 28 2_2"
+    part_one_root.mkdir(parents=True, exist_ok=True)
+    part_two_root.mkdir(parents=True, exist_ok=True)
+    part_one_path = part_one_root / "Session 28 1_2.txt"
+    part_two_path = part_two_root / "Session 28 2_2.txt"
+    part_one_path.write_text("part one", encoding="utf-8")
+    part_two_path.write_text("part two", encoding="utf-8")
+    cli._transcription_completion_marker_path(part_one_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+    cli._transcription_completion_marker_path(part_two_path).write_text(
+        '{"status":"in_progress"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 28 1_2.wav"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+        watch_postprocess_backfill=False,
     )
 
     assert action is None

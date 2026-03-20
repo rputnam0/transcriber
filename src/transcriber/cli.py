@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import math
 import platform
 import numpy as np
@@ -23,9 +24,11 @@ from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
 from .consolidate import consolidate, save_outputs, choose_speaker
 from .postprocess import (
     PostProcessConfig,
+    SplitSessionPendingError,
     expected_completion_marker_path,
     resolve_postprocess_config,
     run_postprocess_for_transcript,
+    split_session_ready_for_postprocess,
 )
 from .segment_classifier import (
     load_segment_classifier,
@@ -2436,6 +2439,13 @@ def run_transcribe(
     if effective_output_dir.name != base:
         effective_output_dir = effective_output_dir / base
 
+    transcript_output_path = Path(effective_output_dir) / f"{base}.txt"
+    _write_transcription_completion_marker(
+        transcript_output_path,
+        input_path=input_path,
+        status="in_progress",
+    )
+
     final_out_dir = save_outputs(
         base_stem=base,
         output_dir=str(effective_output_dir),
@@ -2467,11 +2477,24 @@ def run_transcribe(
                 logger.warning("Failed to copy speaker bank PCA plot to %s: %s", target_pca, exc)
 
     # Clean up extracted ZIP contents before any downstream processing.
+    transcript_output_path = Path(final_out_dir) / f"{base}.txt"
+    if transcript_output_path.exists():
+        _write_transcription_completion_marker(
+            transcript_output_path,
+            input_path=input_path,
+            status="completed",
+        )
+    else:
+        logger.warning("Transcript output missing after save_outputs: %s", transcript_output_path)
+
+    # Clean up extracted ZIP contents before any downstream processing.
     cleanup_tmp(tmp_root)
 
-    transcript_output_path = Path(final_out_dir) / f"{base}.txt"
     if postprocess_config:
-        run_postprocess_for_transcript(transcript_output_path, postprocess_config)
+        try:
+            run_postprocess_for_transcript(transcript_output_path, postprocess_config)
+        except SplitSessionPendingError as exc:
+            logger.warning("Post-process deferred for %s: %s", transcript_output_path, exc)
 
     logging.getLogger("transcriber").warning(
         "Done. Outputs in %s", str(Path(final_out_dir).resolve())
@@ -2541,6 +2564,17 @@ def _expected_txt_path_for_input(input_path: str, output_dir: str) -> Path:
     return Path(output_dir) / base / f"{base}.txt"
 
 
+def _transcription_completion_marker_path(transcript_path: str | Path) -> Path:
+    transcript = Path(transcript_path)
+    return transcript.parent / f"{transcript.stem}.transcribe.json"
+
+
+def _expected_transcription_marker_path_for_input(input_path: str, output_dir: str) -> Path:
+    return _transcription_completion_marker_path(
+        _expected_txt_path_for_input(input_path, output_dir)
+    )
+
+
 def _extract_session_keys(text: str) -> set[str]:
     keys: set[str] = set()
     for match in _SESSION_KEY_RE.finditer(text):
@@ -2553,10 +2587,13 @@ def _normalize_watch_name(text: str) -> str:
     return " ".join(text.replace("_", " ").lower().split())
 
 
-def _find_existing_transcript_for_input(input_path: str, output_dir: str) -> Path | None:
+def _find_existing_transcript_match_for_input(
+    input_path: str,
+    output_dir: str,
+) -> tuple[Path, bool] | None:
     expected = _expected_txt_path_for_input(input_path, output_dir)
     if expected.exists():
-        return expected
+        return expected, True
 
     output_root = Path(output_dir)
     if not output_root.exists():
@@ -2574,10 +2611,63 @@ def _find_existing_transcript_for_input(input_path: str, output_dir: str) -> Pat
         for part in rel.parts:
             transcript_keys.update(_extract_session_keys(part))
         if input_keys and transcript_keys.intersection(input_keys):
-            return transcript_path
+            return transcript_path, False
         if not input_keys and _normalize_watch_name(transcript_path.stem) == normalized_stem:
-            return transcript_path
+            return transcript_path, False
     return None
+
+
+def _find_existing_transcript_for_input(input_path: str, output_dir: str) -> Path | None:
+    match = _find_existing_transcript_match_for_input(input_path, output_dir)
+    return match[0] if match else None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    tmp_path = Path(tmp_file.name)
+    try:
+        with tmp_file:
+            tmp_file.write(text)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _write_transcription_completion_marker(
+    transcript_path: Path,
+    *,
+    input_path: str,
+    status: str = "completed",
+) -> None:
+    marker_path = _transcription_completion_marker_path(transcript_path)
+    metadata = {
+        "status": status,
+        "input_path": str(Path(input_path).expanduser()),
+        "transcript_path": str(transcript_path),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _atomic_write_text(marker_path, json.dumps(metadata, indent=2) + "\n")
+
+
+def _transcription_marker_status(transcript_path: Path) -> str | None:
+    marker_path = _transcription_completion_marker_path(transcript_path)
+    if not marker_path.exists():
+        return None
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "invalid"
+    status = str(payload.get("status") or "").strip().lower()
+    return status or "invalid"
 
 
 def _watch_task_kind(
@@ -2586,15 +2676,26 @@ def _watch_task_kind(
     postprocess_config: PostProcessConfig | None,
     watch_postprocess_backfill: bool = False,
 ) -> str | None:
-    transcript_path = _find_existing_transcript_for_input(input_path, output_dir)
-    if transcript_path is None:
+    transcript_match = _find_existing_transcript_match_for_input(input_path, output_dir)
+    if transcript_match is None:
         return "transcribe"
-    if postprocess_config is None or not watch_postprocess_backfill:
+
+    transcript_path, is_expected_path = transcript_match
+    transcription_marker_status = _transcription_marker_status(transcript_path)
+    if is_expected_path and transcription_marker_status not in (None, "completed"):
+        return "transcribe"
+
+    if postprocess_config is None:
         return None
+
     marker_path = expected_completion_marker_path(transcript_path, postprocess_config)
     if marker_path.exists():
         return None
-    return "postprocess"
+    if not split_session_ready_for_postprocess(transcript_path):
+        return None
+    if transcription_marker_status == "completed" or watch_postprocess_backfill:
+        return "postprocess"
+    return None
 
 
 def _iter_candidate_media(
@@ -2737,7 +2838,9 @@ def watch_and_transcribe(
                 for task_kind, f in outer:
                     try:
                         if task_kind == "postprocess":
-                            transcript_path = _find_existing_transcript_for_input(f, args.output_dir)
+                            transcript_path = _find_existing_transcript_for_input(
+                                f, args.output_dir
+                            )
                             if transcript_path is None:
                                 logger.warning(
                                     "Watch: skipping postprocess for %s because no transcript was found",
