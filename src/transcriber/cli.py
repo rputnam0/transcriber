@@ -2478,7 +2478,7 @@ def run_transcribe(
 
     # Clean up extracted ZIP contents before any downstream processing.
     transcript_output_path = Path(final_out_dir) / f"{base}.txt"
-    if transcript_output_path.exists():
+    if _path_exists_with_retry(transcript_output_path):
         _write_transcription_completion_marker(
             transcript_output_path,
             input_path=input_path,
@@ -2640,6 +2640,21 @@ def _atomic_write_text(path: Path, text: str) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+
+
+def _path_exists_with_retry(
+    path: Path,
+    *,
+    attempts: int = 5,
+    delay_seconds: float = 0.1,
+) -> bool:
+    attempts = max(1, attempts)
+    for attempt in range(attempts):
+        if path.exists():
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
 
 
 def _write_transcription_completion_marker(
