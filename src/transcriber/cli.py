@@ -5,6 +5,7 @@ import json
 import sys
 import logging
 import os
+import re
 import shutil
 import math
 import platform
@@ -41,6 +42,7 @@ from .segments import (
 
 # Keep global references to preloaded CUDA libraries so they aren't dlclosed
 _CUDA_PRELOAD_HANDLES: list = []
+_SESSION_KEY_RE = re.compile(r"session\s*([0-9]+(?:\s+[0-9]+_[0-9]+)?)", re.IGNORECASE)
 
 
 def _ensure_cuda_libs_on_path() -> None:
@@ -2539,15 +2541,55 @@ def _expected_txt_path_for_input(input_path: str, output_dir: str) -> Path:
     return Path(output_dir) / base / f"{base}.txt"
 
 
+def _extract_session_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for match in _SESSION_KEY_RE.finditer(text):
+        session_id = " ".join(match.group(1).strip().lower().split())
+        keys.add(f"session {session_id}")
+    return keys
+
+
+def _normalize_watch_name(text: str) -> str:
+    return " ".join(text.replace("_", " ").lower().split())
+
+
+def _find_existing_transcript_for_input(input_path: str, output_dir: str) -> Path | None:
+    expected = _expected_txt_path_for_input(input_path, output_dir)
+    if expected.exists():
+        return expected
+
+    output_root = Path(output_dir)
+    if not output_root.exists():
+        return None
+
+    input_obj = Path(input_path)
+    input_keys: set[str] = set()
+    for part in (*input_obj.parts, input_obj.stem):
+        input_keys.update(_extract_session_keys(part))
+
+    normalized_stem = _normalize_watch_name(input_obj.stem)
+    for transcript_path in sorted(output_root.rglob("*.txt")):
+        transcript_keys: set[str] = set()
+        rel = transcript_path.relative_to(output_root)
+        for part in rel.parts:
+            transcript_keys.update(_extract_session_keys(part))
+        if input_keys and transcript_keys.intersection(input_keys):
+            return transcript_path
+        if not input_keys and _normalize_watch_name(transcript_path.stem) == normalized_stem:
+            return transcript_path
+    return None
+
+
 def _watch_task_kind(
     input_path: str,
     output_dir: str,
     postprocess_config: PostProcessConfig | None,
+    watch_postprocess_backfill: bool = False,
 ) -> str | None:
-    transcript_path = _expected_txt_path_for_input(input_path, output_dir)
-    if not transcript_path.exists():
+    transcript_path = _find_existing_transcript_for_input(input_path, output_dir)
+    if transcript_path is None:
         return "transcribe"
-    if postprocess_config is None:
+    if postprocess_config is None or not watch_postprocess_backfill:
         return None
     marker_path = expected_completion_marker_path(transcript_path, postprocess_config)
     if marker_path.exists():
@@ -2656,13 +2698,20 @@ def watch_and_transcribe(
             )
 
             watch_exclude_globs = []
+            watch_postprocess_backfill = False
             if isinstance(cfg, dict):
                 watch_exclude_globs = list(cfg.get("watch_exclude_globs") or [])
+                watch_postprocess_backfill = bool(cfg.get("watch_postprocess_backfill", False))
 
             candidates = _iter_candidate_media(root, watch_exclude_globs)
             pending: list[tuple[str, str]] = []
             for f in candidates:
-                task_kind = _watch_task_kind(f, args.output_dir, postprocess_config)
+                task_kind = _watch_task_kind(
+                    f,
+                    args.output_dir,
+                    postprocess_config,
+                    watch_postprocess_backfill=watch_postprocess_backfill,
+                )
                 if task_kind is None:
                     continue
                 if not _file_is_stable(Path(f), stability):
@@ -2688,7 +2737,13 @@ def watch_and_transcribe(
                 for task_kind, f in outer:
                     try:
                         if task_kind == "postprocess":
-                            transcript_path = _expected_txt_path_for_input(f, args.output_dir)
+                            transcript_path = _find_existing_transcript_for_input(f, args.output_dir)
+                            if transcript_path is None:
+                                logger.warning(
+                                    "Watch: skipping postprocess for %s because no transcript was found",
+                                    f,
+                                )
+                                continue
                             run_postprocess_for_transcript(transcript_path, postprocess_config)
                         else:
                             run_transcribe(

@@ -18,6 +18,11 @@ output_dir: outputs
 watch_exclude_globs:
   - "**/[0-9]-*.wav"
 
+# When false, watch mode skips older files that already have a transcript instead
+# of backfilling LLM post-processing for them. New transcriptions still run
+# post-processing immediately after transcription.
+watch_postprocess_backfill: false
+
 # Speaker mapping can still be used to rename tracks when known.
 speaker_mapping: config/speaker_mapping.example.yaml
 

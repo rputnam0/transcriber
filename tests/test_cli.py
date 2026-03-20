@@ -151,6 +151,7 @@ def test_watch_task_kind_requests_postprocess_backfill(tmp_path):
         str(tmp_path / "incoming" / "Session 32.wav"),
         str(tmp_path / "outputs"),
         postprocess_config,
+        watch_postprocess_backfill=True,
     )
 
     assert action == "postprocess"
@@ -164,6 +165,7 @@ def test_watch_task_kind_requests_postprocess_backfill(tmp_path):
             str(tmp_path / "incoming" / "Session 32.wav"),
             str(tmp_path / "outputs"),
             postprocess_config,
+            watch_postprocess_backfill=True,
         )
         is None
     )
@@ -183,3 +185,56 @@ def test_iter_candidate_media_honors_exclude_globs(tmp_path):
     assert str(root / "Session 62.zip") in found
     assert str(session_dir / "Session 9.wav") in found
     assert str(session_dir / "1-joeeeenathan_0.wav") not in found
+
+
+def test_find_existing_transcript_for_input_matches_historical_names(tmp_path):
+    output_dir = tmp_path / "Transcripts"
+    transcript_dir = output_dir / "Session 13"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "Session 13 Transcript.txt"
+    transcript.write_text("done", encoding="utf-8")
+
+    found = cli._find_existing_transcript_for_input(
+        str(tmp_path / "Audio" / "Session 13.zip"),
+        str(output_dir),
+    )
+
+    assert found == transcript
+
+
+def test_find_existing_transcript_for_nested_session_input(tmp_path):
+    output_dir = tmp_path / "Transcripts"
+    transcript_dir = output_dir / "Session 4"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "Copy of Session 4_transcription.txt"
+    transcript.write_text("done", encoding="utf-8")
+
+    found = cli._find_existing_transcript_for_input(
+        str(tmp_path / "Audio" / "Session 4" / "Raw Audio.zip"),
+        str(output_dir),
+    )
+
+    assert found == transcript
+
+
+def test_watch_task_kind_skips_historical_transcript_without_backfill(tmp_path):
+    output_dir = tmp_path / "Transcripts"
+    transcript_dir = output_dir / "Session 7"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "Session 7_transcription.txt").write_text("done", encoding="utf-8")
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "Audio" / "Session 7" / "ALgqyzm1qUOD_data.zip"),
+        str(output_dir),
+        postprocess_config,
+    )
+
+    assert action is None
