@@ -22,8 +22,12 @@ export PATH="$BIN_DIR:${PATH:-}"
 export PYTHONUNBUFFERED=1
 
 MOUNT_GUARD_PID=""
+TRANSCRIBE_PID=""
 
 cleanup() {
+  if [[ -n "$TRANSCRIBE_PID" ]]; then
+    kill "$TRANSCRIBE_PID" 2>/dev/null || true
+  fi
   if [[ -n "$MOUNT_GUARD_PID" ]]; then
     kill "$MOUNT_GUARD_PID" 2>/dev/null || true
   fi
@@ -94,4 +98,6 @@ fi
 
 start_mount_guard
 
-exec "$TRANSCRIBE_BIN" "${CONFIG_ARGS[@]}" audio/ --watch "$@"
+"$TRANSCRIBE_BIN" "${CONFIG_ARGS[@]}" audio/ --watch "$@" &
+TRANSCRIBE_PID=$!
+wait "$TRANSCRIBE_PID"
