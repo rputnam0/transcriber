@@ -75,8 +75,42 @@ DEFAULT_CURRENT_WINNER = {
     "classifier_n_neighbors": 7,
     "classifier_min_margin": 0.03,
     "threshold": 0.40,
+    "match_aggregation": "mean",
     "min_segments_per_label": 2,
 }
+
+
+def _recipe_int(recipe: Mapping[str, object], key: str, default: int) -> int:
+    value = recipe.get(key)
+    if value is None:
+        return int(default)
+    return int(value)
+
+
+def _recipe_pair_value_map(
+    recipe: Mapping[str, object],
+    key: str,
+) -> Dict[Tuple[str, str], float]:
+    parsed: Dict[Tuple[str, str], float] = {}
+    for item in list(recipe.get(key) or []):
+        if not isinstance(item, Mapping):
+            continue
+        pair = list(item.get("pair") or [])
+        if len(pair) != 2:
+            continue
+        try:
+            value = float(item.get("value"))
+        except (TypeError, ValueError):
+            continue
+        parsed[(str(pair[0]), str(pair[1]))] = value
+    return parsed
+
+
+def _recipe_float(recipe: Mapping[str, object], key: str, default: float) -> float:
+    value = recipe.get(key)
+    if value is None:
+        return float(default)
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -152,7 +186,9 @@ def _write_eval_config(
     speaker_mapping_path: Path,
     classifier_min_margin: float,
     threshold: float,
+    match_aggregation: str,
     min_segments_per_label: int,
+    speaker_bank_overrides: Optional[Mapping[str, object]] = None,
 ) -> Path:
     payload = dict(base_config)
     payload["hf_cache_root"] = str(hf_cache_root)
@@ -164,12 +200,25 @@ def _write_eval_config(
     speaker_bank_cfg["path"] = profile_name
     speaker_bank_cfg["threshold"] = float(threshold)
     speaker_bank_cfg["match_per_segment"] = True
-    speaker_bank_cfg["match_aggregation"] = "mean"
+    speaker_bank_cfg["match_aggregation"] = str(match_aggregation or "mean")
     speaker_bank_cfg["min_segments_per_label"] = int(min_segments_per_label)
     classifier_cfg = dict(speaker_bank_cfg.get("classifier") or {})
     classifier_cfg["min_confidence"] = 0.0
     classifier_cfg["min_margin"] = float(classifier_min_margin)
     speaker_bank_cfg["classifier"] = classifier_cfg
+    for key, value in dict(speaker_bank_overrides or {}).items():
+        if key == "classifier":
+            classifier_override = dict(value or {})
+            merged_classifier = dict(speaker_bank_cfg.get("classifier") or {})
+            merged_classifier.update(classifier_override)
+            speaker_bank_cfg["classifier"] = merged_classifier
+            continue
+        if key in {"repair", "session_graph"} and isinstance(value, Mapping):
+            merged_nested = dict(speaker_bank_cfg.get(key) or {})
+            merged_nested.update(dict(value))
+            speaker_bank_cfg[key] = merged_nested
+            continue
+        speaker_bank_cfg[key] = value
     payload["speaker_bank"] = speaker_bank_cfg
     return _json_write(output_path, payload)
 
@@ -238,6 +287,19 @@ def _summarize_eval(summary: Mapping[str, object]) -> Dict[str, object]:
     results = list(summary.get("results") or [])
     accuracy_values = [float(item.get("metrics", {}).get("accuracy") or 0.0) for item in results]
     coverage_values = [float(item.get("metrics", {}).get("coverage") or 0.0) for item in results]
+    matched_accuracy_values = [
+        float(item.get("metrics", {}).get("matched_accuracy") or 0.0) for item in results
+    ]
+    pre_graph_accuracy_values = [
+        float(item.get("metrics_pre_graph", {}).get("accuracy") or 0.0)
+        for item in results
+        if item.get("metrics_pre_graph") is not None
+    ]
+    pre_graph_matched_accuracy_values = [
+        float(item.get("metrics_pre_graph", {}).get("matched_accuracy") or 0.0)
+        for item in results
+        if item.get("metrics_pre_graph") is not None
+    ]
     confusion: Dict[str, Dict[str, int]] = {}
     for item in results:
         for speaker, counts in dict(item.get("metrics", {}).get("confusion") or {}).items():
@@ -247,6 +309,21 @@ def _summarize_eval(summary: Mapping[str, object]) -> Dict[str, object]:
     return {
         "mean_accuracy": (sum(accuracy_values) / len(accuracy_values)) if accuracy_values else 0.0,
         "mean_coverage": (sum(coverage_values) / len(coverage_values)) if coverage_values else 0.0,
+        "mean_matched_accuracy": (
+            (sum(matched_accuracy_values) / len(matched_accuracy_values))
+            if matched_accuracy_values
+            else 0.0
+        ),
+        "mean_accuracy_pre_graph": (
+            (sum(pre_graph_accuracy_values) / len(pre_graph_accuracy_values))
+            if pre_graph_accuracy_values
+            else None
+        ),
+        "mean_matched_accuracy_pre_graph": (
+            (sum(pre_graph_matched_accuracy_values) / len(pre_graph_matched_accuracy_values))
+            if pre_graph_matched_accuracy_values
+            else None
+        ),
         "confusion": confusion,
     }
 
@@ -1031,6 +1108,10 @@ def prepare_baseline(
     base_balance_summary = dict(base_training_summary.get("balance") or {})
 
     current_winner = {**DEFAULT_CURRENT_WINNER, **dict(recipe.get("current_winner") or {})}
+    speaker_bank_overrides = {
+        **dict(recipe.get("speaker_bank_overrides") or {}),
+        **dict(current_winner.get("speaker_bank_overrides") or {}),
+    }
     eval_window_seconds = float(recipe.get("eval_window_seconds") or 300.0)
     eval_hop_seconds = float(recipe.get("eval_hop_seconds") or 60.0)
     eval_top_k = int(recipe.get("eval_top_k") or 3)
@@ -1042,7 +1123,9 @@ def prepare_baseline(
         "min_speakers": eval_min_speakers,
         "threshold": float(current_winner["threshold"]),
         "classifier_min_margin": float(current_winner["classifier_min_margin"]),
+        "match_aggregation": str(current_winner["match_aggregation"]),
         "min_segments_per_label": int(current_winner["min_segments_per_label"]),
+        "speaker_bank_overrides": speaker_bank_overrides,
     }
     short_spec, short_window = _derive_short_segment_slice(
         eval_specs,
@@ -1070,11 +1153,31 @@ def prepare_baseline(
         "eval_params": eval_params,
         "canonical_suite": canonical_suite,
         "seed_pairs": list(recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]),
-        "top_confusion_pairs": int(recipe.get("top_confusion_pairs") or 5),
-        "hard_negative_max_margin": float(recipe.get("hard_negative_max_margin") or 0.12),
-        "hard_negative_min_dominant_share": float(recipe.get("hard_negative_min_dominant_share") or 0.55),
-        "hard_negative_per_pair_cap": int(recipe.get("hard_negative_per_pair_cap") or 75),
-        "hard_negative_max_fraction": float(recipe.get("hard_negative_max_fraction") or 0.20),
+        "top_confusion_pairs": _recipe_int(recipe, "top_confusion_pairs", 5),
+        "hard_negative_max_margin": _recipe_float(recipe, "hard_negative_max_margin", 0.12),
+        "hard_negative_min_dominant_share": _recipe_float(
+            recipe, "hard_negative_min_dominant_share", 0.55
+        ),
+        "hard_negative_per_pair_cap": _recipe_int(recipe, "hard_negative_per_pair_cap", 75),
+        "hard_negative_pair_caps": {
+            f"{left}::{right}": int(value)
+            for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
+        },
+        "hard_negative_per_speaker_cap": (
+            int(recipe["hard_negative_per_speaker_cap"])
+            if recipe.get("hard_negative_per_speaker_cap") is not None
+            else None
+        ),
+        "hard_negative_max_fraction": _recipe_float(recipe, "hard_negative_max_fraction", 0.20),
+        "hard_negative_style_profile_name": str(
+            recipe.get("hard_negative_style_profile_name") or "session61_like"
+        ),
+        "hard_negative_style_score_threshold": _recipe_float(
+            recipe, "hard_negative_style_score_threshold", 0.70
+        ),
+        "hard_negative_min_style_samples_per_pair": _recipe_int(
+            recipe, "hard_negative_min_style_samples_per_pair", 40
+        ),
     }
     hard_negative_reused, hard_negative_outputs = _maybe_reuse_stage("hard_negatives", hard_negative_signature)
     if not hard_negative_reused:
@@ -1132,7 +1235,9 @@ def prepare_baseline(
             speaker_mapping_path=speaker_mapping_path,
             classifier_min_margin=float(current_winner["classifier_min_margin"]),
             threshold=float(current_winner["threshold"]),
+            match_aggregation=str(current_winner["match_aggregation"]),
             min_segments_per_label=int(current_winner["min_segments_per_label"]),
+            speaker_bank_overrides=speaker_bank_overrides,
         )
         mining_eval: Dict[str, object] = {}
         mining_eval_summaries: List[Dict[str, object]] = []
@@ -1195,11 +1300,29 @@ def prepare_baseline(
             seed_pairs=list(
                 recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]
             ),
-            top_confusion_pairs=int(recipe.get("top_confusion_pairs") or 5),
-            max_eval_margin=float(recipe.get("hard_negative_max_margin") or 0.12),
-            min_mixed_dominant_share=float(recipe.get("hard_negative_min_dominant_share") or 0.55),
-            per_pair_cap=int(recipe.get("hard_negative_per_pair_cap") or 75),
-            max_fraction=float(recipe.get("hard_negative_max_fraction") or 0.20),
+            top_confusion_pairs=_recipe_int(recipe, "top_confusion_pairs", 5),
+            max_eval_margin=_recipe_float(recipe, "hard_negative_max_margin", 0.12),
+            min_mixed_dominant_share=_recipe_float(recipe, "hard_negative_min_dominant_share", 0.55),
+            per_pair_cap=_recipe_int(recipe, "hard_negative_per_pair_cap", 75),
+            pair_caps={
+                (left, right): int(value)
+                for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
+            },
+            per_speaker_cap=(
+                int(recipe["hard_negative_per_speaker_cap"])
+                if recipe.get("hard_negative_per_speaker_cap") is not None
+                else None
+            ),
+            max_fraction=_recipe_float(recipe, "hard_negative_max_fraction", 0.20),
+            style_profile_name=str(
+                recipe.get("hard_negative_style_profile_name") or "session61_like"
+            ),
+            style_score_threshold=_recipe_float(
+                recipe, "hard_negative_style_score_threshold", 0.70
+            ),
+            min_style_samples_per_pair=_recipe_int(
+                recipe, "hard_negative_min_style_samples_per_pair", 40
+            ),
         )
         hard_negative_manifest = None
         hard_negative_dir = base_output_root / "artifacts" / "datasets" / "hard_negative"
@@ -1480,7 +1603,9 @@ def prepare_baseline(
             speaker_mapping_path=speaker_mapping_path,
             classifier_min_margin=float(current_winner["classifier_min_margin"]),
             threshold=float(current_winner["threshold"]),
+            match_aggregation=str(current_winner["match_aggregation"]),
             min_segments_per_label=int(current_winner["min_segments_per_label"]),
+            speaker_bank_overrides=speaker_bank_overrides,
         )
         canonical_eval: Dict[str, object] = {}
         eval_summaries: List[Dict[str, object]] = []
@@ -1541,6 +1666,7 @@ def prepare_baseline(
             "hard_negative_dataset_dir": str(hard_negative_dir) if hard_negative_manifest else None,
             "model_family": str(current_winner["model_name"]),
             "classifier": current_winner,
+            "speaker_bank_overrides": speaker_bank_overrides,
             "selected_pack": selected_pack,
             "variant_dataset_dirs": {
                 name: str(manifest["dataset_dir"]) for name, manifest in variant_manifests.items()

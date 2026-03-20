@@ -1,0 +1,105 @@
+experiments:
+  - name: baseline_global_only
+    notes: Keep the current global graph settings with no pair-specific overrides.
+    session_graph:
+      pair_overrides: {}
+
+  - name: cyrus_cletus_flip_zero_delta
+    notes: Allow graph flips on Cyrus/Cletus without needing to beat the local score by 0.03.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_top1_weight: 0.22
+
+  - name: cyrus_cletus_flip_negative_delta
+    notes: Slightly favor graph reassignment on Cyrus/Cletus when the graph is close to the local score.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_top1_weight: 0.25
+
+  - name: cyrus_leopold_flip_zero_delta
+    notes: Allow graph flips on Cyrus/Leopold with stronger same-raw reinforcement.
+    session_graph:
+      pair_overrides:
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_raw_label_weight: 0.28
+
+  - name: cyrus_leopold_flip_negative_delta
+    notes: Slightly favor graph reassignment on Cyrus/Leopold when graph evidence is close.
+    session_graph:
+      pair_overrides:
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_raw_label_weight: 0.30
+
+  - name: cyrus_dual_flip_zero_delta
+    notes: Enable zero-delta known-label flips on both Cyrus-heavy confusion pairs.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_top1_weight: 0.22
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_raw_label_weight: 0.28
+
+  - name: cyrus_dual_flip_negative_delta
+    notes: Make both Cyrus-heavy pairs graph-favorable while still keeping the global graph gates for other pairs.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_top1_weight: 0.25
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_raw_label_weight: 0.30
+
+  - name: guarded_cyrus_dual_zero_delta
+    notes: Open the Cyrus-heavy pairs while adding conservative guardrails to DM/Kaladen and Kaladen/Leopold.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_top1_weight: 0.22
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: 0.00
+          same_raw_label_weight: 0.28
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+
+  - name: guarded_cyrus_dual_negative_delta
+    notes: Most aggressive Cyrus-focused flip policy with conservative Kaladen guardrails.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_top1_weight: 0.25
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.05
+          override_min_delta: -0.02
+          same_raw_label_weight: 0.30
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05

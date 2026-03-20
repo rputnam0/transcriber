@@ -174,6 +174,7 @@ def test_apply_profile_to_cached_segments_relabels_words_and_segments():
         },
     ]
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={
             "SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32),
@@ -312,6 +313,7 @@ def test_apply_profile_to_cached_segments_supports_score_fusion():
     ]
 
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={"SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32)},
         segment_embeddings=[
@@ -423,6 +425,7 @@ def test_apply_profile_to_cached_segments_uses_label_classifier_for_short_segmen
     ]
 
     relabeled, summary = apply_profile_to_cached_segments(
+        Path("audio.wav"),
         segments,
         label_embeddings={"SPEAKER_00": np.array([1.0, 0.0], dtype=np.float32)},
         segment_embeddings=[

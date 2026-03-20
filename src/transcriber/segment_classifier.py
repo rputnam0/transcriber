@@ -20,6 +20,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder
 
+from .audio import load_audio_mono
 from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
 from .consolidate import choose_speaker
 from .prep_artifacts import (
@@ -617,6 +618,35 @@ def _window_records(records: Sequence[dict], start: float, end: float) -> List[d
     ]
 
 
+def _score_style_value(actual: float, target: float, tolerance: float) -> float:
+    if tolerance <= 0.0:
+        return 1.0 if math.isclose(actual, target) else 0.0
+    return max(0.0, 1.0 - (abs(actual - target) / tolerance))
+
+
+def _session61_style_metrics(
+    *,
+    speaker_count: int,
+    turn_count: int,
+    median_turn_duration: float,
+    short_turn_fraction: float,
+    median_words_per_turn: float,
+) -> Dict[str, object]:
+    components = {
+        "speaker_count": _score_style_value(float(speaker_count), 6.0, 2.0),
+        "turn_count_per_300s": _score_style_value(float(turn_count), 100.0, 40.0),
+        "median_turn_duration": _score_style_value(float(median_turn_duration), 1.1, 1.0),
+        "short_turn_fraction": _score_style_value(float(short_turn_fraction), 0.55, 0.30),
+        "median_words_per_turn": _score_style_value(float(median_words_per_turn), 8.0, 4.0),
+    }
+    style_score = float(sum(components.values()) / len(components))
+    return {
+        "style_profile": "session61_like" if style_score >= 0.70 else "generic",
+        "style_score": style_score,
+        "style_components": components,
+    }
+
+
 def _select_candidate_windows(
     records: Sequence[dict],
     *,
@@ -640,14 +670,19 @@ def _select_candidate_windows(
         total_words = 0
         turns = 0
         previous_speaker: Optional[str] = None
+        turn_durations: List[float] = []
+        words_per_turn: List[int] = []
         for row in window_rows:
             speaker = row.get("speaker")
             if not speaker:
                 continue
             speaker = str(speaker)
             word_count = len(str(row.get("text") or "").split())
+            duration = max(float(row.get("end") or 0.0) - float(row.get("start") or 0.0), 0.0)
             speaker_counts[speaker] += word_count
             total_words += word_count
+            turn_durations.append(duration)
+            words_per_turn.append(word_count)
             if previous_speaker is not None and speaker != previous_speaker:
                 turns += 1
             previous_speaker = speaker
@@ -655,6 +690,28 @@ def _select_candidate_windows(
         if unique_speakers >= min_speakers and total_words:
             dominant_words = max(speaker_counts.values())
             balance = 1.0 - (dominant_words / total_words)
+            median_turn_duration = (
+                float(np.median(np.asarray(turn_durations, dtype=np.float32)))
+                if turn_durations
+                else 0.0
+            )
+            short_turn_fraction = (
+                float(sum(1 for value in turn_durations if value <= 1.5) / len(turn_durations))
+                if turn_durations
+                else 0.0
+            )
+            median_words_per_turn = (
+                float(np.median(np.asarray(words_per_turn, dtype=np.float32)))
+                if words_per_turn
+                else 0.0
+            )
+            style_metrics = _session61_style_metrics(
+                speaker_count=unique_speakers,
+                turn_count=turns,
+                median_turn_duration=median_turn_duration,
+                short_turn_fraction=short_turn_fraction,
+                median_words_per_turn=median_words_per_turn,
+            )
             score = (unique_speakers * 1000.0) + (turns * 10.0) + total_words + (balance * 100.0)
             candidates.append(
                 {
@@ -662,6 +719,11 @@ def _select_candidate_windows(
                     "end": end,
                     "score": score,
                     "speaker_count": unique_speakers,
+                    "turn_count": turns,
+                    "median_turn_duration": median_turn_duration,
+                    "short_turn_fraction": short_turn_fraction,
+                    "median_words_per_turn": median_words_per_turn,
+                    **style_metrics,
                 }
             )
         start += hop_seconds
@@ -1038,7 +1100,11 @@ def _sample_evenly(items: Sequence[T], limit: int) -> List[T]:
 def _load_audio_array(path: Path) -> Tuple[np.ndarray, int]:
     import soundfile as sf
 
-    audio_data, sample_rate = sf.read(path)
+    try:
+        audio_data, sample_rate = sf.read(path)
+    except Exception:
+        sample_rate = 16000
+        return load_audio_mono(path, sample_rate=sample_rate), sample_rate
     if getattr(audio_data, "ndim", 1) > 1:
         audio_data = audio_data.mean(axis=1)
     return np.asarray(audio_data, dtype=np.float32), int(sample_rate)
@@ -2482,6 +2548,13 @@ def train_segment_classifier_from_multitrack(
                         diagnostic = {
                             "session": session_name,
                             "window_index": index,
+                            "speaker_count": int(window["speaker_count"]),
+                            "turn_count": int(window.get("turn_count") or 0),
+                            "median_turn_duration": float(window.get("median_turn_duration") or 0.0),
+                            "short_turn_fraction": float(window.get("short_turn_fraction") or 0.0),
+                            "median_words_per_turn": float(window.get("median_words_per_turn") or 0.0),
+                            "style_profile": str(window.get("style_profile") or "generic"),
+                            "style_score": float(window.get("style_score") or 0.0),
                             "start": start,
                             "end": end,
                             "duration": duration,
@@ -2635,9 +2708,23 @@ def train_segment_classifier_from_multitrack(
                                     "start": float(window["start"]),
                                     "end": float(window["end"]),
                                     "speaker_count": int(window["speaker_count"]),
+                                    "turn_count": int(window.get("turn_count") or 0),
+                                    "median_turn_duration": float(
+                                        window.get("median_turn_duration") or 0.0
+                                    ),
+                                    "short_turn_fraction": float(
+                                        window.get("short_turn_fraction") or 0.0
+                                    ),
+                                    "median_words_per_turn": float(
+                                        window.get("median_words_per_turn") or 0.0
+                                    ),
+                                    "style_profile": str(window.get("style_profile") or "generic"),
+                                    "style_score": float(window.get("style_score") or 0.0),
                                 },
                                 "mixed_path": str(mixed_path),
                                 "clip_paths": [str(path) for path in clip_paths],
+                                "style_profile": str(window.get("style_profile") or "generic"),
+                                "style_score": float(window.get("style_score") or 0.0),
                                 "accepted_segments": [
                                     {
                                         "start": float(candidate["start"]),

@@ -1,0 +1,72 @@
+mode: dev_autopilot_no_rebuild
+workspace_root: /home/rputn/projects/transcriber-gpu
+output_root: .outputs/autoresearch_speaker_id
+program_path: speaker_id_program.md
+device: cuda
+results_history_limit: 10
+
+bootstrap:
+  dev_champion_baseline_summary: .outputs/speaker_id_baseline_prod_graph/baseline_summary.json
+
+splits:
+  mining_heuristic_eval:
+    - Session22
+    - Session61
+  eval_dev:
+    - Session22
+    - Session61
+    - short_segment_slice
+  eval_final:
+    - Session58
+    - Session52
+    - Session48
+
+objective:
+  weights:
+    session61_matched_accuracy: 0.40
+    session61_accuracy: 0.25
+    short_slice_matched_accuracy: 0.20
+    session22_accuracy: 0.10
+    session22_matched_accuracy: 0.05
+  dev_acceptance:
+    min_score_gain: 0.003
+    min_session61_matched_accuracy_gain: 0.005
+    max_session22_accuracy_regression: 0.010
+  final_gate:
+    max_mean_accuracy_regression: 0.005
+    max_mean_matched_accuracy_regression: 0.005
+
+scheduler:
+  start_family: classifier_only
+  rejection_streak_to_escalate: 5
+
+families:
+  eval_only:
+    enabled: true
+    order: 0
+  classifier_only:
+    enabled: true
+    order: 1
+  hard_negative_refresh:
+    enabled: true
+    order: 2
+  full_rebuild:
+    enabled: false
+    order: 3
+
+budgets:
+  eval_only: 20m
+  classifier_only: 20m
+  hard_negative_refresh: 2h
+  full_rebuild: 6h
+
+protected_paths:
+  - config/autoresearch_speaker_id.yaml
+  - speaker_id_program.md
+  - src/transcriber/autoresearch_objective.py
+  - .outputs/autoresearch_speaker_id
+
+codex:
+  binary: codex
+  exec_args:
+    - --full-auto

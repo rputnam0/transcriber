@@ -1,0 +1,101 @@
+experiments:
+  - name: baseline_global_only
+    notes: Keep the current global graph settings with no pair-specific overrides.
+    session_graph:
+      pair_overrides: {}
+
+  - name: cyrus_cletus_permissive_low
+    notes: Let the graph rescue Cyrus/Cletus ambiguities more aggressively.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          same_top1_weight: 0.20
+
+  - name: cyrus_cletus_permissive_mid
+    notes: Slightly less aggressive Cyrus/Cletus override.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.08
+          same_top1_weight: 0.18
+
+  - name: cyrus_leopold_permissive_low
+    notes: Increase graph help for Cyrus/Leopold confusion.
+    session_graph:
+      pair_overrides:
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.06
+          same_raw_label_weight: 0.25
+
+  - name: cyrus_dual_permissive
+    notes: Combine permissive overrides for both Cyrus confusion pairs.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          same_top1_weight: 0.20
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.06
+          same_raw_label_weight: 0.25
+
+  - name: dm_kaladen_conservative
+    notes: Reduce risky DM/Kaladen graph flips.
+    session_graph:
+      pair_overrides:
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+
+  - name: kaladen_leopold_conservative
+    notes: Reduce risky Kaladen/Leopold graph flips.
+    session_graph:
+      pair_overrides:
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+
+  - name: conservative_dual
+    notes: Apply both conservative guardrails together.
+    session_graph:
+      pair_overrides:
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+
+  - name: balanced_pairs_v1
+    notes: Combine permissive Cyrus overrides with conservative Kaladen guardrails.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.05
+          same_top1_weight: 0.20
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.06
+          same_raw_label_weight: 0.25
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+
+  - name: balanced_pairs_v2
+    notes: Slightly more conservative Cyrus/Cletus while keeping the full pair set.
+    session_graph:
+      pair_overrides:
+        Cletus Cobbington::Cyrus Schwert:
+          override_min_confidence: 0.08
+          same_top1_weight: 0.18
+        Cyrus Schwert::Leopold Magnus:
+          override_min_confidence: 0.08
+          same_raw_label_weight: 0.22
+        Dungeon Master::Kaladen Shash:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05
+        Kaladen Shash::Leopold Magnus:
+          override_min_confidence: 0.18
+          override_min_margin: 0.05

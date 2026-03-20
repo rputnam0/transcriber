@@ -78,6 +78,20 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 ],
                 "baseline_pack": ["mixed_raw", "light_x1", "discord_x1"],
                 "build_variants": ["mixed_raw", "light_x1", "discord_x1"],
+                "top_confusion_pairs": 0,
+                "hard_negative_pair_caps": [
+                    {"pair": ["Player Alice", "Player Bob"], "value": 1}
+                ],
+                "current_winner": {
+                    "threshold": 0.36,
+                    "classifier_min_margin": 0.06,
+                    "match_aggregation": "vote",
+                    "min_segments_per_label": 2,
+                },
+                "speaker_bank_overrides": {
+                    "repair": {"enabled": True, "split_on_word_gap_seconds": 0.40},
+                    "session_graph": {"enabled": True, "alpha": 0.80},
+                },
                 "resume": True,
             }
         ),
@@ -116,6 +130,7 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     )
 
     build_calls = {"multitrack": 0, "materialize": 0}
+    hard_negative_call: dict[str, object] = {}
 
     def _write_dataset_artifacts(dataset_cache_dir: Path, dataset: ClassifierDataset, *, mixed_base: bool) -> dict:
         dataset_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -294,6 +309,12 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                         "matched_accuracy": 0.88,
                         "confusion": {"Player Alice": {"Player Bob": 1}},
                     },
+                    "metrics_pre_graph": {
+                        "accuracy": 0.72,
+                        "coverage": 0.9,
+                        "matched_accuracy": 0.80,
+                        "confusion": {"Player Alice": {"Player Bob": 2}},
+                    },
                 }
             ],
             "summary_path": str(output_dir / "summary.json"),
@@ -303,6 +324,7 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         return summary
 
     def fake_build_hard_negative_dataset(**kwargs):
+        hard_negative_call.update(kwargs)
         records = [
             {
                 "speaker": "Player Alice",
@@ -313,9 +335,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 "active_speakers": 2,
                 "top1_power": 0.8,
                 "top2_power": 0.7,
-                "score_margin": 0.05,
-                "selection_reason": "eval_top2_margin",
-                "source_kind": "eval",
+                "score_margin": None,
+                "selection_reason": "mixed_rejection_low_share",
+                "source_kind": "mixed_candidate_pool",
                 "start": 0.0,
                 "end": 1.0,
             }
@@ -365,6 +387,8 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     assert Path(first_summary["narrow_doe_recipe_path"]).exists()
     assert Path(first_summary["stage_metrics_path"]).exists()
     assert "short_segment_slice" in first_summary["canonical_eval"]
+    assert first_summary["canonical_eval"]["Session22"]["mean_accuracy_pre_graph"] == 0.72
+    assert first_summary["canonical_eval"]["Session22"]["mean_matched_accuracy_pre_graph"] == 0.80
     assert set(first_summary["stage_manifests"]) == {
         "bank",
         "mixed_base",
@@ -374,6 +398,16 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         "eval",
     }
     assert second_summary["stage_manifests"] == first_summary["stage_manifests"]
+    eval_manifest = json.loads(Path(first_summary["eval_manifest_path"]).read_text(encoding="utf-8"))
+    eval_config = json.loads(Path(eval_manifest["config_path"]).read_text(encoding="utf-8"))
+    assert eval_manifest["build_params"]["match_aggregation"] == "vote"
+    assert eval_config["speaker_bank"]["match_aggregation"] == "vote"
+    assert eval_config["speaker_bank"]["repair"]["enabled"] is True
+    assert eval_config["speaker_bank"]["repair"]["split_on_word_gap_seconds"] == 0.40
+    assert eval_config["speaker_bank"]["session_graph"]["enabled"] is True
+    assert eval_config["speaker_bank"]["session_graph"]["alpha"] == 0.80
+    assert hard_negative_call["top_confusion_pairs"] == 0
+    assert hard_negative_call["pair_caps"] == {("Player Alice", "Player Bob"): 1}
 
     final_dataset, final_summary = load_classifier_dataset(
         Path(first_summary["final_training_manifest_path"]).parent
