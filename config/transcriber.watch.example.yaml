@@ -37,7 +37,8 @@ quiet: true
 postprocess:
   enabled: false
   provider: google
-  model: gemini-2.5-flash
+  model: gemini-3-flash-preview
+  thinking_level: high  # Gemini 3 uses thinkingLevel; omit to use the model default (currently high)
   api_key_env: GOOGLE_API_KEY
   prompts_dir: /mnt/g/My Drive/DND/Code/Simple LLM Summary/Prompts
   summaries_dir: /mnt/g/My Drive/DND/Summaries

@@ -44,6 +44,7 @@ class PostProcessConfig:
     raw_text_subdir: str = "raw_txt"
     calls_per_minute: int = 5
     skip_existing: bool = True
+    thinking_level: str | None = None
 
     @property
     def delay_seconds(self) -> float:
@@ -100,6 +101,10 @@ class SplitSessionPendingError(RuntimeError):
     """Raised when a split-session transcript is waiting for remaining parts."""
 
 
+class UnsupportedTranscriptPostprocessError(RuntimeError):
+    """Raised when a transcript name cannot be mapped to a campaign session."""
+
+
 class _GoogleTextGenerator:
     def __init__(self, config: PostProcessConfig) -> None:
         try:
@@ -131,6 +136,10 @@ class _GoogleTextGenerator:
         config_kwargs = {"response_mime_type": "text/plain"}
         if system_instruction:
             config_kwargs["system_instruction"] = [system_instruction]
+        if self._config.thinking_level and self._config.model.lower().startswith("gemini-3"):
+            config_kwargs["thinking_config"] = self._types.ThinkingConfig(
+                thinking_level=self._config.thinking_level
+            )
 
         response = self._client.models.generate_content(
             model=self._config.model,
@@ -174,6 +183,12 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
     calls_per_minute_raw = raw_cfg.get("calls_per_minute")
     calls_per_minute = 5 if calls_per_minute_raw is None else int(calls_per_minute_raw)
     skip_existing = bool(raw_cfg.get("skip_existing", True))
+    thinking_level_raw = str(raw_cfg.get("thinking_level") or "").strip().lower()
+    thinking_level = thinking_level_raw or None
+    if thinking_level not in (None, "minimal", "low", "medium", "high"):
+        raise SystemExit(
+            "postprocess.thinking_level must be one of: minimal, low, medium, high."
+        )
 
     if provider != "google":
         raise SystemExit(f"Unsupported postprocess.provider={provider!r}; expected 'google'.")
@@ -194,6 +209,7 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
         raw_text_subdir=raw_text_subdir,
         calls_per_minute=max(0, calls_per_minute),
         skip_existing=skip_existing,
+        thinking_level=thinking_level,
     )
 
 
@@ -201,6 +217,10 @@ def expected_completion_marker_path(
     transcript_path: str | Path,
     config: PostProcessConfig,
 ) -> Path:
+    if not can_postprocess_transcript(transcript_path):
+        raise UnsupportedTranscriptPostprocessError(
+            f"Transcript does not map to a campaign session: {Path(transcript_path).expanduser()}"
+        )
     return build_postprocess_paths(transcript_path, config).completion_marker
 
 
@@ -232,6 +252,10 @@ def run_postprocess_for_transcript(
     transcript_path: str | Path,
     config: PostProcessConfig,
 ) -> PostProcessResult:
+    if not can_postprocess_transcript(transcript_path):
+        raise UnsupportedTranscriptPostprocessError(
+            f"Transcript does not map to a campaign session: {Path(transcript_path).expanduser()}"
+        )
     paths = build_postprocess_paths(transcript_path, config)
     if not paths.transcript_path.exists():
         raise FileNotFoundError(
@@ -467,6 +491,14 @@ def parse_session_identity(path: str | Path) -> SessionIdentity:
         if number_match:
             return SessionIdentity(session_number=int(number_match.group(1)))
     raise ValueError(f"Could not infer a session number from transcript path: {transcript_path}")
+
+
+def can_postprocess_transcript(path: str | Path) -> bool:
+    try:
+        parse_session_identity(path)
+    except ValueError:
+        return False
+    return True
 
 
 def resolve_transcript_bundle(path: str | Path) -> TranscriptBundle:

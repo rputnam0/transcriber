@@ -330,6 +330,34 @@ def test_watch_task_kind_waits_for_all_split_parts_before_postprocess(tmp_path):
     assert action is None
 
 
+def test_watch_task_kind_skips_postprocess_for_non_session_transcript(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Craig Copy Local Smoke"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Craig Copy Local Smoke.txt"
+    transcript_path.write_text("done", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Craig Copy Local Smoke.zip"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+        watch_postprocess_backfill=False,
+    )
+
+    assert action is None
+
+
 def test_watch_task_kind_waits_for_completed_split_part_markers(tmp_path):
     part_one_root = tmp_path / "outputs" / "Session 28 1_2"
     part_two_root = tmp_path / "outputs" / "Session 28 2_2"

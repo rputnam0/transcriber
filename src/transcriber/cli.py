@@ -25,6 +25,7 @@ from .consolidate import consolidate, save_outputs, choose_speaker
 from .postprocess import (
     PostProcessConfig,
     SplitSessionPendingError,
+    can_postprocess_transcript,
     expected_completion_marker_path,
     resolve_postprocess_config,
     run_postprocess_for_transcript,
@@ -2490,11 +2491,16 @@ def run_transcribe(
     # Clean up extracted ZIP contents before any downstream processing.
     cleanup_tmp(tmp_root)
 
-    if postprocess_config:
+    if postprocess_config and can_postprocess_transcript(transcript_output_path):
         try:
             run_postprocess_for_transcript(transcript_output_path, postprocess_config)
         except SplitSessionPendingError as exc:
             logger.warning("Post-process deferred for %s: %s", transcript_output_path, exc)
+    elif postprocess_config:
+        logger.warning(
+            "Skipping postprocess for transcript without session identity: %s",
+            transcript_output_path,
+        )
 
     logging.getLogger("transcriber").warning(
         "Done. Outputs in %s", str(Path(final_out_dir).resolve())
@@ -2703,6 +2709,9 @@ def _watch_task_kind(
     if postprocess_config is None:
         return None
 
+    if not can_postprocess_transcript(transcript_path):
+        return None
+
     marker_path = expected_completion_marker_path(transcript_path, postprocess_config)
     if marker_path.exists():
         return None
@@ -2860,6 +2869,12 @@ def watch_and_transcribe(
                                 logger.warning(
                                     "Watch: skipping postprocess for %s because no transcript was found",
                                     f,
+                                )
+                                continue
+                            if not can_postprocess_transcript(transcript_path):
+                                logger.warning(
+                                    "Watch: skipping postprocess for non-session transcript %s",
+                                    transcript_path,
                                 )
                                 continue
                             run_postprocess_for_transcript(transcript_path, postprocess_config)

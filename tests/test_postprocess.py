@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -131,6 +133,115 @@ def test_postprocess_delay_seconds_allows_no_throttle(tmp_path):
     )
 
     assert config.delay_seconds == 0.0
+
+
+def test_run_postprocess_for_non_session_transcript_raises_clear_error(tmp_path):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    transcript_dir = tmp_path / "transcripts" / "Live Smoke Test"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / "Live Smoke Test.txt"
+    transcript_path.write_text("Speaker 00 00:00:00 Hello there\n", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+    )
+
+    with pytest.raises(postprocess_mod.UnsupportedTranscriptPostprocessError):
+        postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
+
+
+def test_resolve_postprocess_config_accepts_thinking_level(tmp_path):
+    cfg = {
+        "postprocess": {
+            "enabled": True,
+            "provider": "google",
+            "model": "gemini-3-flash-preview",
+            "thinking_level": "high",
+            "prompts_dir": str(tmp_path / "prompts"),
+            "summaries_dir": str(tmp_path / "summaries"),
+        }
+    }
+
+    config = postprocess_mod.resolve_postprocess_config(cfg)
+
+    assert config is not None
+    assert config.model == "gemini-3-flash-preview"
+    assert config.thinking_level == "high"
+
+
+def test_google_text_generator_passes_thinking_level_for_gemini_3(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    class FakeThinkingConfig:
+        def __init__(self, **kwargs):
+            captured["thinking_config_kwargs"] = kwargs
+            self.kwargs = kwargs
+
+    class FakeGenerateContentConfig:
+        def __init__(self, **kwargs):
+            captured["generate_config_kwargs"] = kwargs
+            self.kwargs = kwargs
+
+    class FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class FakeContent:
+        def __init__(self, *, role: str, parts: list[object]):
+            self.role = role
+            self.parts = parts
+
+    class FakeModels:
+        def generate_content(self, *, model, contents, config):
+            captured["model"] = model
+            captured["contents"] = contents
+            captured["config"] = config
+            return types.SimpleNamespace(text="ok")
+
+    class FakeClient:
+        def __init__(self, *, api_key: str):
+            captured["api_key"] = api_key
+            self.models = FakeModels()
+
+    fake_types = types.SimpleNamespace(
+        ThinkingConfig=FakeThinkingConfig,
+        GenerateContentConfig=FakeGenerateContentConfig,
+        Content=FakeContent,
+        Part=FakePart,
+    )
+    fake_genai = types.SimpleNamespace(Client=FakeClient, types=fake_types)
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "google", types.SimpleNamespace(genai=fake_genai))
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="gemini-3-flash-preview",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+        thinking_level="high",
+    )
+
+    generator = postprocess_mod._GoogleTextGenerator(config)
+    text = generator.generate(prompt="hello", system_instruction="system")
+
+    assert text == "ok"
+    assert captured["api_key"] == "test-key"
+    assert captured["model"] == "gemini-3-flash-preview"
+    assert captured["thinking_config_kwargs"] == {"thinking_level": "high"}
+    assert captured["generate_config_kwargs"]["thinking_config"] is captured["config"].kwargs[
+        "thinking_config"
+    ]
 
 
 def test_split_session_ready_for_postprocess_requires_all_parts(tmp_path):
