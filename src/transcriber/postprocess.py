@@ -40,7 +40,9 @@ class PostProcessConfig:
 
     @property
     def delay_seconds(self) -> float:
-        return 60.0 / max(1, int(self.calls_per_minute))
+        if int(self.calls_per_minute) <= 0:
+            return 0.0
+        return 60.0 / int(self.calls_per_minute)
 
 
 @dataclass(frozen=True)
@@ -135,7 +137,8 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
     provider = str(raw_cfg.get("provider") or "google").strip().lower() or "google"
     api_key_env = str(raw_cfg.get("api_key_env") or "GOOGLE_API_KEY").strip() or "GOOGLE_API_KEY"
     raw_text_subdir = str(raw_cfg.get("raw_text_subdir") or "raw_txt").strip() or "raw_txt"
-    calls_per_minute = int(raw_cfg.get("calls_per_minute") or 5)
+    calls_per_minute_raw = raw_cfg.get("calls_per_minute")
+    calls_per_minute = 5 if calls_per_minute_raw is None else int(calls_per_minute_raw)
     skip_existing = bool(raw_cfg.get("skip_existing", True))
 
     if provider != "google":
@@ -155,7 +158,7 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
         summaries_dir=Path(summaries_dir).expanduser(),
         api_key_env=api_key_env,
         raw_text_subdir=raw_text_subdir,
-        calls_per_minute=max(1, calls_per_minute),
+        calls_per_minute=max(0, calls_per_minute),
         skip_existing=skip_existing,
     )
 

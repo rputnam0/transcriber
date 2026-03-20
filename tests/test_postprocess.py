@@ -112,3 +112,16 @@ def test_expected_completion_marker_path_uses_session_folder(tmp_path):
     )
 
     assert marker == tmp_path / "summaries" / "Session 7" / "session_7.postprocess.json"
+
+
+def test_postprocess_delay_seconds_allows_no_throttle(tmp_path):
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+        calls_per_minute=0,
+    )
+
+    assert config.delay_seconds == 0.0
