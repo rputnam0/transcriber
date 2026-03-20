@@ -79,16 +79,15 @@ if ((quiet == 0)); then
   echo "repair_drvfs_mount.sh: repairing $drive_letter on $mount_point via distro $distro_name" >&2
 fi
 
-"$wsl_exe" -d "$distro_name" -u root -- env \
-  WATCH_MOUNT_DRIVE="$drive_letter" \
-  WATCH_MOUNT_POINT="$mount_point" \
-  WATCH_MOUNT_OPTIONS="$mount_options" \
-  bash -lc '
-    set -euo pipefail
-    nsenter -t 1 -m -- umount -l "$WATCH_MOUNT_POINT" 2>/dev/null || true
-    nsenter -t 1 -m -- mkdir -p "$WATCH_MOUNT_POINT"
-    nsenter -t 1 -m -- mount -t drvfs "$WATCH_MOUNT_DRIVE" "$WATCH_MOUNT_POINT" -o "$WATCH_MOUNT_OPTIONS"
-  '
+printf -v repair_cmd \
+  'set -euo pipefail; nsenter -t 1 -m -- umount -l %q 2>/dev/null || true; nsenter -t 1 -m -- mkdir -p %q; nsenter -t 1 -m -- mount -t drvfs %q %q -o %q' \
+  "$mount_point" \
+  "$mount_point" \
+  "$drive_letter" \
+  "$mount_point" \
+  "$mount_options"
+
+"$wsl_exe" -d "$distro_name" -u root -- bash -lc "$repair_cmd"
 
 for _ in 1 2 3 4 5; do
   if ls -d "$probe_path" >/dev/null 2>&1; then
