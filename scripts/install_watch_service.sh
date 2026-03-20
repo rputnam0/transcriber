@@ -74,6 +74,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=$REPO_DIR
+EnvironmentFile=-$REPO_DIR/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=VIRTUAL_ENV=$VENV_DIR
 Environment=PATH=$VENV_DIR/bin:/usr/bin:/bin
