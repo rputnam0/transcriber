@@ -8,6 +8,9 @@ auto_batch: true
 # Watch-specific settings
 watch: true
 watch_input: audio/incoming
+# Successfully processed inputs are automatically moved under
+# `<watch_input>/processed/` so deleting old transcript outputs does not
+# silently requeue the same audio.
 watch_interval: 10
 watch_stability: 5
 output_dir: outputs

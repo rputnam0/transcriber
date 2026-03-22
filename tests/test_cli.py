@@ -188,6 +188,9 @@ def test_iter_candidate_media_honors_exclude_globs(tmp_path):
     root = tmp_path / "audio"
     root.mkdir()
     (root / "Session 62.zip").write_text("zip", encoding="utf-8")
+    processed_dir = root / "processed"
+    processed_dir.mkdir()
+    (processed_dir / "Session 70.zip").write_text("zip", encoding="utf-8")
     session_dir = root / "Session 9"
     session_dir.mkdir()
     (session_dir / "1-joeeeenathan_0.wav").write_text("wav", encoding="utf-8")
@@ -198,6 +201,66 @@ def test_iter_candidate_media_honors_exclude_globs(tmp_path):
     assert str(root / "Session 62.zip") in found
     assert str(session_dir / "Session 9.wav") in found
     assert str(session_dir / "1-joeeeenathan_0.wav") not in found
+    assert str(processed_dir / "Session 70.zip") not in found
+
+
+def test_archive_processed_watch_input_moves_audio_and_manifest_pair(tmp_path):
+    root = tmp_path / "incoming"
+    root.mkdir()
+    zip_path = root / "Live Smoke Test.zip"
+    json_path = root / "Live Smoke Test.json"
+    zip_path.write_text("zip", encoding="utf-8")
+    json_path.write_text("{}", encoding="utf-8")
+
+    archived = cli._archive_processed_watch_input(zip_path, root)
+
+    assert archived == [
+        root / "processed" / "Live Smoke Test.zip",
+        root / "processed" / "Live Smoke Test.json",
+    ]
+    assert not zip_path.exists()
+    assert not json_path.exists()
+
+
+def test_move_watch_input_bundle_moves_audio_and_manifest_pair_to_quarantine(tmp_path):
+    root = tmp_path / "incoming"
+    quarantine_dir = root / "quarantine"
+    root.mkdir()
+    quarantine_dir.mkdir()
+    zip_path = root / "MmCQtqke7kB5.zip"
+    json_path = root / "MmCQtqke7kB5.json"
+    zip_path.write_text("zip", encoding="utf-8")
+    json_path.write_text("{}", encoding="utf-8")
+
+    moved = cli._move_watch_input_bundle(zip_path, quarantine_dir)
+
+    assert moved == [
+        quarantine_dir / "MmCQtqke7kB5.zip",
+        quarantine_dir / "MmCQtqke7kB5.json",
+    ]
+    assert not zip_path.exists()
+    assert not json_path.exists()
+
+
+def test_archive_processed_watch_input_avoids_name_collisions(tmp_path):
+    root = tmp_path / "incoming"
+    root.mkdir()
+    processed_dir = root / "processed"
+    processed_dir.mkdir()
+    (processed_dir / "Live Smoke Test.zip").write_text("old zip", encoding="utf-8")
+    (processed_dir / "Live Smoke Test.json").write_text("old json", encoding="utf-8")
+
+    zip_path = root / "Live Smoke Test.zip"
+    json_path = root / "Live Smoke Test.json"
+    zip_path.write_text("zip", encoding="utf-8")
+    json_path.write_text("{}", encoding="utf-8")
+
+    archived = cli._archive_processed_watch_input(zip_path, root)
+
+    assert archived == [
+        root / "processed" / "Live Smoke Test__2.zip",
+        root / "processed" / "Live Smoke Test__2.json",
+    ]
 
 
 def test_find_existing_transcript_for_input_matches_historical_names(tmp_path):

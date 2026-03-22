@@ -2841,7 +2841,7 @@ def _watch_task_kind(
 def _iter_candidate_media(
     root_dir: Path, exclude_globs: Optional[Sequence[str]] = None
 ) -> list[str]:
-    ignore_dirs = {"quarantine", ".cache", "outputs"}
+    ignore_dirs = {"processed", "quarantine", ".cache", "outputs"}
     exclude_patterns = [pattern for pattern in (exclude_globs or []) if pattern]
     files: list[str] = []
     for f in root_dir.rglob("*"):
@@ -2868,6 +2868,47 @@ def _file_is_stable(path: Path, stability_seconds: int) -> bool:
     except FileNotFoundError:
         return False
     return (time.time() - mtime) >= max(0, stability_seconds)
+
+
+def _reserve_processed_archive_stem(processed_dir: Path, stem: str, suffixes: set[str]) -> str:
+    candidate_stem = stem
+    index = 2
+    while any((processed_dir / f"{candidate_stem}{suffix}").exists() for suffix in suffixes):
+        candidate_stem = f"{stem}__{index}"
+        index += 1
+    return candidate_stem
+
+
+def _move_watch_input_bundle(input_path: str | Path, destination_dir: Path) -> list[Path]:
+    source = Path(input_path)
+    if not source.exists():
+        return []
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    companion_paths: list[Path] = []
+    if source.suffix.lower() == ".zip":
+        companion = source.with_suffix(".json")
+        if companion.exists():
+            companion_paths.append(companion)
+
+    move_paths = [source, *companion_paths]
+    archive_stem = _reserve_processed_archive_stem(
+        destination_dir,
+        source.stem,
+        {path.suffix for path in move_paths},
+    )
+
+    archived_paths: list[Path] = []
+    for path in move_paths:
+        target = destination_dir / f"{archive_stem}{path.suffix}"
+        path.replace(target)
+        archived_paths.append(target)
+
+    return archived_paths
+
+
+def _archive_processed_watch_input(input_path: str | Path, watch_root: Path) -> list[Path]:
+    return _move_watch_input_bundle(input_path, watch_root / "processed")
 
 
 def watch_and_transcribe(
@@ -3030,15 +3071,24 @@ def watch_and_transcribe(
                                 speaker_bank_config=speaker_bank_config,
                                 postprocess_config=postprocess_config,
                             )
+                        archived_paths = _archive_processed_watch_input(f, root)
+                        if archived_paths:
+                            logger.warning(
+                                "Watch: archived processed input(s): %s",
+                                ", ".join(str(path) for path in archived_paths),
+                            )
                     except BaseException as exc:  # noqa: PIE786
                         msg = str(exc)
                         logger.error("Watch: failed to process %s: %s", f, msg)
                         # Quarantine known-bad inputs to avoid hammering the same file forever
                         if _should_quarantine_watch_failure(msg):
                             try:
-                                dest = quarantine_dir / Path(f).name
-                                Path(f).replace(dest)
-                                logger.warning("Watch: moved %s to %s due to input error", f, dest)
+                                moved_paths = _move_watch_input_bundle(f, quarantine_dir)
+                                logger.warning(
+                                    "Watch: moved %s due to input error: %s",
+                                    f,
+                                    ", ".join(str(path) for path in moved_paths),
+                                )
                             except Exception as move_exc:
                                 logger.error("Watch: failed to quarantine %s: %s", f, move_exc)
             time.sleep(interval)
