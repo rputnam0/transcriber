@@ -156,6 +156,15 @@ def test_run_postprocess_for_non_session_transcript_raises_clear_error(tmp_path)
         postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
 
 
+def test_can_postprocess_transcript_requires_explicit_session_name() -> None:
+    assert postprocess_mod.can_postprocess_transcript("Session 3.txt")
+    assert postprocess_mod.can_postprocess_transcript("Session 28 1_2.txt")
+    assert not postprocess_mod.can_postprocess_transcript("kZWVHz3eCBaf.txt")
+    assert not postprocess_mod.can_postprocess_transcript(
+        "Odds and Ends Transcripts/kZWVHz3eCBaf.txt"
+    )
+
+
 def test_resolve_postprocess_config_accepts_thinking_level(tmp_path):
     cfg = {
         "postprocess": {
@@ -239,9 +248,10 @@ def test_google_text_generator_passes_thinking_level_for_gemini_3(monkeypatch, t
     assert captured["api_key"] == "test-key"
     assert captured["model"] == "gemini-3-flash-preview"
     assert captured["thinking_config_kwargs"] == {"thinking_level": "high"}
-    assert captured["generate_config_kwargs"]["thinking_config"] is captured["config"].kwargs[
-        "thinking_config"
-    ]
+    assert (
+        captured["generate_config_kwargs"]["thinking_config"]
+        is captured["config"].kwargs["thinking_config"]
+    )
 
 
 def test_split_session_ready_for_postprocess_requires_all_parts(tmp_path):

@@ -186,9 +186,7 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
     thinking_level_raw = str(raw_cfg.get("thinking_level") or "").strip().lower()
     thinking_level = thinking_level_raw or None
     if thinking_level not in (None, "minimal", "low", "medium", "high"):
-        raise SystemExit(
-            "postprocess.thinking_level must be one of: minimal, low, medium, high."
-        )
+        raise SystemExit("postprocess.thinking_level must be one of: minimal, low, medium, high.")
 
     if provider != "google":
         raise SystemExit(f"Unsupported postprocess.provider={provider!r}; expected 'google'.")
@@ -493,12 +491,19 @@ def parse_session_identity(path: str | Path) -> SessionIdentity:
     raise ValueError(f"Could not infer a session number from transcript path: {transcript_path}")
 
 
+def has_explicit_session_identity(path: str | Path) -> bool:
+    transcript_path = Path(path).expanduser()
+    for candidate in _session_identity_candidates(transcript_path):
+        if _SPLIT_SESSION_PATTERN.search(candidate):
+            return True
+    for candidate in _session_identity_candidates(transcript_path):
+        if _SESSION_PATTERN.search(candidate):
+            return True
+    return False
+
+
 def can_postprocess_transcript(path: str | Path) -> bool:
-    try:
-        parse_session_identity(path)
-    except ValueError:
-        return False
-    return True
+    return has_explicit_session_identity(path)
 
 
 def resolve_transcript_bundle(path: str | Path) -> TranscriptBundle:
