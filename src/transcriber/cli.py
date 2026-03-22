@@ -303,6 +303,7 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         "compute_type": "compute_type",
         "batch_size": "batch_size",
         "output_dir": "output_dir",
+        "non_session_output_dir": "non_session_output_dir",
         "speaker_mapping": "speaker_mapping",
         "min_speakers": "min_speakers",
         "max_speakers": "max_speakers",
@@ -1760,6 +1761,7 @@ def run_transcribe(
     compute_type: str = "float16",
     batch_size: int = 32,
     output_dir: str = "outputs",
+    non_session_output_dir: str | None = None,
     speaker_mapping_path: str | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
@@ -2433,12 +2435,12 @@ def run_transcribe(
 
     consolidated_pairs = consolidate(per_file_segments)
 
-    # Default behavior: nest outputs under a folder named after the input base
-    # e.g., input "Session 32.zip" -> outputs/Session 32/
-    effective_output_dir = Path(output_dir)
     base = Path(input_path).stem
-    if effective_output_dir.name != base:
-        effective_output_dir = effective_output_dir / base
+    effective_output_dir = _effective_output_dir_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
 
     transcript_output_path = Path(effective_output_dir) / f"{base}.txt"
     _write_transcription_completion_marker(
@@ -2565,9 +2567,86 @@ def _recommend_batch_size(
     return int(recommended)
 
 
-def _expected_txt_path_for_input(input_path: str, output_dir: str) -> Path:
+def _primary_output_root_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> Path:
+    if non_session_output_dir and not _input_has_session_identity(input_path):
+        return Path(non_session_output_dir)
+    return Path(output_dir)
+
+
+def _transcript_search_roots_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> list[Path]:
+    primary_root = _primary_output_root_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
+    roots = [primary_root]
+    fallback_root = Path(output_dir)
+    if fallback_root != primary_root:
+        roots.append(fallback_root)
+    return roots
+
+
+def _expected_txt_path_for_root(input_path: str, output_root: str | Path) -> Path:
     base = Path(input_path).stem
-    return Path(output_dir) / base / f"{base}.txt"
+    effective_output_dir = Path(output_root)
+    if effective_output_dir.name != base:
+        effective_output_dir = effective_output_dir / base
+    return effective_output_dir / f"{base}.txt"
+
+
+def _effective_output_dir_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> Path:
+    transcript_path = _expected_txt_path_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
+    return transcript_path.parent
+
+
+def _input_identity_candidates(path: Path) -> tuple[str, ...]:
+    grandparent_name = path.parent.parent.name if path.parent.parent != path.parent else ""
+    candidates = [path.stem, path.name]
+    for candidate in (path.parent.name, grandparent_name):
+        if candidate and "session" in candidate.lower():
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _input_has_session_identity(input_path: str) -> bool:
+    input_obj = Path(input_path).expanduser()
+    for candidate in _input_identity_candidates(input_obj):
+        if not candidate:
+            continue
+        if "session" not in candidate.lower():
+            continue
+        if can_postprocess_transcript(candidate):
+            return True
+    return False
+
+
+def _expected_txt_path_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> Path:
+    primary_root = _primary_output_root_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
+    return _expected_txt_path_for_root(input_path, primary_root)
 
 
 def _transcription_completion_marker_path(transcript_path: str | Path) -> Path:
@@ -2575,9 +2654,17 @@ def _transcription_completion_marker_path(transcript_path: str | Path) -> Path:
     return transcript.parent / f"{transcript.stem}.transcribe.json"
 
 
-def _expected_transcription_marker_path_for_input(input_path: str, output_dir: str) -> Path:
+def _expected_transcription_marker_path_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> Path:
     return _transcription_completion_marker_path(
-        _expected_txt_path_for_input(input_path, output_dir)
+        _expected_txt_path_for_input(
+            input_path,
+            output_dir,
+            non_session_output_dir=non_session_output_dir,
+        )
     )
 
 
@@ -2596,35 +2683,50 @@ def _normalize_watch_name(text: str) -> str:
 def _find_existing_transcript_match_for_input(
     input_path: str,
     output_dir: str,
+    non_session_output_dir: str | None = None,
 ) -> tuple[Path, bool] | None:
-    expected = _expected_txt_path_for_input(input_path, output_dir)
-    if expected.exists():
-        return expected, True
-
-    output_root = Path(output_dir)
-    if not output_root.exists():
-        return None
-
     input_obj = Path(input_path)
     input_keys: set[str] = set()
     for part in (*input_obj.parts, input_obj.stem):
         input_keys.update(_extract_session_keys(part))
 
     normalized_stem = _normalize_watch_name(input_obj.stem)
-    for transcript_path in sorted(output_root.rglob("*.txt")):
-        transcript_keys: set[str] = set()
-        rel = transcript_path.relative_to(output_root)
-        for part in rel.parts:
-            transcript_keys.update(_extract_session_keys(part))
-        if input_keys and transcript_keys.intersection(input_keys):
-            return transcript_path, False
-        if not input_keys and _normalize_watch_name(transcript_path.stem) == normalized_stem:
-            return transcript_path, False
+    for root_index, output_root in enumerate(
+        _transcript_search_roots_for_input(
+            input_path,
+            output_dir,
+            non_session_output_dir=non_session_output_dir,
+        )
+    ):
+        expected = _expected_txt_path_for_root(input_path, output_root)
+        if expected.exists():
+            return expected, root_index == 0
+
+        if not output_root.exists():
+            continue
+
+        for transcript_path in sorted(output_root.rglob("*.txt")):
+            transcript_keys: set[str] = set()
+            rel = transcript_path.relative_to(output_root)
+            for part in rel.parts:
+                transcript_keys.update(_extract_session_keys(part))
+            if input_keys and transcript_keys.intersection(input_keys):
+                return transcript_path, False
+            if not input_keys and _normalize_watch_name(transcript_path.stem) == normalized_stem:
+                return transcript_path, False
     return None
 
 
-def _find_existing_transcript_for_input(input_path: str, output_dir: str) -> Path | None:
-    match = _find_existing_transcript_match_for_input(input_path, output_dir)
+def _find_existing_transcript_for_input(
+    input_path: str,
+    output_dir: str,
+    non_session_output_dir: str | None = None,
+) -> Path | None:
+    match = _find_existing_transcript_match_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
     return match[0] if match else None
 
 
@@ -2704,9 +2806,14 @@ def _watch_task_kind(
     input_path: str,
     output_dir: str,
     postprocess_config: PostProcessConfig | None,
+    non_session_output_dir: str | None = None,
     watch_postprocess_backfill: bool = False,
 ) -> str | None:
-    transcript_match = _find_existing_transcript_match_for_input(input_path, output_dir)
+    transcript_match = _find_existing_transcript_match_for_input(
+        input_path,
+        output_dir,
+        non_session_output_dir=non_session_output_dir,
+    )
     if transcript_match is None:
         return "transcribe"
 
@@ -2844,6 +2951,7 @@ def watch_and_transcribe(
                     f,
                     args.output_dir,
                     postprocess_config,
+                    non_session_output_dir=getattr(args, "non_session_output_dir", None),
                     watch_postprocess_backfill=watch_postprocess_backfill,
                 )
                 if task_kind is None:
@@ -2872,7 +2980,9 @@ def watch_and_transcribe(
                     try:
                         if task_kind == "postprocess":
                             transcript_path = _find_existing_transcript_for_input(
-                                f, args.output_dir
+                                f,
+                                args.output_dir,
+                                getattr(args, "non_session_output_dir", None),
                             )
                             if transcript_path is None:
                                 logger.warning(
@@ -2895,6 +3005,9 @@ def watch_and_transcribe(
                                 compute_type=args.compute_type,
                                 batch_size=args.batch_size,
                                 output_dir=args.output_dir,
+                                non_session_output_dir=getattr(
+                                    args, "non_session_output_dir", None
+                                ),
                                 speaker_mapping_path=args.speaker_mapping,
                                 min_speakers=args.min_speakers,
                                 max_speakers=args.max_speakers,
@@ -3004,6 +3117,10 @@ def main():
         help="Override the directory to monitor in watch mode (defaults to INPUT/config input)",
     )
     ap.add_argument("--output-dir", default="outputs")
+    ap.add_argument(
+        "--non-session-output-dir",
+        help="Alternate output root for transcripts without a recognizable session number",
+    )
     ap.add_argument(
         "--speaker-mapping",
         dest="speaker_mapping",
@@ -3350,6 +3467,7 @@ def main():
         batch_size=args.batch_size,
         auto_batch=args.auto_batch,
         output_dir=args.output_dir,
+        non_session_output_dir=args.non_session_output_dir,
         speaker_mapping_path=args.speaker_mapping,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,

@@ -85,6 +85,18 @@ def test_apply_config_defaults_honors_backend():
     assert parser.parse_args([]).backend == "parakeet"
 
 
+def test_apply_config_defaults_honors_non_session_output_dir():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--non-session-output-dir")
+
+    cli._apply_config_defaults(
+        parser,
+        {"non_session_output_dir": "/tmp/odds-and-ends"},
+    )
+
+    assert parser.parse_args([]).non_session_output_dir == "/tmp/odds-and-ends"
+
+
 def test_single_file_speaker_overrides_faster_labels(monkeypatch, tmp_path):
     captured: dict = {}
 
@@ -216,6 +228,29 @@ def test_find_existing_transcript_for_nested_session_input(tmp_path):
     )
 
     assert found == transcript
+
+
+def test_find_existing_transcript_for_non_session_input_prefers_alternate_output_root(tmp_path):
+    output_dir = tmp_path / "Transcripts"
+    alternate_output_dir = tmp_path / "Odds and Ends Transcripts"
+    transcript_dir = alternate_output_dir / "Live Smoke Test"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "Live Smoke Test.txt"
+    transcript.write_text("done", encoding="utf-8")
+
+    found = cli._find_existing_transcript_for_input(
+        str(tmp_path / "Audio" / "Live Smoke Test.zip"),
+        str(output_dir),
+        str(alternate_output_dir),
+    )
+
+    assert found == transcript
+
+
+def test_raw_recording_id_does_not_count_as_session_identity():
+    assert not cli._input_has_session_identity("/tmp/1j637PZBwVBg.zip")
+    assert not cli._input_has_session_identity("/tmp/MmCQtqke7kB5.zip")
+    assert cli._input_has_session_identity("/tmp/Session 63 Craig Copy Smoke.zip")
 
 
 def test_watch_task_kind_skips_historical_transcript_without_backfill(tmp_path):
@@ -352,6 +387,37 @@ def test_watch_task_kind_skips_postprocess_for_non_session_transcript(tmp_path):
         str(tmp_path / "incoming" / "Craig Copy Local Smoke.zip"),
         str(tmp_path / "outputs"),
         postprocess_config,
+        watch_postprocess_backfill=False,
+    )
+
+    assert action is None
+
+
+def test_watch_task_kind_skips_non_session_transcript_in_alternate_root(tmp_path):
+    main_output_dir = tmp_path / "outputs"
+    alternate_output_dir = tmp_path / "Odds and Ends Transcripts"
+    transcript_root = alternate_output_dir / "Live Smoke Test"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Live Smoke Test.txt"
+    transcript_path.write_text("done", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Live Smoke Test.zip"),
+        str(main_output_dir),
+        postprocess_config,
+        non_session_output_dir=str(alternate_output_dir),
         watch_postprocess_backfill=False,
     )
 

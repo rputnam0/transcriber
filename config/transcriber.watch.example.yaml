@@ -11,6 +11,10 @@ watch_input: audio/incoming
 watch_interval: 10
 watch_stability: 5
 output_dir: outputs
+non_session_output_dir:
+  # Optional alternate root for recordings that do not resolve to a session number.
+  # Useful for smoke tests, ad-hoc clips, and other odds-and-ends transcripts that
+  # should not land in your main campaign transcript folder.
 
 # Optional glob patterns to skip while recursively scanning the watch root.
 # Useful when the watch root contains raw stems or other source artifacts that
