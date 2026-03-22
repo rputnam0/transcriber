@@ -2691,6 +2691,15 @@ def _transcription_marker_status(transcript_path: Path) -> str | None:
     return status or "invalid"
 
 
+def _should_quarantine_watch_failure(message: str) -> bool:
+    known_bad_input_tokens = (
+        "Bad CRC-32",
+        "No audio files found",
+        "empty transcript bundle",
+    )
+    return any(token in message for token in known_bad_input_tokens)
+
+
 def _watch_task_kind(
     input_path: str,
     output_dir: str,
@@ -2912,7 +2921,7 @@ def watch_and_transcribe(
                         msg = str(exc)
                         logger.error("Watch: failed to process %s: %s", f, msg)
                         # Quarantine known-bad inputs to avoid hammering the same file forever
-                        if any(token in msg for token in ("Bad CRC-32", "No audio files found")):
+                        if _should_quarantine_watch_failure(msg):
                             try:
                                 dest = quarantine_dir / Path(f).name
                                 Path(f).replace(dest)

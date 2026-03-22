@@ -358,6 +358,16 @@ def test_watch_task_kind_skips_postprocess_for_non_session_transcript(tmp_path):
     assert action is None
 
 
+def test_should_quarantine_watch_failure_recognizes_empty_transcript_bundle():
+    assert cli._should_quarantine_watch_failure(
+        "Refusing to run post-processing with an empty transcript bundle for /tmp/out.txt"
+    )
+
+
+def test_should_quarantine_watch_failure_ignores_retryable_errors():
+    assert not cli._should_quarantine_watch_failure("temporary google api timeout")
+
+
 def test_watch_task_kind_waits_for_completed_split_part_markers(tmp_path):
     part_one_root = tmp_path / "outputs" / "Session 28 1_2"
     part_two_root = tmp_path / "outputs" / "Session 28 2_2"
