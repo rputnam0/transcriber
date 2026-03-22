@@ -4,7 +4,33 @@ from pathlib import Path
 
 import pytest
 
-from transcriber.consolidate import save_outputs
+from transcriber.consolidate import choose_speaker, save_outputs
+
+
+def test_choose_speaker_ignores_numeric_only_fuzzy_matches():
+    mapping = {
+        "autbot_80hd_55561_0": "B. Ver",
+        "travisaurus6985_0": "Cyrus Schwert",
+        "kinglizard7958_0": "Leopold Magnus",
+    }
+
+    assert choose_speaker("1.flac", mapping, return_match=True) == ("1", False)
+    assert choose_speaker("9.flac", mapping, return_match=True) == ("9", False)
+
+
+def test_choose_speaker_preserves_alpha_stem_fuzzy_matching():
+    mapping = {
+        "kinglizard7958_0": "Leopold Magnus",
+    }
+
+    assert choose_speaker("kinglizard7958.flac", mapping, return_match=True) == (
+        "Leopold Magnus",
+        True,
+    )
+    assert choose_speaker("6-kinglizard7958.ogg", mapping, return_match=True) == (
+        "Leopold Magnus",
+        True,
+    )
 
 
 def test_save_outputs_raises_when_output_dir_is_not_writable(monkeypatch, tmp_path):

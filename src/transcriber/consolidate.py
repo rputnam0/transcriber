@@ -25,11 +25,12 @@ def choose_speaker(
 ) -> Union[str, Tuple[str, bool]]:
     """Pick a friendly speaker label based on path / mapping tokens.
 
-    Behavior mirrors the prototype's flexible matching:
+    Behavior mirrors the prototype's flexible matching, with one guardrail:
       - Trim file extension for comparisons
       - Prefer the portion after the last hyphen (e.g., "2-foo_0" -> "foo_0")
       - Also strip any leading "<digits>-" prefix if present
       - Match case-insensitively using either exact stem or substring containment
+      - Avoid fuzzy substring matches for numeric-only stems like "1.flac"
     """
     stem = Path(filename).stem
     if not mapping:
@@ -75,6 +76,8 @@ def choose_speaker(
     # 2) Substring containment either direction (like the prototype)
     for cand in uniq_candidates:
         simplified = re.sub(r"[^a-z0-9]+", "", cand)
+        if not _allow_fuzzy_speaker_match(cand, simplified):
+            continue
         for key, value in normalized.items():
             if cand in key or key in cand:
                 result = value
@@ -85,6 +88,12 @@ def choose_speaker(
                 return (result, True) if return_match else result
 
     return (stem, False) if return_match else stem
+
+
+def _allow_fuzzy_speaker_match(candidate: str, simplified: str) -> bool:
+    if len(simplified) < 3:
+        return False
+    return any(ch.isalpha() for ch in candidate)
 
 
 def consolidate(all_segments: List[Tuple[str, List[dict]]]) -> List[Tuple[str, str, str]]:
