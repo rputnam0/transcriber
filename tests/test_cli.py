@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from transcriber import cli
-from transcriber.postprocess import PostProcessConfig
+from transcriber.postprocess import PostProcessConfig, SummaryReadyConfig
 from transcriber.speaker_bank import SpeakerBankConfig
 
 
@@ -293,6 +294,21 @@ def test_find_existing_transcript_for_nested_session_input(tmp_path):
     assert found == transcript
 
 
+def test_find_existing_transcript_for_input_ignores_similarly_named_session_variant(tmp_path):
+    output_dir = tmp_path / "Transcripts"
+    transcript_dir = output_dir / "Session 65 test"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "Session 65 test.txt"
+    transcript.write_text("done", encoding="utf-8")
+
+    found = cli._find_existing_transcript_for_input(
+        str(tmp_path / "Audio" / "Session 65.zip"),
+        str(output_dir),
+    )
+
+    assert found is None
+
+
 def test_find_existing_transcript_for_non_session_input_prefers_alternate_output_root(tmp_path):
     output_dir = tmp_path / "Transcripts"
     alternate_output_dir = tmp_path / "Odds and Ends Transcripts"
@@ -365,6 +381,81 @@ def test_watch_task_kind_retries_postprocess_for_marked_transcript(tmp_path):
     )
 
     assert action == "postprocess"
+
+
+def test_watch_task_kind_retries_postprocess_when_summary_receipt_is_missing(tmp_path):
+    transcript_root = tmp_path / "outputs" / "Session 44"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_root / "Session 44.txt"
+    transcript_path.write_text("hello", encoding="utf-8")
+    cli._transcription_completion_marker_path(transcript_path).write_text(
+        '{"status":"completed"}',
+        encoding="utf-8",
+    )
+
+    postprocess_config = PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="test-model",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+        summary_ready=SummaryReadyConfig(state_target=str(tmp_path / "state")),
+    )
+    marker_path = (
+        Path(postprocess_config.summaries_dir) / "Session 44" / "session_44.postprocess.json"
+    )
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    (marker_path.parent / "raw_txt").mkdir(parents=True, exist_ok=True)
+    (marker_path.parent / "raw_txt" / "session_44_summary_output.txt").write_text(
+        "# Summary\n\nFresh summary.\n",
+        encoding="utf-8",
+    )
+    marker_path.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "transcript_path": str(transcript_path),
+                "source_transcript_paths": [str(transcript_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    action = cli._watch_task_kind(
+        str(tmp_path / "incoming" / "Session 44.wav"),
+        str(tmp_path / "outputs"),
+        postprocess_config,
+        watch_postprocess_backfill=False,
+    )
+
+    assert action == "postprocess"
+
+    summary_ready_marker = marker_path.parent / "session_44.summary-ready.json"
+    summary_ready_marker.write_text(
+        json.dumps(
+            {
+                "recording_id": "rec-44",
+                "transcript_path": str(transcript_path),
+                "source_transcript_paths": [str(transcript_path)],
+                "summary_path": str(
+                    marker_path.parent / "raw_txt" / "session_44_summary_output.txt"
+                ),
+                "drive_url": "https://drive.example/rec-44",
+                "document_url": "https://drive.example/docs/rec-44",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        cli._watch_task_kind(
+            str(tmp_path / "incoming" / "Session 44.wav"),
+            str(tmp_path / "outputs"),
+            postprocess_config,
+            watch_postprocess_backfill=False,
+        )
+        is None
+    )
 
 
 def test_watch_task_kind_retranscribes_expected_transcript_with_incomplete_marker(tmp_path):

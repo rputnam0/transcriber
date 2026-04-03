@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +183,65 @@ def test_run_transcribe_runs_postprocess_when_enabled(monkeypatch, tmp_path):
     assert called["config"] is postprocess_config
     assert called["marker_exists"] is True
     assert called["marker_status"] == "completed"
+
+
+def test_run_transcribe_stamps_craig_recording_metadata_into_marker(monkeypatch, tmp_path):
+    from transcriber import cli as cli_mod
+    from transcriber.transcript_pipeline import TranscriptPipelineResult
+
+    fake_input = tmp_path / "Session 65.zip"
+    fake_input.write_text("dummy", encoding="utf-8")
+    (tmp_path / "Session 65.json").write_text(
+        '{"recording_id":"rec-65","preferred_basename":"Session 65"}',
+        encoding="utf-8",
+    )
+    transcript_dir = tmp_path / "outputs" / "Session 65"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(cli_mod, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli_mod, "_preload_cudnn_libs", lambda: None)
+    monkeypatch.setattr(cli_mod, "cleanup_tmp", lambda *_args: None)
+    monkeypatch.setattr(cli_mod, "gather_inputs", lambda path: ([str(fake_input)], None))
+    monkeypatch.setattr("transcriber.diarization._detect_device", lambda: "cpu")
+
+    def fake_save_outputs(**kwargs):
+        transcript_path = transcript_dir / "Session 65.txt"
+        transcript_path.write_text("Speaker 00 00:00:00 hello world\n", encoding="utf-8")
+        return transcript_dir
+
+    def fake_transcribe_with_faster_pipeline(*args, **kwargs):
+        return TranscriptPipelineResult(
+            segments=[{"start": 0.0, "end": 1.0, "text": "hello world", "speaker": "SPEAKER_00"}],
+            diarization_segments=[],
+            exclusive_diarization_segments=[],
+            speaker_embeddings={},
+            metadata={},
+        )
+
+    monkeypatch.setattr(cli_mod, "save_outputs", fake_save_outputs)
+    monkeypatch.setattr(
+        "transcriber.transcript_pipeline.transcribe_with_faster_pipeline",
+        fake_transcribe_with_faster_pipeline,
+    )
+
+    cli_mod.run_transcribe(
+        input_path=str(fake_input),
+        backend="faster",
+        model_name="tiny",
+        compute_type="int8",
+        batch_size=4,
+        output_dir=str(tmp_path / "outputs"),
+        hf_cache_root=None,
+        speaker_bank_root=None,
+        write_srt=False,
+        write_jsonl=False,
+        auto_batch=False,
+        speaker_bank_config=None,
+    )
+
+    marker = json.loads((transcript_dir / "Session 65.transcribe.json").read_text(encoding="utf-8"))
+    assert marker["recording_id"] == "rec-65"
+    assert marker["title"] == "Session 65"
 
 
 def test_run_transcribe_skips_postprocess_for_non_session_transcript(monkeypatch, tmp_path):

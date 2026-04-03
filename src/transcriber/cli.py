@@ -30,6 +30,7 @@ from .postprocess import (
     resolve_postprocess_config,
     run_postprocess_for_transcript,
     split_session_ready_for_postprocess,
+    summary_ready_receipt_current,
 )
 from .segment_classifier import (
     load_segment_classifier,
@@ -47,6 +48,11 @@ from .segments import (
 # Keep global references to preloaded CUDA libraries so they aren't dlclosed
 _CUDA_PRELOAD_HANDLES: list = []
 _SESSION_KEY_RE = re.compile(r"session\s*([0-9]+(?:\s+[0-9]+_[0-9]+)?)", re.IGNORECASE)
+_TRANSCRIPT_NAME_PREFIX_RE = re.compile(r"^(?:copy of\s+)+", re.IGNORECASE)
+_TRANSCRIPT_NAME_SUFFIX_RE = re.compile(
+    r"(?:\s+(?:transcript(?:ion)?|copy))+$",
+    re.IGNORECASE,
+)
 
 
 def _ensure_cuda_libs_on_path() -> None:
@@ -2443,10 +2449,12 @@ def run_transcribe(
     )
 
     transcript_output_path = Path(effective_output_dir) / f"{base}.txt"
+    craig_input_metadata = _load_craig_input_metadata(input_path)
     _write_transcription_completion_marker(
         transcript_output_path,
         input_path=input_path,
         status="in_progress",
+        extra_metadata=craig_input_metadata,
     )
 
     final_out_dir = save_outputs(
@@ -2486,6 +2494,7 @@ def run_transcribe(
             transcript_output_path,
             input_path=input_path,
             status="completed",
+            extra_metadata=craig_input_metadata,
         )
     else:
         logger.warning("Transcript output missing after save_outputs: %s", transcript_output_path)
@@ -2680,17 +2689,26 @@ def _normalize_watch_name(text: str) -> str:
     return " ".join(text.replace("_", " ").lower().split())
 
 
+def _normalize_transcript_match_name(text: str) -> str:
+    normalized = _normalize_watch_name(text)
+    normalized = _TRANSCRIPT_NAME_PREFIX_RE.sub("", normalized).strip()
+    normalized = _TRANSCRIPT_NAME_SUFFIX_RE.sub("", normalized).strip()
+    return normalized
+
+
 def _find_existing_transcript_match_for_input(
     input_path: str,
     output_dir: str,
     non_session_output_dir: str | None = None,
 ) -> tuple[Path, bool] | None:
     input_obj = Path(input_path)
-    input_keys: set[str] = set()
-    for part in (*input_obj.parts, input_obj.stem):
-        input_keys.update(_extract_session_keys(part))
-
-    normalized_stem = _normalize_watch_name(input_obj.stem)
+    normalized_input_names = {
+        normalized
+        for candidate in _input_identity_candidates(input_obj)
+        if (normalized := _normalize_transcript_match_name(candidate))
+    }
+    if not normalized_input_names:
+        normalized_input_names.add(_normalize_transcript_match_name(input_obj.stem))
     for root_index, output_root in enumerate(
         _transcript_search_roots_for_input(
             input_path,
@@ -2706,13 +2724,13 @@ def _find_existing_transcript_match_for_input(
             continue
 
         for transcript_path in sorted(output_root.rglob("*.txt")):
-            transcript_keys: set[str] = set()
             rel = transcript_path.relative_to(output_root)
-            for part in rel.parts:
-                transcript_keys.update(_extract_session_keys(part))
-            if input_keys and transcript_keys.intersection(input_keys):
-                return transcript_path, False
-            if not input_keys and _normalize_watch_name(transcript_path.stem) == normalized_stem:
+            normalized_transcript_names = {
+                normalized
+                for part in rel.parts
+                if (normalized := _normalize_transcript_match_name(part))
+            }
+            if normalized_input_names.intersection(normalized_transcript_names):
                 return transcript_path, False
     return None
 
@@ -2765,11 +2783,33 @@ def _path_exists_with_retry(
     return False
 
 
+def _load_craig_input_metadata(input_path: str) -> dict[str, str]:
+    manifest_path = Path(input_path).expanduser().with_suffix(".json")
+    if not manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    metadata: dict[str, str] = {"input_manifest_path": str(manifest_path)}
+    recording_id = str(payload.get("recording_id") or "").strip()
+    if recording_id:
+        metadata["recording_id"] = recording_id
+    title = str(payload.get("preferred_basename") or payload.get("requested_name") or "").strip()
+    if title:
+        metadata["title"] = title
+    return metadata
+
+
 def _write_transcription_completion_marker(
     transcript_path: Path,
     *,
     input_path: str,
     status: str = "completed",
+    extra_metadata: dict[str, str] | None = None,
 ) -> None:
     marker_path = _transcription_completion_marker_path(transcript_path)
     metadata = {
@@ -2778,6 +2818,8 @@ def _write_transcription_completion_marker(
         "transcript_path": str(transcript_path),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
     _atomic_write_text(marker_path, json.dumps(metadata, indent=2) + "\n")
 
 
@@ -2830,6 +2872,12 @@ def _watch_task_kind(
 
     marker_path = expected_completion_marker_path(transcript_path, postprocess_config)
     if marker_path.exists():
+        if postprocess_config.summary_ready and not summary_ready_receipt_current(
+            transcript_path,
+            postprocess_config,
+        ):
+            if transcription_marker_status == "completed" or watch_postprocess_backfill:
+                return "postprocess"
         return None
     if not split_session_ready_for_postprocess(transcript_path):
         return None

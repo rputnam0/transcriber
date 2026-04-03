@@ -4,11 +4,15 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ class PostProcessConfig:
     calls_per_minute: int = 5
     skip_existing: bool = True
     thinking_level: str | None = None
+    summary_ready: "SummaryReadyConfig | None" = None
 
     @property
     def delay_seconds(self) -> float:
@@ -95,6 +100,13 @@ class TranscriptBundle:
 class PostProcessResult:
     paths: PostProcessPaths
     created_marker: bool
+
+
+@dataclass(frozen=True)
+class SummaryReadyConfig:
+    state_target: str
+    ssh_options: str = ""
+    scenes_count: int = 2
 
 
 class SplitSessionPendingError(RuntimeError):
@@ -187,6 +199,24 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
     thinking_level = thinking_level_raw or None
     if thinking_level not in (None, "minimal", "low", "medium", "high"):
         raise SystemExit("postprocess.thinking_level must be one of: minimal, low, medium, high.")
+    raw_summary_ready_cfg = raw_cfg.get("summary_ready") or {}
+    summary_ready: SummaryReadyConfig | None = None
+    if raw_summary_ready_cfg:
+        if not isinstance(raw_summary_ready_cfg, Mapping):
+            raise SystemExit("postprocess.summary_ready must be a mapping when provided.")
+        if bool(raw_summary_ready_cfg.get("enabled")):
+            state_target = str(raw_summary_ready_cfg.get("state_target") or "").strip()
+            if not state_target:
+                raise SystemExit(
+                    "postprocess.summary_ready.state_target is required when summary_ready is enabled."
+                )
+            ssh_options = str(raw_summary_ready_cfg.get("ssh_options") or "").strip()
+            scenes_count = max(0, int(raw_summary_ready_cfg.get("scenes_count") or 2))
+            summary_ready = SummaryReadyConfig(
+                state_target=state_target,
+                ssh_options=ssh_options,
+                scenes_count=scenes_count,
+            )
 
     if provider != "google":
         raise SystemExit(f"Unsupported postprocess.provider={provider!r}; expected 'google'.")
@@ -208,6 +238,7 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
         calls_per_minute=max(0, calls_per_minute),
         skip_existing=skip_existing,
         thinking_level=thinking_level,
+        summary_ready=summary_ready,
     )
 
 
@@ -246,6 +277,33 @@ def build_postprocess_paths(
     )
 
 
+def summary_ready_marker_path(
+    transcript_path: str | Path,
+    config: PostProcessConfig,
+) -> Path:
+    """Return the local idempotency marker path for summary-ready publication."""
+    paths = build_postprocess_paths(transcript_path, config)
+    return _summary_ready_marker_path_for_paths(paths)
+
+
+def summary_ready_receipt_current(
+    transcript_path: str | Path,
+    config: PostProcessConfig,
+) -> bool:
+    """Return true when the summary-ready publication marker is current for a transcript."""
+    if config.summary_ready is None:
+        return True
+    paths = build_postprocess_paths(transcript_path, config)
+    bundle = resolve_transcript_bundle(paths.transcript_path)
+    if not bundle.is_complete:
+        return False
+    return _summary_ready_marker_is_current(paths, bundle, config.summary_ready)
+
+
+def _summary_ready_marker_path_for_paths(paths: PostProcessPaths) -> Path:
+    return paths.session_folder / f"session_{paths.session_number}.summary-ready.json"
+
+
 def run_postprocess_for_transcript(
     transcript_path: str | Path,
     config: PostProcessConfig,
@@ -260,10 +318,6 @@ def run_postprocess_for_transcript(
             f"Transcript not found for post-processing: {paths.transcript_path}"
         )
 
-    if config.skip_existing and _postprocess_complete(paths):
-        logger.info("Post-process already complete for session %s", paths.session_number)
-        return PostProcessResult(paths=paths, created_marker=False)
-
     transcript_bundle = resolve_transcript_bundle(paths.transcript_path)
     if not transcript_bundle.is_complete:
         missing = ", ".join(str(part) for part in transcript_bundle.missing_parts)
@@ -271,6 +325,19 @@ def run_postprocess_for_transcript(
             f"Split-session transcript for session {paths.session_number} is waiting for part(s): "
             f"{missing}"
         )
+    can_reuse_existing_outputs = config.skip_existing and _postprocess_outputs_are_current(
+        paths,
+        transcript_bundle,
+    )
+    if can_reuse_existing_outputs:
+        logger.info("Post-process already complete for session %s", paths.session_number)
+        _publish_summary_ready_receipt(
+            paths,
+            transcript_bundle,
+            summary_text=_read_text(paths.summary_txt),
+            config=config,
+        )
+        return PostProcessResult(paths=paths, created_marker=False)
 
     prompts = _load_prompt_texts(config.prompts_dir)
     previous_campaign_overview = _resolve_previous_campaign_overview(paths, config, prompts)
@@ -280,7 +347,7 @@ def run_postprocess_for_transcript(
     analysis_text, _ = _materialize_text_and_docx(
         text_path=paths.analysis_txt,
         docx_path=paths.analysis_docx,
-        skip_existing=config.skip_existing,
+        skip_existing=can_reuse_existing_outputs,
         generate_text=lambda: _generate_analysis(
             client=client,
             prompts=prompts,
@@ -291,7 +358,7 @@ def run_postprocess_for_transcript(
     campaign_overview_text, _ = _materialize_text_and_docx(
         text_path=paths.campaign_overview_txt,
         docx_path=paths.campaign_overview_docx,
-        skip_existing=config.skip_existing,
+        skip_existing=can_reuse_existing_outputs,
         generate_text=lambda: _generate_campaign_overview(
             client=client,
             prompts=prompts,
@@ -302,7 +369,7 @@ def run_postprocess_for_transcript(
     summary_text, _ = _materialize_text_and_docx(
         text_path=paths.summary_txt,
         docx_path=paths.summary_docx,
-        skip_existing=config.skip_existing,
+        skip_existing=can_reuse_existing_outputs,
         generate_text=lambda: _generate_summary(
             client=client,
             prompts=prompts,
@@ -345,6 +412,13 @@ def run_postprocess_for_transcript(
         "Post-process complete for session %s (summary=%s)",
         paths.session_number,
         paths.summary_docx,
+    )
+    _publish_summary_ready_receipt(
+        paths,
+        transcript_bundle,
+        summary_text=summary_text,
+        config=config,
+        client=client,
     )
     return PostProcessResult(paths=paths, created_marker=True)
 
@@ -680,6 +754,71 @@ def _extract_tagged_text(text: str, tag_name: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _extract_tagged_blocks(text: str, tag_name: str) -> list[str]:
+    pattern = re.compile(
+        rf"<{re.escape(tag_name)}>(.*?)</{re.escape(tag_name)}>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return [match.strip() for match in pattern.findall(text) if match.strip()]
+
+
+def _build_summary_excerpt(text: str, limit: int = 280) -> str:
+    excerpt = " ".join(text.split())
+    if limit <= 0 or len(excerpt) <= limit:
+        return excerpt
+    return excerpt[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def _fallback_announcement_scenes(summary_text: str, count: int) -> list[str]:
+    if count <= 0:
+        return []
+    candidates: list[str] = []
+    for block in re.split(r"\n\s*\n", summary_text):
+        line = " ".join(block.split()).strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        candidates.append(line)
+    if not candidates:
+        fallback = _build_summary_excerpt(summary_text, 280)
+        return [fallback] if fallback else []
+    return candidates[:count]
+
+
+def _generate_announcement_scenes(
+    client: _GoogleTextGenerator,
+    *,
+    summary_text: str,
+    scenes_count: int,
+) -> list[str]:
+    if scenes_count <= 0:
+        return []
+    prompt = (
+        "Select the funniest or most impactful scenes from this tabletop RPG session summary.\n"
+        f"Return exactly {scenes_count} short, vivid scene snippets.\n"
+        "Use only this XML format and no extra text:\n"
+        "<announcement_scenes><scene>...</scene><scene>...</scene></announcement_scenes>\n\n"
+        f"{summary_text.strip()}"
+    )
+    response_text = client.generate(
+        prompt=prompt,
+        system_instruction=(
+            "You write short Discord-ready scene callouts from RPG session summaries. "
+            "Favor funny, surprising, or emotionally strong moments. Return only XML."
+        ),
+    )
+    scenes = [
+        " ".join(scene.split())
+        for scene in _extract_tagged_blocks(response_text, "scene")
+        if scene.strip()
+    ]
+    if scenes:
+        return scenes[:scenes_count]
+    logger.warning("Announcement scene response was missing <scene> tags; using summary fallback.")
+    return _fallback_announcement_scenes(summary_text, scenes_count)
+
+
 def _materialize_text_and_docx(
     *,
     text_path: Path,
@@ -701,8 +840,47 @@ def _materialize_text_and_docx(
     return text, True
 
 
+def _summary_ready_marker_is_current(
+    paths: PostProcessPaths,
+    bundle: TranscriptBundle,
+    summary_ready_config: SummaryReadyConfig,
+) -> bool:
+    del summary_ready_config
+    marker_path = _summary_ready_marker_path_for_paths(paths)
+    metadata = _load_postprocess_metadata(marker_path)
+    if metadata is None:
+        return False
+    if not str(metadata.get("document_url") or "").strip():
+        return False
+    expected_sources = [str(path) for path in bundle.source_transcript_paths]
+    actual_sources = metadata.get("source_transcript_paths")
+    if not isinstance(actual_sources, list):
+        return False
+    if metadata.get("transcript_path") != str(paths.transcript_path):
+        return False
+    if [str(item) for item in actual_sources] != expected_sources:
+        return False
+    try:
+        newest_source_mtime = max(
+            path.stat().st_mtime
+            for path in (
+                *bundle.source_transcript_paths,
+                paths.summary_txt,
+                paths.completion_marker,
+            )
+        )
+        marker_mtime = marker_path.stat().st_mtime
+    except OSError:
+        return False
+    return marker_mtime >= newest_source_mtime
+
+
 def _postprocess_complete(paths: PostProcessPaths) -> bool:
-    required_files = (
+    return all(path.exists() for path in _required_postprocess_files(paths))
+
+
+def _required_postprocess_files(paths: PostProcessPaths) -> tuple[Path, ...]:
+    return (
         paths.analysis_txt,
         paths.analysis_docx,
         paths.campaign_overview_txt,
@@ -711,7 +889,424 @@ def _postprocess_complete(paths: PostProcessPaths) -> bool:
         paths.summary_docx,
         paths.completion_marker,
     )
-    return all(path.exists() for path in required_files)
+
+
+def _load_postprocess_metadata(marker_path: Path) -> dict[str, object] | None:
+    if not marker_path.exists():
+        return None
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _postprocess_outputs_are_current(
+    paths: PostProcessPaths,
+    bundle: TranscriptBundle,
+) -> bool:
+    required_files = _required_postprocess_files(paths)
+    if not all(path.exists() for path in required_files):
+        return False
+
+    metadata = _load_postprocess_metadata(paths.completion_marker)
+    if metadata is None:
+        return False
+
+    expected_sources = [str(path) for path in bundle.source_transcript_paths]
+    actual_sources = metadata.get("source_transcript_paths")
+    if not isinstance(actual_sources, list):
+        return False
+    if metadata.get("transcript_path") != str(paths.transcript_path):
+        return False
+    if [str(item) for item in actual_sources] != expected_sources:
+        return False
+
+    try:
+        newest_source_mtime = max(path.stat().st_mtime for path in bundle.source_transcript_paths)
+        oldest_output_mtime = min(path.stat().st_mtime for path in required_files)
+    except OSError:
+        return False
+    return oldest_output_mtime >= newest_source_mtime
+
+
+def _transcription_marker_payload(transcript_path: str | Path) -> dict[str, Any] | None:
+    marker_path = _transcription_completion_marker_path(transcript_path)
+    if not marker_path.exists():
+        return None
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_json_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_manifest_from_marker(marker_payload: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[Path] = []
+    manifest_path_raw = str(marker_payload.get("input_manifest_path") or "").strip()
+    if manifest_path_raw:
+        candidates.append(Path(manifest_path_raw).expanduser())
+
+    input_path_raw = str(marker_payload.get("input_path") or "").strip()
+    if input_path_raw:
+        input_path = Path(input_path_raw).expanduser()
+        candidates.append(input_path.with_suffix(".json"))
+        candidates.append(input_path.parent / "processed" / f"{input_path.stem}.json")
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        payload = _load_json_payload(candidate)
+        if payload is not None:
+            return payload
+    return None
+
+
+def _summary_ready_context(
+    paths: PostProcessPaths,
+) -> tuple[str, str] | None:
+    marker_payload = _transcription_marker_payload(paths.transcript_path) or {}
+    manifest_payload = _load_manifest_from_marker(marker_payload) or {}
+    recording_id = str(
+        marker_payload.get("recording_id") or manifest_payload.get("recording_id") or ""
+    ).strip()
+    if not recording_id:
+        return None
+    title = str(
+        marker_payload.get("title")
+        or manifest_payload.get("preferred_basename")
+        or manifest_payload.get("requested_name")
+        or f"Session {paths.session_number}"
+    ).strip()
+    return recording_id, title or f"Session {paths.session_number}"
+
+
+def _drivefs_metadata_db_paths() -> list[Path]:
+    roots = Path("/mnt/c/Users")
+    try:
+        if not roots.exists():
+            return []
+        user_dirs = list(roots.iterdir())
+    except OSError:
+        return []
+    candidates: list[Path] = []
+    for user_dir in user_dirs:
+        drivefs_root = user_dir / "AppData" / "Local" / "Google" / "DriveFS"
+        try:
+            if not drivefs_root.exists():
+                continue
+            account_dirs = list(drivefs_root.iterdir())
+        except OSError:
+            continue
+        for account_dir in account_dirs:
+            candidate = account_dir / "mirror_metadata_sqlite.db"
+            try:
+                if candidate.is_file():
+                    candidates.append(candidate)
+            except OSError:
+                continue
+    return sorted(candidates)
+
+
+def _drivefs_relative_parts(path: Path) -> tuple[str, ...] | None:
+    normalized_parts = path.expanduser().parts
+    for anchor in ("My Drive", "Shared drives"):
+        if anchor in normalized_parts:
+            start = normalized_parts.index(anchor)
+            return normalized_parts[start:]
+    return None
+
+
+def _copy_db_snapshot(path: Path) -> Path:
+    snapshot = Path(tempfile.mkstemp(prefix=f"{path.stem}.", suffix=".sqlite")[1])
+    shutil.copy2(path, snapshot)
+    return snapshot
+
+
+def _drivefs_cloud_id_for_parts(db_path: Path, parts: tuple[str, ...]) -> str | None:
+    if not parts:
+        return None
+    snapshot_path = _copy_db_snapshot(db_path)
+    try:
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            candidates = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    select stable_id
+                    from items
+                    where local_title = ? and is_tombstone = 0
+                    """,
+                    (parts[0],),
+                ).fetchall()
+            ]
+            for part in parts[1:]:
+                if not candidates:
+                    return None
+                next_candidates: list[int] = []
+                for parent_stable_id in candidates:
+                    next_candidates.extend(
+                        row[0]
+                        for row in conn.execute(
+                            """
+                            select i.stable_id
+                            from items i
+                            join stable_parents sp on sp.item_stable_id = i.stable_id
+                            where i.local_title = ?
+                              and i.is_tombstone = 0
+                              and sp.parent_stable_id = ?
+                            """,
+                            (part, parent_stable_id),
+                        ).fetchall()
+                    )
+                candidates = next_candidates
+            if not candidates:
+                return None
+            row = conn.execute(
+                """
+                select cloud_id
+                from stable_ids
+                where stable_id = ?
+                """,
+                (candidates[0],),
+            ).fetchone()
+            if row and isinstance(row[0], str) and row[0].strip():
+                return row[0].strip()
+            return None
+        finally:
+            conn.close()
+    finally:
+        snapshot_path.unlink(missing_ok=True)
+
+
+def _resolve_summary_document_url(summary_docx_path: Path) -> str | None:
+    parts = _drivefs_relative_parts(summary_docx_path)
+    if not parts:
+        return None
+    for db_path in _drivefs_metadata_db_paths():
+        try:
+            cloud_id = _drivefs_cloud_id_for_parts(db_path, parts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to query DriveFS metadata at %s: %s", db_path, exc)
+            continue
+        if cloud_id:
+            return f"https://drive.google.com/open?id={cloud_id}"
+    return None
+
+
+def _is_remote_target(target: str) -> bool:
+    return ":" in target and not target.startswith(("/", ".", "~"))
+
+
+def _parse_remote_target(target: str) -> tuple[str, str]:
+    host, separator, remote_path = target.partition(":")
+    if not separator or not host or not remote_path:
+        raise ValueError(f"Unsupported remote target: {target!r}")
+    return host, remote_path
+
+
+def _build_ssh_command(
+    summary_ready: SummaryReadyConfig, host: str, remote_command: str
+) -> list[str]:
+    command = ["ssh"]
+    if summary_ready.ssh_options:
+        command.extend(shlex.split(summary_ready.ssh_options))
+    command.extend([host, remote_command])
+    return command
+
+
+def _run_checked(
+    command: list[str], *, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        input=input_text,
+        text=True,
+    )
+
+
+def _load_state_receipt(
+    summary_ready: SummaryReadyConfig,
+    *,
+    recording_id: str,
+    suffix: str,
+) -> dict[str, Any] | None:
+    receipt_name = f"{recording_id}.{suffix}.json"
+    if _is_remote_target(summary_ready.state_target):
+        host, remote_dir = _parse_remote_target(summary_ready.state_target)
+        remote_receipt = str(Path(remote_dir) / receipt_name)
+        command = _build_ssh_command(
+            summary_ready,
+            host,
+            f"cat {shlex.quote(remote_receipt)}",
+        )
+        try:
+            result = _run_checked(command)
+        except subprocess.CalledProcessError:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    receipt_path = Path(summary_ready.state_target).expanduser() / receipt_name
+    if not receipt_path.exists():
+        return None
+    return _load_json_payload(receipt_path)
+
+
+def _write_summary_ready_receipt(
+    summary_ready: SummaryReadyConfig,
+    *,
+    recording_id: str,
+    title: str,
+    summary_excerpt: str,
+    drive_url: str,
+    completed_at: str,
+    announcement_scenes: list[str],
+    document_url: str = "",
+    status: str = "ready",
+) -> None:
+    receipt_name = f"{recording_id}.summary-ready.json"
+    payload: dict[str, Any] = {
+        "recording_id": recording_id,
+        "title": title,
+        "summary_excerpt": summary_excerpt,
+        "drive_url": drive_url,
+        "completed_at": completed_at,
+        "status": status,
+    }
+    cleaned_scenes = [scene.strip() for scene in announcement_scenes if scene.strip()]
+    if cleaned_scenes:
+        payload["announcement_scenes"] = cleaned_scenes
+    if document_url.strip():
+        payload["document_url"] = document_url.strip()
+    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+    if _is_remote_target(summary_ready.state_target):
+        host, remote_dir = _parse_remote_target(summary_ready.state_target)
+        remote_receipt = str(Path(remote_dir) / receipt_name)
+        temp_receipt = f"{remote_receipt}.tmp.{os.getpid()}"
+        remote_command = (
+            f"mkdir -p {shlex.quote(remote_dir)} && "
+            f"cat > {shlex.quote(temp_receipt)} && "
+            f"mv {shlex.quote(temp_receipt)} {shlex.quote(remote_receipt)}"
+        )
+        _run_checked(
+            _build_ssh_command(summary_ready, host, remote_command),
+            input_text=payload_text,
+        )
+        return
+
+    state_dir = Path(summary_ready.state_target).expanduser()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    temp_receipt = state_dir / f".{receipt_name}.tmp.{os.getpid()}"
+    temp_receipt.write_text(payload_text, encoding="utf-8")
+    os.replace(temp_receipt, state_dir / receipt_name)
+
+
+def _write_summary_ready_marker(
+    paths: PostProcessPaths,
+    bundle: TranscriptBundle,
+    *,
+    recording_id: str,
+    drive_url: str,
+    document_url: str,
+) -> None:
+    marker_path = _summary_ready_marker_path_for_paths(paths)
+    metadata = {
+        "recording_id": recording_id,
+        "transcript_path": str(paths.transcript_path),
+        "source_transcript_paths": [str(path) for path in bundle.source_transcript_paths],
+        "summary_path": str(paths.summary_txt),
+        "drive_url": drive_url,
+        "document_url": document_url,
+        "published_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _atomic_write_text(marker_path, json.dumps(metadata, indent=2) + "\n")
+
+
+def _publish_summary_ready_receipt(
+    paths: PostProcessPaths,
+    bundle: TranscriptBundle,
+    *,
+    summary_text: str,
+    config: PostProcessConfig,
+    client: _GoogleTextGenerator | None = None,
+) -> None:
+    summary_ready = config.summary_ready
+    if summary_ready is None:
+        return
+    if _summary_ready_marker_is_current(paths, bundle, summary_ready):
+        return
+
+    context = _summary_ready_context(paths)
+    if context is None:
+        logger.warning(
+            "Skipping summary-ready receipt for %s: missing Craig recording id",
+            paths.transcript_path,
+        )
+        return
+    recording_id, title = context
+    drive_receipt = _load_state_receipt(
+        summary_ready,
+        recording_id=recording_id,
+        suffix="drive-uploaded",
+    )
+    drive_url = str((drive_receipt or {}).get("url") or "").strip()
+    if not drive_url:
+        logger.warning(
+            "Skipping summary-ready receipt for %s: drive-uploaded receipt is not available yet",
+            recording_id,
+        )
+        return
+    document_url = _resolve_summary_document_url(paths.summary_docx)
+    if not document_url:
+        logger.warning(
+            "Skipping summary-ready receipt for %s: summary document Drive link is not available yet",
+            recording_id,
+        )
+        return
+
+    generator = client or _GoogleTextGenerator(config)
+    announcement_scenes = _generate_announcement_scenes(
+        generator,
+        summary_text=summary_text,
+        scenes_count=summary_ready.scenes_count,
+    )
+    completion_payload = _load_postprocess_metadata(paths.completion_marker) or {}
+    completed_at = str(
+        completion_payload.get("generated_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    ).strip()
+    _write_summary_ready_receipt(
+        summary_ready,
+        recording_id=recording_id,
+        title=title,
+        summary_excerpt=_build_summary_excerpt(summary_text),
+        drive_url=drive_url,
+        completed_at=completed_at,
+        announcement_scenes=announcement_scenes,
+        document_url=document_url,
+    )
+    _write_summary_ready_marker(
+        paths,
+        bundle,
+        recording_id=recording_id,
+        drive_url=drive_url,
+        document_url=document_url,
+    )
 
 
 def _read_text(path: Path) -> str:
