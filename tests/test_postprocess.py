@@ -277,6 +277,209 @@ def test_run_postprocess_for_transcript_writes_summary_ready_receipt(monkeypatch
     assert len(DummyGenerator.calls) == 4
 
 
+def test_run_postprocess_for_transcript_backfills_drive_uploaded_receipt_from_audio_bundle(
+    monkeypatch,
+    tmp_path,
+):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    state_dir = tmp_path / "state"
+    audio_dir = tmp_path / "drive" / "Audio"
+    incoming_dir = tmp_path / "incoming"
+    transcript_dir = tmp_path / "transcripts" / "Session 66"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    incoming_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / "Session 66.txt"
+    source_zip = incoming_dir / "Session 66.zip"
+    source_zip.write_bytes(b"zip-bytes-66")
+    (incoming_dir / "Session 66.json").write_text(
+        json.dumps(
+            {
+                "recording_id": "rec-66",
+                "preferred_basename": "Session 66",
+                "requester_id": "user-66",
+                "format": "flac",
+                "container": "zip",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transcript_path.write_text("Speaker 00 00:00:00 Real session transcript\n", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+    _write_transcription_marker(
+        transcript_path,
+        "completed",
+        input_path=str(source_zip),
+        recording_id="rec-66",
+        title="Session 66",
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="gemini-3-flash-preview",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+        api_key_env="GOOGLE_API_KEY",
+        calls_per_minute=60,
+        summary_ready=postprocess_mod.SummaryReadyConfig(
+            state_target=str(state_dir),
+            scenes_count=2,
+            audio_dir=audio_dir,
+            audio_link_wait_seconds=0,
+        ),
+    )
+
+    class DummyGenerator:
+        calls: list[tuple[str, str | None]] = []
+
+        def __init__(self, cfg):
+            assert cfg is config
+
+        def generate(self, *, prompt: str, system_instruction: str | None = None) -> str:
+            self.calls.append((prompt, system_instruction))
+            if len(self.calls) == 1:
+                return "# Analysis\n\nFresh analysis."
+            if len(self.calls) == 2:
+                return (
+                    "<campaign_overview># Campaign Overview\n\nFresh overview.</campaign_overview>"
+                )
+            if len(self.calls) == 3:
+                return "<Summary># Summary\n\nFresh summary.</Summary>"
+            return (
+                "<announcement_scenes>"
+                "<scene>The goblin king dissolved into pure courtroom chaos.</scene>"
+                "<scene>The rogue pickpocketed the one guard already on their side.</scene>"
+                "</announcement_scenes>"
+            )
+
+    captured: dict[str, Path] = {}
+
+    def fake_wait_for_drivefs_cloud_id(path: Path, *, timeout_seconds: int) -> str | None:
+        captured["audio_path"] = path
+        assert timeout_seconds == 0
+        assert path.exists()
+        return "audio-file-66"
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+    monkeypatch.setattr(
+        postprocess_mod,
+        "_resolve_summary_document_url",
+        lambda path: "https://drive.example/docs/session-66",
+    )
+    monkeypatch.setattr(
+        postprocess_mod,
+        "_wait_for_drivefs_cloud_id",
+        fake_wait_for_drivefs_cloud_id,
+    )
+
+    result = postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
+
+    assert result.created_marker is True
+    copied_audio = audio_dir / "Session 66.zip"
+    assert copied_audio.read_bytes() == b"zip-bytes-66"
+    assert captured["audio_path"] == copied_audio
+
+    drive_receipt = json.loads(
+        (state_dir / "rec-66.drive-uploaded.json").read_text(encoding="utf-8")
+    )
+    assert drive_receipt["recording_id"] == "rec-66"
+    assert drive_receipt["user_id"] == "user-66"
+    assert drive_receipt["file_id"] == "audio-file-66"
+    assert drive_receipt["url"] == "https://drive.google.com/open?id=audio-file-66"
+    assert drive_receipt["format"] == "flac"
+    assert drive_receipt["container"] == "zip"
+
+    summary_receipt = json.loads(
+        (state_dir / "rec-66.summary-ready.json").read_text(encoding="utf-8")
+    )
+    assert summary_receipt["drive_url"] == "https://drive.google.com/open?id=audio-file-66"
+    assert summary_receipt["document_url"] == "https://drive.example/docs/session-66"
+
+
+def test_run_postprocess_for_transcript_writes_summary_ready_receipt_without_drive_upload(
+    monkeypatch,
+    tmp_path,
+):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    state_dir = tmp_path / "state"
+    transcript_dir = tmp_path / "transcripts" / "Session 66"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / "Session 66.txt"
+    transcript_path.write_text("Speaker 00 00:00:00 Real session transcript\n", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+    _write_transcription_marker(
+        transcript_path,
+        "completed",
+        input_path=str(tmp_path / "incoming" / "Session 66.zip"),
+        recording_id="rec-66",
+        title="Session 66",
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="gemini-3-flash-preview",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+        api_key_env="GOOGLE_API_KEY",
+        calls_per_minute=60,
+        summary_ready=postprocess_mod.SummaryReadyConfig(
+            state_target=str(state_dir),
+            scenes_count=2,
+        ),
+    )
+
+    class DummyGenerator:
+        calls: list[tuple[str, str | None]] = []
+
+        def __init__(self, cfg):
+            assert cfg is config
+
+        def generate(self, *, prompt: str, system_instruction: str | None = None) -> str:
+            self.calls.append((prompt, system_instruction))
+            if len(self.calls) == 1:
+                return "# Analysis\n\nFresh analysis."
+            if len(self.calls) == 2:
+                return (
+                    "<campaign_overview># Campaign Overview\n\nFresh overview.</campaign_overview>"
+                )
+            if len(self.calls) == 3:
+                return "<Summary># Summary\n\nFresh summary.</Summary>"
+            return (
+                "<announcement_scenes>"
+                "<scene>The goblin king dissolved into pure courtroom chaos.</scene>"
+                "<scene>The rogue pickpocketed the one guard already on their side.</scene>"
+                "</announcement_scenes>"
+            )
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+    monkeypatch.setattr(
+        postprocess_mod,
+        "_resolve_summary_document_url",
+        lambda path: "https://drive.example/docs/session-66",
+    )
+
+    result = postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
+
+    assert result.created_marker is True
+    receipt = json.loads((state_dir / "rec-66.summary-ready.json").read_text(encoding="utf-8"))
+    assert receipt["recording_id"] == "rec-66"
+    assert receipt["title"] == "Session 66"
+    assert receipt["drive_url"] == ""
+    assert receipt["document_url"] == "https://drive.example/docs/session-66"
+    assert receipt["announcement_scenes"] == [
+        "The goblin king dissolved into pure courtroom chaos.",
+        "The rogue pickpocketed the one guard already on their side.",
+    ]
+    summary_ready_marker = result.paths.session_folder / "session_66.summary-ready.json"
+    assert summary_ready_marker.exists()
+    assert len(DummyGenerator.calls) == 4
+
+
 def test_run_postprocess_for_transcript_retries_summary_receipt_without_regenerating_outputs(
     monkeypatch,
     tmp_path,
@@ -372,6 +575,117 @@ def test_run_postprocess_for_transcript_retries_summary_receipt_without_regenera
         "The cleric survived entirely on indignation.",
     ]
     assert receipt["document_url"] == "https://drive.example/docs/session-65"
+
+
+def test_run_postprocess_for_transcript_refreshes_summary_ready_when_drive_receipt_arrives(
+    monkeypatch,
+    tmp_path,
+):
+    prompts_dir = tmp_path / "prompts"
+    summaries_dir = tmp_path / "summaries"
+    state_dir = tmp_path / "state"
+    transcript_dir = tmp_path / "transcripts" / "Session 65"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcript_dir / "Session 65.txt"
+    transcript_path.write_text("Speaker 00 00:00:00 Real session transcript\n", encoding="utf-8")
+    _write_prompt_files(prompts_dir)
+    _write_transcription_marker(
+        transcript_path,
+        "completed",
+        input_path=str(tmp_path / "incoming" / "Session 65.zip"),
+        recording_id="rec-65",
+        title="Session 65",
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "rec-65.drive-uploaded.json").write_text(
+        json.dumps({"recording_id": "rec-65", "url": "https://drive.example/audio/session-65"}),
+        encoding="utf-8",
+    )
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="google",
+        model="gemini-3-flash-preview",
+        prompts_dir=prompts_dir,
+        summaries_dir=summaries_dir,
+        api_key_env="GOOGLE_API_KEY",
+        calls_per_minute=60,
+        summary_ready=postprocess_mod.SummaryReadyConfig(
+            state_target=str(state_dir),
+            scenes_count=2,
+        ),
+    )
+    paths = postprocess_mod.build_postprocess_paths(transcript_path, config)
+    paths.raw_text_folder.mkdir(parents=True, exist_ok=True)
+    paths.analysis_txt.write_text("# Analysis\n\nFresh analysis.\n", encoding="utf-8")
+    paths.campaign_overview_txt.write_text(
+        "# Campaign Overview\n\nFresh overview.\n",
+        encoding="utf-8",
+    )
+    paths.summary_txt.write_text("# Summary\n\nFresh summary.\n", encoding="utf-8")
+    for path in (
+        paths.analysis_docx,
+        paths.campaign_overview_docx,
+        paths.summary_docx,
+    ):
+        Document().save(path)
+    paths.completion_marker.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "transcript_path": str(transcript_path),
+                "source_transcript_paths": [str(transcript_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (paths.session_folder / "session_65.summary-ready.json").write_text(
+        json.dumps(
+            {
+                "recording_id": "rec-65",
+                "transcript_path": str(transcript_path),
+                "source_transcript_paths": [str(transcript_path)],
+                "summary_path": str(paths.summary_txt),
+                "drive_url": "",
+                "document_url": "https://drive.example/docs/session-65",
+                "published_at": "2026-04-10T06:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class DummyGenerator:
+        calls: list[tuple[str, str | None]] = []
+
+        def __init__(self, cfg):
+            assert cfg is config
+
+        def generate(self, *, prompt: str, system_instruction: str | None = None) -> str:
+            self.calls.append((prompt, system_instruction))
+            return (
+                "<announcement_scenes>"
+                "<scene>The wizard cast a speech instead of a spell.</scene>"
+                "<scene>The cleric survived entirely on indignation.</scene>"
+                "</announcement_scenes>"
+            )
+
+    monkeypatch.setattr(postprocess_mod, "_GoogleTextGenerator", DummyGenerator)
+    monkeypatch.setattr(
+        postprocess_mod,
+        "_resolve_summary_document_url",
+        lambda path: "https://drive.example/docs/session-65",
+    )
+
+    result = postprocess_mod.run_postprocess_for_transcript(transcript_path, config)
+
+    assert result.created_marker is False
+    assert len(DummyGenerator.calls) == 1
+    receipt = json.loads((state_dir / "rec-65.summary-ready.json").read_text(encoding="utf-8"))
+    assert receipt["drive_url"] == "https://drive.example/audio/session-65"
+    marker = json.loads(
+        (paths.session_folder / "session_65.summary-ready.json").read_text(encoding="utf-8")
+    )
+    assert marker["drive_url"] == "https://drive.example/audio/session-65"
 
 
 def test_resolve_summary_document_url_from_drivefs_db(monkeypatch, tmp_path):
@@ -474,6 +788,98 @@ def test_resolve_summary_document_url_from_drivefs_db(monkeypatch, tmp_path):
     assert url == "https://drive.google.com/open?id=doc-good"
 
 
+def test_resolve_summary_document_url_reads_recent_drivefs_entries_from_wal(monkeypatch, tmp_path):
+    db_path = tmp_path / "mirror_metadata_sqlite.db"
+    conn = postprocess_mod.sqlite3.connect(str(db_path))
+    try:
+        conn.execute("pragma journal_mode=wal")
+        conn.execute(
+            """
+            create table items (
+                stable_id integer primary key,
+                id text,
+                proto blob,
+                trashed boolean,
+                starred boolean,
+                is_owner boolean,
+                mime_type text,
+                is_folder boolean,
+                modified_date integer,
+                shared_with_me_date integer,
+                viewed_by_me_date integer,
+                file_size integer,
+                is_tombstone boolean,
+                local_title text,
+                subscribed boolean,
+                team_drive_stable_id integer,
+                local_title_tokenized text,
+                inaccessible_inheritance_broken boolean
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table stable_ids (
+                stable_id integer primary key,
+                cloud_id text
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table stable_parents (
+                item_stable_id integer,
+                parent_stable_id integer,
+                local_title_hash integer,
+                primary key (item_stable_id, parent_stable_id)
+            )
+            """
+        )
+        rows = [
+            (101, None, True, "My Drive"),
+            (219, None, True, "DND"),
+            (218, None, True, "Summaries"),
+            (30866, None, True, "Session 66"),
+            (30867, None, False, "session_66_summary_output.docx"),
+        ]
+        for stable_id, cloud_id, is_folder, local_title in rows:
+            conn.execute(
+                """
+                insert into items (
+                    stable_id, id, proto, trashed, starred, is_owner, mime_type, is_folder,
+                    modified_date, shared_with_me_date, viewed_by_me_date, file_size, is_tombstone,
+                    local_title, subscribed, team_drive_stable_id, local_title_tokenized,
+                    inaccessible_inheritance_broken
+                ) values (?, ?, null, 0, 0, 1, '', ?, 0, 0, 0, 0, 0, ?, 1, null, ?, 0)
+                """,
+                (stable_id, cloud_id or "", int(is_folder), local_title, local_title.lower()),
+            )
+        conn.execute(
+            "insert into stable_ids (stable_id, cloud_id) values (?, ?)",
+            (30867, "doc-from-wal"),
+        )
+        conn.executemany(
+            "insert into stable_parents (item_stable_id, parent_stable_id, local_title_hash) values (?, ?, 0)",
+            [
+                (219, 101),
+                (218, 219),
+                (30866, 218),
+                (30867, 30866),
+            ],
+        )
+        conn.commit()
+
+        monkeypatch.setattr(postprocess_mod, "_drivefs_metadata_db_paths", lambda: [db_path])
+
+        url = postprocess_mod._resolve_summary_document_url(
+            Path("/mnt/g/My Drive/DND/Summaries/Session 66/session_66_summary_output.docx")
+        )
+    finally:
+        conn.close()
+
+    assert url == "https://drive.google.com/open?id=doc-from-wal"
+
+
 def test_expected_completion_marker_path_uses_session_folder(tmp_path):
     config = postprocess_mod.PostProcessConfig(
         enabled=True,
@@ -553,6 +959,54 @@ def test_resolve_postprocess_config_accepts_thinking_level(tmp_path):
     assert config.thinking_level == "high"
 
 
+def test_resolve_postprocess_config_accepts_openai_provider(tmp_path):
+    cfg = {
+        "postprocess": {
+            "enabled": True,
+            "provider": "openai",
+            "model": "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+            "api_key_env": "LOCAL_LLM_API_KEY",
+            "api_base_env": "LOCAL_LLM_API_BASE",
+            "max_output_tokens": 768,
+            "prompts_dir": str(tmp_path / "prompts"),
+            "summaries_dir": str(tmp_path / "summaries"),
+        }
+    }
+
+    config = postprocess_mod.resolve_postprocess_config(cfg)
+
+    assert config is not None
+    assert config.provider == "openai"
+    assert config.api_key_env == "LOCAL_LLM_API_KEY"
+    assert config.api_base_env == "LOCAL_LLM_API_BASE"
+    assert config.max_output_tokens == 768
+
+
+def test_resolve_postprocess_config_accepts_summary_audio_dir(tmp_path):
+    cfg = {
+        "postprocess": {
+            "enabled": True,
+            "provider": "google",
+            "model": "gemini-3-flash-preview",
+            "prompts_dir": str(tmp_path / "prompts"),
+            "summaries_dir": str(tmp_path / "summaries"),
+            "summary_ready": {
+                "enabled": True,
+                "state_target": "raspi:/srv/craig-stack/exports/state",
+                "audio_dir": str(tmp_path / "drive" / "Audio"),
+                "audio_link_wait_seconds": 15,
+            },
+        }
+    }
+
+    config = postprocess_mod.resolve_postprocess_config(cfg)
+
+    assert config is not None
+    assert config.summary_ready is not None
+    assert config.summary_ready.audio_dir == (tmp_path / "drive" / "Audio")
+    assert config.summary_ready.audio_link_wait_seconds == 15
+
+
 def test_google_text_generator_passes_thinking_level_for_gemini_3(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 
@@ -621,6 +1075,62 @@ def test_google_text_generator_passes_thinking_level_for_gemini_3(monkeypatch, t
         captured["generate_config_kwargs"]["thinking_config"]
         is captured["config"].kwargs["thinking_config"]
     )
+
+
+def test_openai_text_generator_uses_reasoning_content_when_content_is_empty(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "<Summary># Summary\n\nGemma fallback summary.</Summary>",
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout=0):
+        captured["timeout"] = timeout
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("LOCAL_LLM_API_KEY", "dummy")
+    monkeypatch.setenv("LOCAL_LLM_API_BASE", "http://127.0.0.1:8082/v1")
+    monkeypatch.setattr(postprocess_mod.request, "urlopen", fake_urlopen)
+
+    config = postprocess_mod.PostProcessConfig(
+        enabled=True,
+        provider="openai",
+        model="gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+        prompts_dir=tmp_path / "prompts",
+        summaries_dir=tmp_path / "summaries",
+        api_key_env="LOCAL_LLM_API_KEY",
+        api_base_env="LOCAL_LLM_API_BASE",
+        max_output_tokens=512,
+    )
+
+    generator = postprocess_mod._OpenAITextGenerator(config)
+    text = generator.generate(prompt="hello", system_instruction="system")
+
+    assert text == "<Summary># Summary\n\nGemma fallback summary.</Summary>"
+    assert captured["url"] == "http://127.0.0.1:8082/v1/chat/completions"
+    assert captured["body"]["max_tokens"] == 512
+    assert captured["body"]["messages"][0] == {"role": "system", "content": "system"}
+    assert captured["body"]["messages"][1] == {"role": "user", "content": "hello"}
 
 
 def test_split_session_ready_for_postprocess_requires_all_parts(tmp_path):

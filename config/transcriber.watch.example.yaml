@@ -52,3 +52,12 @@ postprocess:
   raw_text_subdir: raw_txt
   calls_per_minute: 5
   skip_existing: true
+  summary_ready:
+    enabled: false
+    state_target: raspi:/srv/craig-stack/exports/state
+    ssh_options: -o ClearAllForwardings=yes
+    scenes_count: 2
+    # Optional override for the DriveFS-backed audio backup target.
+    # When omitted, the watcher defaults to a sibling `Audio/` folder next to `summaries_dir`.
+    audio_dir: /mnt/g/My Drive/DND/Audio
+    audio_link_wait_seconds: 60

@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+from urllib import error, request
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +47,13 @@ class PostProcessConfig:
     prompts_dir: Path
     summaries_dir: Path
     api_key_env: str = "GOOGLE_API_KEY"
+    api_base: str | None = None
+    api_base_env: str | None = None
     raw_text_subdir: str = "raw_txt"
     calls_per_minute: int = 5
     skip_existing: bool = True
     thinking_level: str | None = None
+    max_output_tokens: int | None = None
     summary_ready: "SummaryReadyConfig | None" = None
 
     @property
@@ -107,6 +112,8 @@ class SummaryReadyConfig:
     state_target: str
     ssh_options: str = ""
     scenes_count: int = 2
+    audio_dir: Path | None = None
+    audio_link_wait_seconds: int = 60
 
 
 class SplitSessionPendingError(RuntimeError):
@@ -176,6 +183,122 @@ class _GoogleTextGenerator:
         raise RuntimeError("Google post-processing returned an empty response.")
 
 
+def _extract_openai_message_text(message: Mapping[str, Any]) -> str:
+    def _flatten_content(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    if item.strip():
+                        parts.append(item.strip())
+                    continue
+                if not isinstance(item, Mapping):
+                    continue
+                if str(item.get("type") or "").lower() == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+            return "\n".join(parts).strip()
+        return ""
+
+    content_text = _flatten_content(message.get("content"))
+    if content_text:
+        return content_text
+    return _flatten_content(message.get("reasoning_content"))
+
+
+class _OpenAITextGenerator:
+    def __init__(self, config: PostProcessConfig) -> None:
+        api_key = os.getenv(config.api_key_env)
+        if not api_key:
+            raise RuntimeError(
+                f"Missing API key for post-processing. Set ${config.api_key_env} in the environment."
+            )
+
+        base_url = str(config.api_base or "").strip()
+        if not base_url and config.api_base_env:
+            base_url = str(os.getenv(config.api_base_env) or "").strip()
+        if not base_url:
+            detail = f" or ${config.api_base_env}" if config.api_base_env else ""
+            raise RuntimeError(
+                "Missing API base for OpenAI-compatible post-processing. "
+                f"Set postprocess.api_base{detail}."
+            )
+
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._config = config
+        self._last_completed_at: Optional[float] = None
+
+    def generate(self, *, prompt: str, system_instruction: Optional[str] = None) -> str:
+        if self._last_completed_at is not None:
+            elapsed = time.monotonic() - self._last_completed_at
+            wait_for = self._config.delay_seconds - elapsed
+            if wait_for > 0:
+                time.sleep(wait_for)
+
+        messages: list[dict[str, str]] = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        if self._config.max_output_tokens is not None:
+            payload["max_tokens"] = int(self._config.max_output_tokens)
+
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            f"{self._base_url}/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=900.0) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(
+                f"OpenAI-compatible post-processing request failed: {exc.code} {detail}"
+            ) from exc
+        self._last_completed_at = time.monotonic()
+
+        choices = response_payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenAI-compatible post-processing returned no choices.")
+        first_choice = choices[0]
+        if not isinstance(first_choice, Mapping):
+            raise RuntimeError(
+                "OpenAI-compatible post-processing returned an invalid choice payload."
+            )
+        message = first_choice.get("message")
+        if not isinstance(message, Mapping):
+            raise RuntimeError("OpenAI-compatible post-processing returned no chat message.")
+        text = _extract_openai_message_text(message)
+        if text:
+            return text
+        raise RuntimeError("OpenAI-compatible post-processing returned an empty response.")
+
+
+def _build_text_generator(config: PostProcessConfig) -> _GoogleTextGenerator | _OpenAITextGenerator:
+    if config.provider == "google":
+        return _GoogleTextGenerator(config)
+    if config.provider == "openai":
+        return _OpenAITextGenerator(config)
+    raise RuntimeError(f"Unsupported postprocess provider at runtime: {config.provider!r}")
+
+
 def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[PostProcessConfig]:
     if not isinstance(cfg, Mapping):
         return None
@@ -190,13 +313,23 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
     summaries_dir = str(raw_cfg.get("summaries_dir") or "").strip()
     model = str(raw_cfg.get("model") or "").strip()
     provider = str(raw_cfg.get("provider") or "google").strip().lower() or "google"
-    api_key_env = str(raw_cfg.get("api_key_env") or "GOOGLE_API_KEY").strip() or "GOOGLE_API_KEY"
+    default_api_key_env = "GOOGLE_API_KEY" if provider == "google" else "OPENAI_API_KEY"
+    api_key_env = (
+        str(raw_cfg.get("api_key_env") or default_api_key_env).strip() or default_api_key_env
+    )
+    api_base = str(raw_cfg.get("api_base") or "").strip() or None
+    default_api_base_env = "OPENAI_BASE_URL" if provider == "openai" else None
+    api_base_env = str(raw_cfg.get("api_base_env") or default_api_base_env or "").strip() or None
     raw_text_subdir = str(raw_cfg.get("raw_text_subdir") or "raw_txt").strip() or "raw_txt"
     calls_per_minute_raw = raw_cfg.get("calls_per_minute")
     calls_per_minute = 5 if calls_per_minute_raw is None else int(calls_per_minute_raw)
     skip_existing = bool(raw_cfg.get("skip_existing", True))
     thinking_level_raw = str(raw_cfg.get("thinking_level") or "").strip().lower()
     thinking_level = thinking_level_raw or None
+    max_output_tokens_raw = raw_cfg.get("max_output_tokens")
+    max_output_tokens = None
+    if max_output_tokens_raw not in (None, ""):
+        max_output_tokens = int(max_output_tokens_raw)
     if thinking_level not in (None, "minimal", "low", "medium", "high"):
         raise SystemExit("postprocess.thinking_level must be one of: minimal, low, medium, high.")
     raw_summary_ready_cfg = raw_cfg.get("summary_ready") or {}
@@ -212,14 +345,23 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
                 )
             ssh_options = str(raw_summary_ready_cfg.get("ssh_options") or "").strip()
             scenes_count = max(0, int(raw_summary_ready_cfg.get("scenes_count") or 2))
+            audio_dir_raw = str(raw_summary_ready_cfg.get("audio_dir") or "").strip()
+            audio_dir = Path(audio_dir_raw).expanduser() if audio_dir_raw else None
+            audio_link_wait_seconds = max(
+                0, int(raw_summary_ready_cfg.get("audio_link_wait_seconds") or 60)
+            )
             summary_ready = SummaryReadyConfig(
                 state_target=state_target,
                 ssh_options=ssh_options,
                 scenes_count=scenes_count,
+                audio_dir=audio_dir,
+                audio_link_wait_seconds=audio_link_wait_seconds,
             )
 
-    if provider != "google":
-        raise SystemExit(f"Unsupported postprocess.provider={provider!r}; expected 'google'.")
+    if provider not in {"google", "openai"}:
+        raise SystemExit(
+            f"Unsupported postprocess.provider={provider!r}; expected 'google' or 'openai'."
+        )
     if not prompts_dir:
         raise SystemExit("postprocess.prompts_dir is required when post-processing is enabled.")
     if not summaries_dir:
@@ -234,10 +376,13 @@ def resolve_postprocess_config(cfg: Mapping[str, object] | None) -> Optional[Pos
         prompts_dir=Path(prompts_dir).expanduser(),
         summaries_dir=Path(summaries_dir).expanduser(),
         api_key_env=api_key_env,
+        api_base=api_base,
+        api_base_env=api_base_env,
         raw_text_subdir=raw_text_subdir,
         calls_per_minute=max(0, calls_per_minute),
         skip_existing=skip_existing,
         thinking_level=thinking_level,
+        max_output_tokens=max_output_tokens,
         summary_ready=summary_ready,
     )
 
@@ -342,7 +487,7 @@ def run_postprocess_for_transcript(
     prompts = _load_prompt_texts(config.prompts_dir)
     previous_campaign_overview = _resolve_previous_campaign_overview(paths, config, prompts)
     transcript_text = _read_transcript_bundle(transcript_bundle)
-    client = _GoogleTextGenerator(config)
+    client = _build_text_generator(config)
 
     analysis_text, _ = _materialize_text_and_docx(
         text_path=paths.analysis_txt,
@@ -680,7 +825,7 @@ def _resolve_previous_campaign_overview_path(
 
 def _generate_analysis(
     *,
-    client: _GoogleTextGenerator,
+    client: _GoogleTextGenerator | _OpenAITextGenerator,
     prompts: Mapping[str, str],
     transcript_text: str,
     previous_campaign_overview: str,
@@ -700,7 +845,7 @@ def _generate_analysis(
 
 def _generate_campaign_overview(
     *,
-    client: _GoogleTextGenerator,
+    client: _GoogleTextGenerator | _OpenAITextGenerator,
     prompts: Mapping[str, str],
     previous_campaign_overview: str,
     analysis_text: str,
@@ -721,7 +866,7 @@ def _generate_campaign_overview(
 
 def _generate_summary(
     *,
-    client: _GoogleTextGenerator,
+    client: _GoogleTextGenerator | _OpenAITextGenerator,
     prompts: Mapping[str, str],
     transcript_text: str,
     analysis_text: str,
@@ -787,7 +932,7 @@ def _fallback_announcement_scenes(summary_text: str, count: int) -> list[str]:
 
 
 def _generate_announcement_scenes(
-    client: _GoogleTextGenerator,
+    client: _GoogleTextGenerator | _OpenAITextGenerator,
     *,
     summary_text: str,
     scenes_count: int,
@@ -845,13 +990,30 @@ def _summary_ready_marker_is_current(
     bundle: TranscriptBundle,
     summary_ready_config: SummaryReadyConfig,
 ) -> bool:
-    del summary_ready_config
     marker_path = _summary_ready_marker_path_for_paths(paths)
     metadata = _load_postprocess_metadata(marker_path)
     if metadata is None:
         return False
     if not str(metadata.get("document_url") or "").strip():
         return False
+    marker_drive_url = str(metadata.get("drive_url") or "").strip()
+    context = _summary_ready_context(paths)
+    marker_payload = _transcription_marker_payload(paths.transcript_path) or {}
+    if context is not None:
+        drive_receipt = _load_state_receipt(
+            summary_ready_config,
+            recording_id=context[0],
+            suffix="drive-uploaded",
+        )
+        current_drive_url = str((drive_receipt or {}).get("url") or "").strip()
+        if current_drive_url and current_drive_url != marker_drive_url:
+            return False
+        if (
+            not current_drive_url
+            and summary_ready_config.audio_dir is not None
+            and _source_audio_bundle_from_marker(marker_payload) is not None
+        ):
+            return False
     expected_sources = [str(path) for path in bundle.source_transcript_paths]
     actual_sources = metadata.get("source_transcript_paths")
     if not isinstance(actual_sources, list):
@@ -949,7 +1111,34 @@ def _load_json_payload(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _load_manifest_from_marker(marker_payload: dict[str, Any]) -> dict[str, Any] | None:
+def _candidate_processed_bundle_paths(path: Path) -> list[Path]:
+    processed_dir = path.parent / "processed"
+    candidates: list[Path] = []
+    exact = processed_dir / path.name
+    if exact.exists():
+        candidates.append(exact)
+    if not processed_dir.exists():
+        return candidates
+    pattern = f"{path.stem}*{path.suffix}"
+    try:
+        matches = sorted(
+            processed_dir.glob(pattern),
+            key=lambda candidate: candidate.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return candidates
+    seen = {candidate.resolve(strict=False) for candidate in candidates}
+    for candidate in matches:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(candidate)
+    return candidates
+
+
+def _recording_marker_candidates(marker_payload: dict[str, Any], suffix: str) -> list[Path]:
     candidates: list[Path] = []
     manifest_path_raw = str(marker_payload.get("input_manifest_path") or "").strip()
     if manifest_path_raw:
@@ -958,15 +1147,38 @@ def _load_manifest_from_marker(marker_payload: dict[str, Any]) -> dict[str, Any]
     input_path_raw = str(marker_payload.get("input_path") or "").strip()
     if input_path_raw:
         input_path = Path(input_path_raw).expanduser()
-        candidates.append(input_path.with_suffix(".json"))
-        candidates.append(input_path.parent / "processed" / f"{input_path.stem}.json")
+        if suffix == ".json":
+            candidates.append(input_path.with_suffix(".json"))
+            candidates.extend(_candidate_processed_bundle_paths(input_path.with_suffix(".json")))
+        else:
+            candidates.append(input_path)
+            candidates.extend(_candidate_processed_bundle_paths(input_path))
 
+    deduped: list[Path] = []
+    seen: set[Path] = set()
     for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(candidate)
+    return deduped
+
+
+def _load_manifest_from_marker(marker_payload: dict[str, Any]) -> dict[str, Any] | None:
+    for candidate in _recording_marker_candidates(marker_payload, ".json"):
         if not candidate.exists():
             continue
         payload = _load_json_payload(candidate)
         if payload is not None:
             return payload
+    return None
+
+
+def _source_audio_bundle_from_marker(marker_payload: dict[str, Any]) -> Path | None:
+    for candidate in _recording_marker_candidates(marker_payload, ".zip"):
+        if candidate.is_file():
+            return candidate
     return None
 
 
@@ -1028,6 +1240,11 @@ def _drivefs_relative_parts(path: Path) -> tuple[str, ...] | None:
 def _copy_db_snapshot(path: Path) -> Path:
     snapshot = Path(tempfile.mkstemp(prefix=f"{path.stem}.", suffix=".sqlite")[1])
     shutil.copy2(path, snapshot)
+    for suffix in ("-wal", "-shm"):
+        source_sidecar = path.with_name(f"{path.name}{suffix}")
+        if not source_sidecar.exists():
+            continue
+        shutil.copy2(source_sidecar, snapshot.with_name(f"{snapshot.name}{suffix}"))
     return snapshot
 
 
@@ -1086,10 +1303,12 @@ def _drivefs_cloud_id_for_parts(db_path: Path, parts: tuple[str, ...]) -> str | 
             conn.close()
     finally:
         snapshot_path.unlink(missing_ok=True)
+        snapshot_path.with_name(f"{snapshot_path.name}-wal").unlink(missing_ok=True)
+        snapshot_path.with_name(f"{snapshot_path.name}-shm").unlink(missing_ok=True)
 
 
-def _resolve_summary_document_url(summary_docx_path: Path) -> str | None:
-    parts = _drivefs_relative_parts(summary_docx_path)
+def _resolve_drivefs_cloud_id(path: Path) -> str | None:
+    parts = _drivefs_relative_parts(path)
     if not parts:
         return None
     for db_path in _drivefs_metadata_db_paths():
@@ -1099,7 +1318,46 @@ def _resolve_summary_document_url(summary_docx_path: Path) -> str | None:
             logger.warning("Failed to query DriveFS metadata at %s: %s", db_path, exc)
             continue
         if cloud_id:
-            return f"https://drive.google.com/open?id={cloud_id}"
+            return cloud_id
+    return None
+
+
+def _drive_url_for_cloud_id(cloud_id: str) -> str:
+    return f"https://drive.google.com/open?id={cloud_id}"
+
+
+def _resolve_drivefs_url(path: Path) -> str | None:
+    cloud_id = _resolve_drivefs_cloud_id(path)
+    if cloud_id:
+        return _drive_url_for_cloud_id(cloud_id)
+    return None
+
+
+def _resolve_summary_document_url(summary_docx_path: Path) -> str | None:
+    return _resolve_drivefs_url(summary_docx_path)
+
+
+def _wait_for_drivefs_cloud_id(path: Path, *, timeout_seconds: int) -> str | None:
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    while True:
+        cloud_id = _resolve_drivefs_cloud_id(path)
+        if cloud_id:
+            return cloud_id
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(2.0)
+
+
+def _cloud_id_from_drive_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.query:
+        values = parse_qs(parsed.query)
+        ids = values.get("id") or []
+        if ids and ids[0].strip():
+            return ids[0].strip()
+    match = re.search(r"/d/([A-Za-z0-9_-]+)", parsed.path)
+    if match:
+        return match.group(1)
     return None
 
 
@@ -1167,6 +1425,152 @@ def _load_state_receipt(
     return _load_json_payload(receipt_path)
 
 
+def _write_state_receipt_payload(
+    summary_ready: SummaryReadyConfig,
+    *,
+    receipt_name: str,
+    payload: dict[str, Any],
+) -> None:
+    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if _is_remote_target(summary_ready.state_target):
+        host, remote_dir = _parse_remote_target(summary_ready.state_target)
+        remote_receipt = str(Path(remote_dir) / receipt_name)
+        temp_receipt = f"{remote_receipt}.tmp.{os.getpid()}"
+        remote_command = (
+            f"mkdir -p {shlex.quote(remote_dir)} && "
+            f"cat > {shlex.quote(temp_receipt)} && "
+            f"mv {shlex.quote(temp_receipt)} {shlex.quote(remote_receipt)}"
+        )
+        _run_checked(
+            _build_ssh_command(summary_ready, host, remote_command),
+            input_text=payload_text,
+        )
+        return
+
+    state_dir = Path(summary_ready.state_target).expanduser()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    temp_receipt = state_dir / f".{receipt_name}.tmp.{os.getpid()}"
+    temp_receipt.write_text(payload_text, encoding="utf-8")
+    os.replace(temp_receipt, state_dir / receipt_name)
+
+
+def _safe_drivefs_name(value: str, *, fallback: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', " ", value).strip().rstrip(".")
+    return cleaned or fallback
+
+
+def _default_audio_dir(config: PostProcessConfig, summary_ready: SummaryReadyConfig) -> Path:
+    del config
+    if summary_ready.audio_dir is None:
+        raise RuntimeError("summary_ready.audio_dir must be configured for DriveFS audio backup.")
+    return summary_ready.audio_dir.expanduser()
+
+
+def _copy_audio_bundle_to_drivefs(source_path: Path, destination_path: Path) -> bool:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source_stat = source_path.stat()
+    except FileNotFoundError:
+        raise
+    if destination_path.exists():
+        try:
+            destination_stat = destination_path.stat()
+        except OSError:
+            destination_stat = None
+        if (
+            destination_stat is not None
+            and destination_stat.st_size == source_stat.st_size
+            and destination_stat.st_mtime >= source_stat.st_mtime
+        ):
+            return False
+    temp_path = destination_path.with_name(f".{destination_path.name}.tmp.{os.getpid()}")
+    shutil.copy2(source_path, temp_path)
+    os.replace(temp_path, destination_path)
+    return True
+
+
+def _write_drive_uploaded_receipt(
+    summary_ready: SummaryReadyConfig,
+    *,
+    recording_id: str,
+    user_id: str,
+    drive_service: str,
+    file_id: str,
+    url: str,
+    format_name: str,
+    container: str,
+) -> None:
+    payload = {
+        "recording_id": recording_id,
+        "user_id": user_id,
+        "drive_service": drive_service,
+        "file_id": file_id,
+        "url": url,
+        "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "format": format_name,
+        "container": container,
+        "status": "uploaded",
+    }
+    _write_state_receipt_payload(
+        summary_ready,
+        receipt_name=f"{recording_id}.drive-uploaded.json",
+        payload=payload,
+    )
+
+
+def _ensure_drive_upload_receipt(
+    paths: PostProcessPaths,
+    config: PostProcessConfig,
+    summary_ready: SummaryReadyConfig,
+    *,
+    recording_id: str,
+    title: str,
+) -> dict[str, Any] | None:
+    if summary_ready.audio_dir is None:
+        return None
+    marker_payload = _transcription_marker_payload(paths.transcript_path) or {}
+    manifest_payload = _load_manifest_from_marker(marker_payload) or {}
+    source_audio_path = _source_audio_bundle_from_marker(marker_payload)
+    if source_audio_path is None:
+        logger.warning(
+            "Could not backfill drive-uploaded receipt for %s: source audio bundle was not found",
+            recording_id,
+        )
+        return None
+    audio_dir = _default_audio_dir(config, summary_ready)
+    base_title = Path(title).stem if Path(title).suffix else title
+    safe_name = _safe_drivefs_name(base_title.strip(), fallback=recording_id)
+    destination_path = audio_dir / f"{safe_name}{source_audio_path.suffix.lower()}"
+    copied = _copy_audio_bundle_to_drivefs(source_audio_path, destination_path)
+    if copied:
+        logger.warning("Copied %s into DriveFS audio backup at %s", recording_id, destination_path)
+    cloud_id = _wait_for_drivefs_cloud_id(
+        destination_path,
+        timeout_seconds=summary_ready.audio_link_wait_seconds,
+    )
+    if not cloud_id:
+        logger.warning(
+            "Copied %s to %s but DriveFS did not expose a cloud id within %ss",
+            recording_id,
+            destination_path,
+            summary_ready.audio_link_wait_seconds,
+        )
+        return None
+    _write_drive_uploaded_receipt(
+        summary_ready,
+        recording_id=recording_id,
+        user_id=str(manifest_payload.get("requester_id") or "").strip(),
+        drive_service="google",
+        file_id=cloud_id,
+        url=_drive_url_for_cloud_id(cloud_id),
+        format_name=str(manifest_payload.get("format") or "").strip() or "flac",
+        container=str(manifest_payload.get("container") or "").strip()
+        or source_audio_path.suffix.lstrip(".")
+        or "zip",
+    )
+    return _load_state_receipt(summary_ready, recording_id=recording_id, suffix="drive-uploaded")
+
+
 def _write_summary_ready_receipt(
     summary_ready: SummaryReadyConfig,
     *,
@@ -1193,28 +1597,7 @@ def _write_summary_ready_receipt(
         payload["announcement_scenes"] = cleaned_scenes
     if document_url.strip():
         payload["document_url"] = document_url.strip()
-    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-
-    if _is_remote_target(summary_ready.state_target):
-        host, remote_dir = _parse_remote_target(summary_ready.state_target)
-        remote_receipt = str(Path(remote_dir) / receipt_name)
-        temp_receipt = f"{remote_receipt}.tmp.{os.getpid()}"
-        remote_command = (
-            f"mkdir -p {shlex.quote(remote_dir)} && "
-            f"cat > {shlex.quote(temp_receipt)} && "
-            f"mv {shlex.quote(temp_receipt)} {shlex.quote(remote_receipt)}"
-        )
-        _run_checked(
-            _build_ssh_command(summary_ready, host, remote_command),
-            input_text=payload_text,
-        )
-        return
-
-    state_dir = Path(summary_ready.state_target).expanduser()
-    state_dir.mkdir(parents=True, exist_ok=True)
-    temp_receipt = state_dir / f".{receipt_name}.tmp.{os.getpid()}"
-    temp_receipt.write_text(payload_text, encoding="utf-8")
-    os.replace(temp_receipt, state_dir / receipt_name)
+    _write_state_receipt_payload(summary_ready, receipt_name=receipt_name, payload=payload)
 
 
 def _write_summary_ready_marker(
@@ -1244,12 +1627,10 @@ def _publish_summary_ready_receipt(
     *,
     summary_text: str,
     config: PostProcessConfig,
-    client: _GoogleTextGenerator | None = None,
+    client: _GoogleTextGenerator | _OpenAITextGenerator | None = None,
 ) -> None:
     summary_ready = config.summary_ready
     if summary_ready is None:
-        return
-    if _summary_ready_marker_is_current(paths, bundle, summary_ready):
         return
 
     context = _summary_ready_context(paths)
@@ -1267,11 +1648,20 @@ def _publish_summary_ready_receipt(
     )
     drive_url = str((drive_receipt or {}).get("url") or "").strip()
     if not drive_url:
-        logger.warning(
-            "Skipping summary-ready receipt for %s: drive-uploaded receipt is not available yet",
-            recording_id,
+        drive_receipt = (
+            _ensure_drive_upload_receipt(
+                paths,
+                config,
+                summary_ready,
+                recording_id=recording_id,
+                title=title,
+            )
+            or drive_receipt
         )
+        drive_url = str((drive_receipt or {}).get("url") or "").strip()
+    if _summary_ready_marker_is_current(paths, bundle, summary_ready):
         return
+
     document_url = _resolve_summary_document_url(paths.summary_docx)
     if not document_url:
         logger.warning(
@@ -1279,8 +1669,14 @@ def _publish_summary_ready_receipt(
             recording_id,
         )
         return
+    if not drive_url:
+        logger.warning(
+            "Publishing summary-ready receipt for %s without a drive-uploaded receipt; "
+            "the summary link is live but the audio backup is not ready",
+            recording_id,
+        )
 
-    generator = client or _GoogleTextGenerator(config)
+    generator = client or _build_text_generator(config)
     announcement_scenes = _generate_announcement_scenes(
         generator,
         summary_text=summary_text,
