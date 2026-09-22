@@ -48,6 +48,13 @@ to display names. Add a future session's known attendees before running it. Pres
 the checkpoint's stable speaker ordering; roster restriction must not renumber IDs.
 New voices require new enrollment/training, not merely another display name.
 
+An existing verified asset directory can be passed directly to `--assets`; a ZIP
+restore is unnecessary on a machine that already has the checkpoint and enrollment.
+The initial private Drive model backup is incomplete (2 of 55 model parts uploaded).
+It is not a usable fresh-machine restore source yet. The complete, verified local
+asset copy remains the source for the current workflow; preserve it independently
+of this repository. Code on GitHub alone cannot reproduce the enrolled voices.
+
 ## Run or resume a complete recording
 
 ```sh
@@ -81,6 +88,19 @@ The listening AAC copy is separate from the original inference input. The server
 local-only. Drive does not host this audio player; upload TXT/SRT or standalone text
 HTML for reading there. Keep the `.turns.json` and `release_audit.json` privately for
 future re-export and audit.
+
+## Completed release
+
+The full-recording release covers sessions 1, 2, 3, 15, 36, and 40: approximately
+22 hours 56 minutes across 2,755 source chunks. Session 1 now uses the complete
+2:20:00.875 recording (281 chunks), with its confirmed four-person roster. The old
+15-minute excerpt is retained as a historical review snapshot, not the full source.
+
+All six sessions have TXT, SRT, turns JSON, and processing JSON published to their
+existing private Drive session folders. Eight superseded transcripts were moved
+into archive subfolders with their original file identities preserved. Release
+receipts, source hashes, review labels, and transcripts remain private. Publishing
+to Drive is a separate release step; the runner above produces local exports.
 
 ## Quality and validation
 

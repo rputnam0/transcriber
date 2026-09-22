@@ -1,7 +1,12 @@
 # Session 1 speaker reviewer
 
-A local audio player for grading the accepted MOSS fine-tune's Session 1 draft.
-The available recording is 922.906 seconds (15 minutes 23 seconds), with 325 timed
+This is the historical excerpt reviewer. The complete Session 1 recording has since
+been processed with the confirmed four-person roster; see the [current workflow and
+reader](../../docs/mac-single-file-transcription.md). Keep this review snapshot intact
+so its annotations continue to refer to the original predictions.
+
+A local audio player for grading the original MOSS fine-tune's Session 1 draft.
+This snapshot's recording is 922.906 seconds (15 minutes 23 seconds), with 325 timed
 segments. It has four people, according to the user. The existing model output
 used six candidate identities; the review tool preserves that output rather than
 silently inventing the four-person mapping.

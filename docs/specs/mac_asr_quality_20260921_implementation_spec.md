@@ -1,7 +1,7 @@
 # Implementation specification
 
 ## Build Plan
-Create a resumable candidate ASR runner, a shared clip comparison, and a full recording queue. Run models in the isolated asr-quality-env; run the new MOSS diarizer in its established MPS environment.
+Implemented a resumable candidate ASR runner, a shared clip comparison, and a full recording queue. The released Qwen ASR and MOSS inference both run through MLX in an isolated Python 3.12 environment; enrollment and export use the application environment. See the [installation and run guide](../mac-single-file-transcription.md).
 
 ## Data and Interface Mapping
 Audio: float32 mono 16 kHz, immutable clip hashes. Times: seconds relative to clip plus explicit recording offset. Words from the selected ASR, word timing from its aligner (C1,C2,C3). MOSS turns supply overlapping voice evidence (C7), with frozen voice enrollment and attendance constraints from the repository.
@@ -26,6 +26,9 @@ Existing pipeline used MOSS for both words and voices. This run evaluates dedica
 
 ## Implemented interfaces
 
+- `transcribe_mac_recording.py`: complete-recording orchestration and resume entry point.
+- `resolve_mac_asr_models.py`: pinned public ASR/alignment model resolution.
+- `restore_mac_voice_assets.py`: checksum-verified private checkpoint and enrollment restoration from a complete multipart backup.
 - `run_mac_asr_quality.py`: pinned-model, SHA-verified paired candidate inference; records the Granite 4 layout repair.
 - `mlx_speech_batch.py`: equal-real-duration greedy MLX batching with a per-sample token cap.
 - `run_moss_mlx_recordings.py`: fresh trained-checkpoint inference over complete source manifests; separate resumable prediction caches and parser/decode repairs.

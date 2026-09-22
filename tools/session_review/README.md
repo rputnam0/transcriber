@@ -1,5 +1,11 @@
 # Full-session speaker review
 
+This annotation tool preserves earlier transcript snapshots. For the latest Qwen/MOSS
+exports, including complete Session 1 and Session 40, use the [current transcript
+reader](../../docs/mac-single-file-transcription.md). Old grades must not be attached
+to new turns merely because a session number matches. The ports and session choices
+below describe the historical annotation library, not the latest release reader.
+
 Open http://127.0.0.1:8767/ and choose Session 2, 3, 15, or 36. Session 1 links to the original reviewer on port 8765, preserving its existing annotations.
 
 With **Needs review only** enabled, playback is phrase-by-phrase: one second before the flagged turn through 0.25 seconds after it, then pause for grading. Correct, Wrong, Unsure, or a speaker assignment immediately plays the next ungraded flagged turn, skipping intervening audio. Choose the replacement speaker directly when you know it, or use **Previous phrase** to revisit a grade. Overlapping phrases keep separate grading targets even when another voice is audible. Turning the switch off restores continuous playback.

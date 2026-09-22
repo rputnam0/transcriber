@@ -1,7 +1,9 @@
 # Open items
 
 ## Blocking Items
-None for local comparative implementation. A missing full Session 1 source blocks completion of that full session, not processing the five other files.
+None for the completed local transcript release. The full Session 1 source was recovered and processed; all six available single-file sessions are exported and published. See the [current workflow and release status](../mac-single-file-transcription.md).
+
+The private Drive model backup remains incomplete (2 of 55 model parts). Fresh-machine restoration from that backup is blocked until all parts are present; the complete verified local voice assets remain available.
 
 ## Non-Blocking Follow-Ups
 - Human word-level ground truth is absent. Existing grades concern speaker identity; automatic source-stem text is only a proxy and favors its generating recognizer.

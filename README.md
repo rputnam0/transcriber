@@ -5,7 +5,19 @@ speakers**, see [Mac single-file transcription](docs/mac-single-file-transcripti
 It combines dedicated Qwen ASR with trained MOSS diarization and private enrollment
 profiles. It is a separate, resumable workflow from the regular CLI below.
 
-GPU-accelerated speech transcription powered by faster-whisper plus direct pyannote diarization. Works on single audio files, directories, or multi-track ZIPs.
+Local speech transcription for mixed recordings, isolated speaker audio, and multi-track ZIPs.
+
+## Choose a workflow
+
+| Input | Workflow |
+| --- | --- |
+| Mixed recording with enrolled voices on Apple Silicon | [Qwen ASR + trained MOSS](docs/mac-single-file-transcription.md): resumable full-recording processing, named turns, overlap handling, and an audio reader |
+| Isolated speaker recording or named multitrack stems | Regular `transcribe` CLI below; use speaker mapping for known track identities |
+| Mixed recording with generic speaker labels or a pyannote speaker bank | Regular CLI with the `faster` backend and pyannote diarization |
+
+The Mac workflow requires private voice assets in addition to this checkout. Those
+assets and recordings are deliberately excluded from Git. See the [documentation
+index](docs/README.md) for current instructions, release status, and historical experiments.
 
 ## Features
 - Faster-whisper backend with native word timestamps

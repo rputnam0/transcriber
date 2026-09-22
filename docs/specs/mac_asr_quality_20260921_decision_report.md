@@ -23,7 +23,7 @@ Use maintained MLX adaptations for Apple GPU execution and retain exact model re
 | Transcription-uncertain source claim | pass | Sources are native text |
 
 ## Locked Defaults
-Fresh output caches; no modification of old annotations; greedy English decoding; no generative editorial rewriting; source SHA and model identity checks. User-specified diarizer is interruption_v1_pilot_20260921. Final pipeline choice will be recorded after the local comparison.
+Fresh output caches; no modification of old annotations; greedy English decoding; no generative editorial rewriting; source SHA and model identity checks. User-specified diarizer is interruption_v1_pilot_20260921. The completed comparison and selected pipeline are recorded below.
 
 
 ## Local comparison and implementation outcome
@@ -32,6 +32,6 @@ All five dedicated candidates were executed locally, including the official Gran
 
 The production candidate combines Qwen wording on ordinary speech with the explicitly requested 20-step MOSS checkpoint for fresh voice attribution and complete overlapping exchanges. Qwen's alternate wording is retained for those exchanges. A direct, flat ASR-to-speaker handoff failed the overlap validation and was rejected. The resulting validation preserves the pilot's overlap recall, but does not establish lower aggregate end-to-end WER: the conservative hybrid proxy WER was 34.60%, versus 33.21% for the old baseline. Publish the rerun as a reviewable comparative revision and retain the previous version.
 
-Detailed evidence, caveats, exact commands, model/environment provenance, and the release coverage audit are linked from [the local report](../analysis/asr_quality_20260921/README.md). No human “unsure” grade is a training target. The full Session 1 source remains an input dependency.
+Detailed evidence, exact commands, model/environment provenance, and the coverage audit are retained privately under `docs/analysis/asr_quality_20260921/`; this directory is intentionally absent from public checkouts. No human “unsure” grade is a training target. Full Session 1 was recovered and processed, and all six single-file sessions were published with older transcripts archived. See the [current workflow](../mac-single-file-transcription.md) for reproduction requirements and release limitations.
 
-status = ready_for_implementation
+status = implemented_and_published
