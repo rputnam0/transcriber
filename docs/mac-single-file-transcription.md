@@ -32,7 +32,7 @@ and accept the model's access conditions if not already cached; never commit tok
 The public repository contains code, tests and dependency versions, **not** voice
 weights, embeddings, session rosters, recordings, or human-review snapshots. Download
 the private backup's `backup_manifest.json`, `private-assets.zip`, and **every**
-`model.safetensors.partNNN.zip` into one folder. The manifest records exact SHA-256
+`model-partNNN.zip` into one folder. The manifest records exact SHA-256
 values; the restore tool reads the parts directly from their ZIP files.
 
 ```sh
