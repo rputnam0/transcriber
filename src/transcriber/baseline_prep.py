@@ -171,7 +171,9 @@ def _normalized_session_name(value: object) -> str:
 
 
 def _spec_session_names(specs: Sequence[EvalSpec]) -> set[str]:
-    return {_normalized_session_name(spec.name) for spec in specs if _normalized_session_name(spec.name)}
+    return {
+        _normalized_session_name(spec.name) for spec in specs if _normalized_session_name(spec.name)
+    }
 
 
 def _spec_session_stems(specs: Sequence[EvalSpec]) -> set[str]:
@@ -337,7 +339,9 @@ def _run_eval_suite(
     return suite_eval, suite_summaries
 
 
-def _collect_training_sources(input_roots: Sequence[Path], excluded_stems: Sequence[str]) -> List[Path]:
+def _collect_training_sources(
+    input_roots: Sequence[Path], excluded_stems: Sequence[str]
+) -> List[Path]:
     excluded = {str(item).strip().lower() for item in excluded_stems if str(item).strip()}
     sources: List[Path] = []
     seen: set[str] = set()
@@ -631,19 +635,27 @@ def prepare_baseline(
         to_stage=to_stage,
     )
 
-    hf_cache_root = Path(
-        str(recipe.get("hf_cache_root") or (base_output_root / "hf_cache"))
-    ).expanduser().resolve()
+    hf_cache_root = (
+        Path(str(recipe.get("hf_cache_root") or (base_output_root / "hf_cache")))
+        .expanduser()
+        .resolve()
+    )
     hf_cache_root.mkdir(parents=True, exist_ok=True)
-    extracted_session_cache_root = Path(
-        str(recipe.get("extracted_session_cache_root") or "data/.cache/extracted_sessions")
-    ).expanduser().resolve()
-    mixed_base_cache_root = Path(
-        str(recipe.get("mixed_base_cache_root") or "data/.cache/mixed_base")
-    ).expanduser().resolve()
-    metrics_log_path = Path(
-        str(recipe.get("metrics_log_path") or (base_output_root / "stage_metrics.jsonl"))
-    ).expanduser().resolve()
+    extracted_session_cache_root = (
+        Path(str(recipe.get("extracted_session_cache_root") or "data/.cache/extracted_sessions"))
+        .expanduser()
+        .resolve()
+    )
+    mixed_base_cache_root = (
+        Path(str(recipe.get("mixed_base_cache_root") or "data/.cache/mixed_base"))
+        .expanduser()
+        .resolve()
+    )
+    metrics_log_path = (
+        Path(str(recipe.get("metrics_log_path") or (base_output_root / "stage_metrics.jsonl")))
+        .expanduser()
+        .resolve()
+    )
     stage_logger = StageMetricsLogger(metrics_log_path)
     diarization_model = str(
         recipe.get("diarization_model") or "pyannote/speaker-diarization-community-1"
@@ -721,7 +733,9 @@ def prepare_baseline(
                 )
             return False, {}
         stage_manifests[stage] = str(manifest_path)
-        stage_logger.log(stage=stage, status="stage_reused", cache_hit=True, extra={"reason": reason})
+        stage_logger.log(
+            stage=stage, status="stage_reused", cache_hit=True, extra={"reason": reason}
+        )
         return True, dict((manifest or {}).get("outputs") or {})
 
     bank_params = {
@@ -745,7 +759,9 @@ def prepare_baseline(
     bank_reused, bank_outputs = _maybe_reuse_stage("bank", bank_signature)
     if not bank_reused:
         if "bank" not in selected_stage_names:
-            raise RuntimeError("Bank stage outputs are unavailable and bank is outside the requested stage range")
+            raise RuntimeError(
+                "Bank stage outputs are unavailable and bank is outside the requested stage range"
+            )
         stage_logger.log(stage="bank", status="stage_started", cache_hit=False)
         bank_manifest = build_artifact_manifest(
             artifact_type="bank",
@@ -756,7 +772,9 @@ def prepare_baseline(
             parent_artifacts=[],
             git_commit=git_commit,
         )
-        bank_artifact_dir = base_output_root / "artifacts" / "bank" / str(bank_manifest["artifact_id"])
+        bank_artifact_dir = (
+            base_output_root / "artifacts" / "bank" / str(bank_manifest["artifact_id"])
+        )
         bank_manifest_path = bank_artifact_dir / "bank_manifest.json"
         bank_profile_name = _bank_profile_name(
             str(recipe.get("bank_profile_prefix") or "baseline_bank"),
@@ -1119,7 +1137,11 @@ def prepare_baseline(
                 git_commit=git_commit,
             )
             variant_dir = (
-                base_output_root / "artifacts" / "datasets" / variant_name / str(manifest["artifact_id"])
+                base_output_root
+                / "artifacts"
+                / "datasets"
+                / variant_name
+                / str(manifest["artifact_id"])
             )
             dataset, dataset_summary = materialize_classifier_dataset_from_mixed_base(
                 mixed_base_dir=mixed_base_dir,
@@ -1151,7 +1173,9 @@ def prepare_baseline(
                 source_groups=dataset_summary.get("source_groups"),  # type: ignore[arg-type]
                 extra={
                     "base_artifact_id": str(mixed_base_manifest["artifact_id"]),
-                    "materialization_mode": str(dataset_summary.get("materialization_mode") or "mixed_base_derived"),
+                    "materialization_mode": str(
+                        dataset_summary.get("materialization_mode") or "mixed_base_derived"
+                    ),
                     "cache_hits": dict(dataset_summary.get("cache_hits") or {}),
                     "stage_dependencies": ["mixed_base"],
                 },
@@ -1181,7 +1205,9 @@ def prepare_baseline(
                 "Missing dataset variants required by baseline pack: "
                 + ", ".join(sorted(missing_pack_variants))
             )
-        missing_candidate_variants = [name for name in candidate_variant_names if name not in variant_datasets]
+        missing_candidate_variants = [
+            name for name in candidate_variant_names if name not in variant_datasets
+        ]
         if missing_candidate_variants:
             raise RuntimeError(
                 "Missing dataset variants required for hard-negative mining: "
@@ -1195,7 +1221,9 @@ def prepare_baseline(
             if variant_name == "mixed_raw":
                 continue
             merged_datasets.append(
-                relabel_classifier_dataset_sources(variant_datasets[variant_name], "mixed_aug_total")
+                relabel_classifier_dataset_sources(
+                    variant_datasets[variant_name], "mixed_aug_total"
+                )
             )
         merged_dataset = merge_classifier_datasets(merged_datasets)
         base_training_dataset, base_balance_summary = balance_classifier_dataset(
@@ -1217,7 +1245,11 @@ def prepare_baseline(
                 "source_groups": base_balance_summary.get("source_groups") or {},
             },
             parent_artifacts=[str(bank_manifest["artifact_id"])]
-            + [str(variant_manifests[name]["artifact_id"]) for name in selected_pack if name in variant_manifests],
+            + [
+                str(variant_manifests[name]["artifact_id"])
+                for name in selected_pack
+                if name in variant_manifests
+            ],
             git_commit=git_commit,
         )
         base_training_dir = (
@@ -1284,11 +1316,18 @@ def prepare_baseline(
             extra={"variants": sorted(variant_manifest_paths)},
         )
     else:
-        for name, manifest_path_str in dict(variants_outputs.get("variant_manifest_paths") or {}).items():
+        for name, manifest_path_str in dict(
+            variants_outputs.get("variant_manifest_paths") or {}
+        ).items():
             manifest = load_manifest(Path(str(manifest_path_str)))
             if manifest is None:
                 raise RuntimeError(f"Missing variant manifest: {manifest_path_str}")
-            dataset_dir = Path(str((variants_outputs.get("variant_dataset_dirs") or {}).get(name) or manifest["dataset_dir"]))
+            dataset_dir = Path(
+                str(
+                    (variants_outputs.get("variant_dataset_dirs") or {}).get(name)
+                    or manifest["dataset_dir"]
+                )
+            )
             dataset, summary = load_classifier_dataset(dataset_dir)
             variant_manifests[name] = manifest
             variant_datasets[name] = dataset
@@ -1299,7 +1338,9 @@ def prepare_baseline(
             raise RuntimeError(f"Missing base training manifest: {base_training_manifest_path}")
         base_training_dir = Path(str(variants_outputs["base_training_dir"]))
         base_training_dataset, base_training_summary = load_classifier_dataset(base_training_dir)
-        base_quality_filters = dict(base_training_summary.get("quality_filters") or DEFAULT_QUALITY_FILTERS)
+        base_quality_filters = dict(
+            base_training_summary.get("quality_filters") or DEFAULT_QUALITY_FILTERS
+        )
         base_balance_summary = dict(base_training_summary.get("balance") or {})
 
     if not variants_reused:
@@ -1309,7 +1350,9 @@ def prepare_baseline(
             raise RuntimeError(f"Missing base training manifest: {base_training_manifest_path}")
         base_training_dir = Path(str(variants_outputs["base_training_dir"]))
     base_training_dataset, base_training_summary = load_classifier_dataset(base_training_dir)
-    base_quality_filters = dict(base_training_summary.get("quality_filters") or DEFAULT_QUALITY_FILTERS)
+    base_quality_filters = dict(
+        base_training_summary.get("quality_filters") or DEFAULT_QUALITY_FILTERS
+    )
     base_balance_summary = dict(base_training_summary.get("balance") or {})
 
     current_winner = {**DEFAULT_CURRENT_WINNER, **dict(recipe.get("current_winner") or {})}
@@ -1364,14 +1407,18 @@ def prepare_baseline(
     hard_negative_signature = {
         "base_training_artifact_id": base_training_manifest["artifact_id"],
         "candidate_variant_ids": [
-            str(variant_manifests[name]["artifact_id"]) for name in candidate_variant_names if name in variant_manifests
+            str(variant_manifests[name]["artifact_id"])
+            for name in candidate_variant_names
+            if name in variant_manifests
         ],
         "current_winner": current_winner,
         "eval_params": eval_params,
         "mining_heuristic_suite": mining_heuristic_suite,
         "mining_eval_input_identities": mining_eval_input_identities,
         "eval_final_sessions": sorted(_spec_session_stems(eval_final_specs)),
-        "seed_pairs": list(recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]),
+        "seed_pairs": list(
+            recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]
+        ),
         "top_confusion_pairs": _recipe_int(recipe, "top_confusion_pairs", 5),
         "hard_negative_max_margin": _recipe_float(recipe, "hard_negative_max_margin", 0.12),
         "hard_negative_min_dominant_share": _recipe_float(
@@ -1380,7 +1427,9 @@ def prepare_baseline(
         "hard_negative_per_pair_cap": _recipe_int(recipe, "hard_negative_per_pair_cap", 75),
         "hard_negative_pair_caps": {
             f"{left}::{right}": int(value)
-            for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
+            for (left, right), value in _recipe_pair_value_map(
+                recipe, "hard_negative_pair_caps"
+            ).items()
         },
         "hard_negative_per_speaker_cap": (
             int(recipe["hard_negative_per_speaker_cap"])
@@ -1398,7 +1447,9 @@ def prepare_baseline(
             recipe, "hard_negative_min_style_samples_per_pair", 40
         ),
     }
-    hard_negative_reused, hard_negative_outputs = _maybe_reuse_stage("hard_negatives", hard_negative_signature)
+    hard_negative_reused, hard_negative_outputs = _maybe_reuse_stage(
+        "hard_negatives", hard_negative_signature
+    )
     if not hard_negative_reused:
         if "hard_negatives" not in selected_stage_names:
             raise RuntimeError(
@@ -1424,7 +1475,9 @@ def prepare_baseline(
                 "parent_artifacts": base_training_manifest["parent_artifacts"],
             },
         )
-        mining_training_summary_path = _write_training_summary(mining_profile_dir, mining_training_summary)
+        mining_training_summary_path = _write_training_summary(
+            mining_profile_dir, mining_training_summary
+        )
         mining_eval_manifest = build_artifact_manifest(
             artifact_type="eval",
             diarization_model=diarization_model,
@@ -1495,42 +1548,50 @@ def prepare_baseline(
         save_manifest(mining_eval_manifest_path, mining_eval_manifest)
         _assert_candidate_pool_excludes_sessions(
             candidate_pool_dirs=[
-                Path(str(variant_manifests[name]["dataset_dir"])) for name in candidate_variant_names
+                Path(str(variant_manifests[name]["dataset_dir"]))
+                for name in candidate_variant_names
             ],
             forbidden_session_stems=sorted(_spec_session_stems(eval_final_specs)),
         )
-        hard_negative_dataset, hard_negative_records, hard_negative_summary = build_hard_negative_dataset(
-            eval_summaries=mining_eval_summaries,
-            candidate_pool_dirs=[
-                Path(str(variant_manifests[name]["dataset_dir"])) for name in candidate_variant_names
-            ],
-            base_dataset_samples=base_training_dataset.samples,
-            seed_pairs=list(
-                recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]
-            ),
-            top_confusion_pairs=_recipe_int(recipe, "top_confusion_pairs", 5),
-            max_eval_margin=_recipe_float(recipe, "hard_negative_max_margin", 0.12),
-            min_mixed_dominant_share=_recipe_float(recipe, "hard_negative_min_dominant_share", 0.55),
-            per_pair_cap=_recipe_int(recipe, "hard_negative_per_pair_cap", 75),
-            pair_caps={
-                (left, right): int(value)
-                for (left, right), value in _recipe_pair_value_map(recipe, "hard_negative_pair_caps").items()
-            },
-            per_speaker_cap=(
-                int(recipe["hard_negative_per_speaker_cap"])
-                if recipe.get("hard_negative_per_speaker_cap") is not None
-                else None
-            ),
-            max_fraction=_recipe_float(recipe, "hard_negative_max_fraction", 0.20),
-            style_profile_name=str(
-                recipe.get("hard_negative_style_profile_name") or "session61_like"
-            ),
-            style_score_threshold=_recipe_float(
-                recipe, "hard_negative_style_score_threshold", 0.70
-            ),
-            min_style_samples_per_pair=_recipe_int(
-                recipe, "hard_negative_min_style_samples_per_pair", 40
-            ),
+        hard_negative_dataset, hard_negative_records, hard_negative_summary = (
+            build_hard_negative_dataset(
+                eval_summaries=mining_eval_summaries,
+                candidate_pool_dirs=[
+                    Path(str(variant_manifests[name]["dataset_dir"]))
+                    for name in candidate_variant_names
+                ],
+                base_dataset_samples=base_training_dataset.samples,
+                seed_pairs=list(
+                    recipe.get("seed_confusion_pairs") or [["Cyrus Schwert", "Cletus Cobbington"]]
+                ),
+                top_confusion_pairs=_recipe_int(recipe, "top_confusion_pairs", 5),
+                max_eval_margin=_recipe_float(recipe, "hard_negative_max_margin", 0.12),
+                min_mixed_dominant_share=_recipe_float(
+                    recipe, "hard_negative_min_dominant_share", 0.55
+                ),
+                per_pair_cap=_recipe_int(recipe, "hard_negative_per_pair_cap", 75),
+                pair_caps={
+                    (left, right): int(value)
+                    for (left, right), value in _recipe_pair_value_map(
+                        recipe, "hard_negative_pair_caps"
+                    ).items()
+                },
+                per_speaker_cap=(
+                    int(recipe["hard_negative_per_speaker_cap"])
+                    if recipe.get("hard_negative_per_speaker_cap") is not None
+                    else None
+                ),
+                max_fraction=_recipe_float(recipe, "hard_negative_max_fraction", 0.20),
+                style_profile_name=str(
+                    recipe.get("hard_negative_style_profile_name") or "session61_like"
+                ),
+                style_score_threshold=_recipe_float(
+                    recipe, "hard_negative_style_score_threshold", 0.70
+                ),
+                min_style_samples_per_pair=_recipe_int(
+                    recipe, "hard_negative_min_style_samples_per_pair", 40
+                ),
+            )
         )
         _assert_records_exclude_sessions(
             records=hard_negative_records,
@@ -1544,10 +1605,15 @@ def prepare_baseline(
             hard_negative_manifest = build_artifact_manifest(
                 artifact_type="dataset",
                 diarization_model=diarization_model,
-                source_sessions=sorted({str(item["source_session"]) for item in hard_negative_records}),
+                source_sessions=sorted(
+                    {str(item["source_session"]) for item in hard_negative_records}
+                ),
                 input_file_identities=collect_input_file_identities(
                     [mining_eval_artifact_dir]
-                    + [Path(str(variant_manifests[name]["dataset_dir"])) for name in candidate_variant_names],
+                    + [
+                        Path(str(variant_manifests[name]["dataset_dir"]))
+                        for name in candidate_variant_names
+                    ],
                     hash_contents=False,
                 ),
                 build_params={
@@ -1603,7 +1669,9 @@ def prepare_baseline(
             "mining_heuristic_eval_manifest_path": str(mining_eval_manifest_path),
             "mining_eval_manifest_path": str(mining_eval_manifest_path),
             "hard_negative_manifest_path": (
-                str(hard_negative_dir / "hard_negative_manifest.json") if hard_negative_manifest else ""
+                str(hard_negative_dir / "hard_negative_manifest.json")
+                if hard_negative_manifest
+                else ""
             ),
             "hard_negative_dir": str(hard_negative_dir) if hard_negative_manifest else "",
         }
@@ -1630,7 +1698,9 @@ def prepare_baseline(
             stage="hard_negatives",
             status="stage_completed",
             cache_hit=False,
-            extra={"hard_negative_dataset": bool(hard_negative_outputs["hard_negative_manifest_path"])},
+            extra={
+                "hard_negative_dataset": bool(hard_negative_outputs["hard_negative_manifest_path"])
+            },
         )
 
     mining_profile_dir = Path(str(hard_negative_outputs["mining_profile_dir"]))
@@ -1646,17 +1716,27 @@ def prepare_baseline(
     if mining_eval_manifest is None:
         raise RuntimeError(f"Missing mining eval manifest: {mining_eval_manifest_path}")
     mining_eval = dict(
-        mining_eval_manifest.get("heuristic_eval") or mining_eval_manifest.get("canonical_eval") or {}
+        mining_eval_manifest.get("heuristic_eval")
+        or mining_eval_manifest.get("canonical_eval")
+        or {}
     )
-    hard_negative_manifest_path_raw = str(hard_negative_outputs.get("hard_negative_manifest_path") or "")
+    hard_negative_manifest_path_raw = str(
+        hard_negative_outputs.get("hard_negative_manifest_path") or ""
+    )
     hard_negative_manifest = (
         load_manifest(Path(hard_negative_manifest_path_raw))
         if hard_negative_manifest_path_raw
         else None
     )
-    hard_negative_dir = Path(str(hard_negative_outputs.get("hard_negative_dir") or "")) if hard_negative_manifest else base_output_root / "artifacts" / "datasets" / "hard_negative"
+    hard_negative_dir = (
+        Path(str(hard_negative_outputs.get("hard_negative_dir") or ""))
+        if hard_negative_manifest
+        else base_output_root / "artifacts" / "datasets" / "hard_negative"
+    )
     if hard_negative_manifest is not None:
-        hard_negative_dataset, hard_negative_dataset_summary = load_classifier_dataset(hard_negative_dir)
+        hard_negative_dataset, hard_negative_dataset_summary = load_classifier_dataset(
+            hard_negative_dir
+        )
         hard_negative_summary = dict(hard_negative_dataset_summary.get("hard_negative") or {})
     else:
         hard_negative_dataset = None
@@ -1665,13 +1745,17 @@ def prepare_baseline(
     train_signature = {
         "bank_artifact_id": bank_manifest["artifact_id"],
         "base_training_artifact_id": base_training_manifest["artifact_id"],
-        "hard_negative_artifact_id": hard_negative_manifest["artifact_id"] if hard_negative_manifest else None,
+        "hard_negative_artifact_id": (
+            hard_negative_manifest["artifact_id"] if hard_negative_manifest else None
+        ),
         "current_winner": current_winner,
     }
     train_reused, train_outputs = _maybe_reuse_stage("train", train_signature)
     if not train_reused:
         if "train" not in selected_stage_names:
-            raise RuntimeError("Train outputs are unavailable and train is outside the requested stage range")
+            raise RuntimeError(
+                "Train outputs are unavailable and train is outside the requested stage range"
+            )
         stage_logger.log(stage="train", status="stage_started", cache_hit=False)
         final_training_dataset = append_dataset(base_training_dataset, hard_negative_dataset)
         final_training_manifest = build_artifact_manifest(
@@ -1698,7 +1782,9 @@ def prepare_baseline(
             final_training_dataset,
             summary={
                 "artifact_id": str(final_training_manifest["artifact_id"]),
-                "parent_artifacts": [item for item in final_training_manifest["parent_artifacts"] if item],
+                "parent_artifacts": [
+                    item for item in final_training_manifest["parent_artifacts"] if item
+                ],
                 "quality_filters": base_quality_filters,
                 "source_groups": base_balance_summary.get("source_groups") or {},
                 "hard_negative": hard_negative_summary,
@@ -1743,7 +1829,9 @@ def prepare_baseline(
                 "parent_artifacts": final_training_manifest["parent_artifacts"],
             },
         )
-        final_training_summary_path = _write_training_summary(baseline_profile_dir, final_training_summary)
+        final_training_summary_path = _write_training_summary(
+            baseline_profile_dir, final_training_summary
+        )
         train_outputs = {
             "final_training_manifest_path": str(final_training_manifest_path),
             "final_training_dir": str(final_training_dir),
@@ -1781,7 +1869,9 @@ def prepare_baseline(
     baseline_profile_dir = Path(str(train_outputs["baseline_profile_dir"]))
     baseline_profile_name = str(train_outputs["baseline_profile_name"])
     final_training_summary_path = Path(str(train_outputs["final_training_summary_path"]))
-    final_training_dataset, _final_training_dataset_summary = load_classifier_dataset(final_training_dir)
+    final_training_dataset, _final_training_dataset_summary = load_classifier_dataset(
+        final_training_dir
+    )
     final_coverage_report_path = final_training_dir / "coverage_report.json"
 
     eval_signature = {
@@ -1796,7 +1886,9 @@ def prepare_baseline(
     eval_reused, eval_outputs = _maybe_reuse_stage("eval", eval_signature)
     if not eval_reused:
         if "eval" not in selected_stage_names:
-            raise RuntimeError("Eval outputs are unavailable and eval is outside the requested stage range")
+            raise RuntimeError(
+                "Eval outputs are unavailable and eval is outside the requested stage range"
+            )
         stage_logger.log(stage="eval", status="stage_started", cache_hit=False)
         dev_eval_manifest = build_artifact_manifest(
             artifact_type="eval",
@@ -1852,10 +1944,14 @@ def prepare_baseline(
             "config_path": str(dev_eval_config_path),
             "canonical_suite": dev_canonical_suite,
             "canonical_eval": dev_eval,
-            "summary_paths": [str(summary.get("summary_path") or "") for summary in dev_eval_summaries],
+            "summary_paths": [
+                str(summary.get("summary_path") or "") for summary in dev_eval_summaries
+            ],
         }
         save_manifest(dev_eval_artifact_dir / "eval_manifest.json", dev_eval_manifest)
-        dev_eval_manifest_path = save_manifest(base_output_root / "dev_eval_manifest.json", dev_eval_manifest)
+        dev_eval_manifest_path = save_manifest(
+            base_output_root / "dev_eval_manifest.json", dev_eval_manifest
+        )
 
         final_eval_manifest = build_artifact_manifest(
             artifact_type="eval",
@@ -1968,7 +2064,9 @@ def prepare_baseline(
             },
             "base_training_manifest_path": str(base_training_manifest_path),
             "hard_negative_manifest_path": (
-                str(hard_negative_dir / "hard_negative_manifest.json") if hard_negative_manifest else None
+                str(hard_negative_dir / "hard_negative_manifest.json")
+                if hard_negative_manifest
+                else None
             ),
             "final_training_manifest_path": str(final_training_manifest_path),
             "mining_heuristic_eval_manifest_path": str(mining_eval_manifest_path),
@@ -2011,7 +2109,9 @@ def prepare_baseline(
             },
             "narrow_doe_recipe_path": str(narrow_doe_recipe_path),
         }
-        baseline_summary_path = _json_write(base_output_root / "baseline_summary.json", baseline_summary)
+        baseline_summary_path = _json_write(
+            base_output_root / "baseline_summary.json", baseline_summary
+        )
         eval_outputs = {
             "dev_eval_manifest_path": str(dev_eval_manifest_path),
             "final_eval_manifest_path": str(final_eval_manifest_path),

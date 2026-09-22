@@ -59,7 +59,9 @@ def _parse_eval_spec(raw: str) -> Tuple[str, Path, Path]:
     return parts[0], Path(parts[1]).expanduser().resolve(), Path(parts[2]).expanduser().resolve()
 
 
-def _collect_training_sources(input_roots: Sequence[Path], excluded_stems: Sequence[str]) -> List[Path]:
+def _collect_training_sources(
+    input_roots: Sequence[Path], excluded_stems: Sequence[str]
+) -> List[Path]:
     excluded = {stem.strip().lower() for stem in excluded_stems if stem.strip()}
     seen: set[str] = set()
     results: List[Path] = []
@@ -95,7 +97,9 @@ def _mean(values: Iterable[float]) -> float:
 
 
 def _dataset_summary(dataset: ClassifierDataset) -> Dict[str, object]:
-    dominant_values = [float(value) for value in dataset.dominant_shares if value == value and value >= 0.0]
+    dominant_values = [
+        float(value) for value in dataset.dominant_shares if value == value and value >= 0.0
+    ]
     return {
         "samples": int(dataset.samples),
         "dimensions": int(dataset.embeddings.shape[1]) if dataset.samples else 0,
@@ -501,8 +505,12 @@ def _copy_bank_profile(source_dir: Path, target_dir: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the full widened mixed-speaker rebuild pipeline.")
-    parser.add_argument("--train-input", action="append", default=[], help="Training ZIP root. Repeatable.")
+    parser = argparse.ArgumentParser(
+        description="Run the full widened mixed-speaker rebuild pipeline."
+    )
+    parser.add_argument(
+        "--train-input", action="append", default=[], help="Training ZIP root. Repeatable."
+    )
     parser.add_argument(
         "--transcript-root",
         action="append",
@@ -513,7 +521,9 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, help="Artifact directory for the rebuild.")
     parser.add_argument("--base-config", help="Optional transcriber config JSON/YAML.")
     parser.add_argument("--eval", action="append", default=[], type=_parse_eval_spec)
-    parser.add_argument("--baseline-profile-dir", help="Optional existing profile used for regression checks.")
+    parser.add_argument(
+        "--baseline-profile-dir", help="Optional existing profile used for regression checks."
+    )
     parser.add_argument("--hf-cache-root", help="HF cache root for rebuilt bank/profiles.")
     parser.add_argument("--bank-profile-name", default="final_expanded_bank_v3")
     parser.add_argument(
@@ -527,7 +537,9 @@ def main() -> None:
     )
     parser.add_argument("--diarization-model", default="pyannote/speaker-diarization-community-1")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--batch-size", type=int, default=8, help="Number of training sessions per mixed batch.")
+    parser.add_argument(
+        "--batch-size", type=int, default=8, help="Number of training sessions per mixed batch."
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -542,7 +554,11 @@ def main() -> None:
     hf_cache_root.mkdir(parents=True, exist_ok=True)
     speaker_mapping_path = Path(args.speaker_mapping).expanduser().resolve()
     speaker_mapping = _load_yaml_or_json(str(speaker_mapping_path)) or {}
-    base_config = _load_yaml_or_json(str(Path(args.base_config).expanduser().resolve())) if args.base_config else {}
+    base_config = (
+        _load_yaml_or_json(str(Path(args.base_config).expanduser().resolve()))
+        if args.base_config
+        else {}
+    )
     eval_specs = list(args.eval)
     excluded_session_stems = [session_zip.stem for _, session_zip, _ in eval_specs]
     transcript_roots = [Path(path).expanduser().resolve() for path in args.transcript_root]
@@ -556,7 +572,9 @@ def main() -> None:
 
     if args.skip_bank_build:
         if not args.existing_bank_profile_dir:
-            raise SystemExit("--existing-bank-profile-dir is required when --skip-bank-build is set.")
+            raise SystemExit(
+                "--existing-bank-profile-dir is required when --skip-bank-build is set."
+            )
         bank_profile_dir = Path(args.existing_bank_profile_dir).expanduser().resolve()
         if not bank_profile_dir.exists():
             raise SystemExit(f"Existing bank profile dir does not exist: {bank_profile_dir}")
@@ -654,16 +672,20 @@ def main() -> None:
     }
 
     loaded_variants = {
-        name: load_classifier_dataset(path)[0]
-        for name, path in variant_dirs.items()
+        name: load_classifier_dataset(path)[0] for name, path in variant_dirs.items()
     }
     prepared_root = output_root / "prepared_eval"
     stage1_results: List[Dict[str, object]] = []
 
     for pack_name, aug_variants in DEFAULT_AUGMENTATION_PACKS.items():
-        merged_datasets = [relabel_classifier_dataset_sources(bank_dataset, "bank"), loaded_variants["mixed_raw"]]
+        merged_datasets = [
+            relabel_classifier_dataset_sources(bank_dataset, "bank"),
+            loaded_variants["mixed_raw"],
+        ]
         for aug_name in aug_variants:
-            merged_datasets.append(relabel_classifier_dataset_sources(loaded_variants[aug_name], "mixed_aug_total"))
+            merged_datasets.append(
+                relabel_classifier_dataset_sources(loaded_variants[aug_name], "mixed_aug_total")
+            )
         merged_dataset = merge_classifier_datasets(merged_datasets)
         balanced_dataset, balance_summary = balance_classifier_dataset(
             merged_dataset,

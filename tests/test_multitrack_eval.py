@@ -61,8 +61,62 @@ def test_score_word_speaker_alignment_uses_word_timestamps():
     assert metrics["reference_words"] == 3
     assert metrics["matched_words"] == 3
     assert metrics["correct_words"] == 2
+    assert metrics["timed_speaker_hit_words"] == 2
     assert metrics["accuracy"] == 2 / 3
+    assert metrics["accuracy_metric"] == "timed_speaker_hit_rate"
+    assert metrics["timed_speaker_hit_rate"] == 2 / 3
+    assert metrics["lexical_matched_words"] == 3
+    assert metrics["lexical_correct_words"] == 2
+    assert metrics["lexical_accuracy"] == 2 / 3
+    assert metrics["speaker_attributed_lexical_accuracy"] == 2 / 3
     assert metrics["confusion"]["Alice"]["Carol"] == 1
+
+
+def test_score_word_speaker_alignment_keeps_lexical_accuracy_separate():
+    reference = [WordSpan(speaker="Alice", start=1.0, end=1.2, text="dragon")]
+    predicted = [WordSpan(speaker="Alice", start=1.0, end=1.2, text="wagon")]
+
+    metrics = score_word_speaker_alignment(reference, predicted, tolerance_seconds=0.2)
+
+    assert metrics["timed_speaker_hit_words"] == 1
+    assert metrics["timed_speaker_hit_rate"] == 1.0
+    assert metrics["lexical_matched_words"] == 0
+    assert metrics["lexical_correct_words"] == 0
+    assert metrics["lexical_accuracy"] == 0.0
+
+
+def test_score_word_speaker_alignment_matches_lexical_tokens_independently():
+    reference = [WordSpan(speaker="Alice", start=1.0, end=1.2, text="dragon")]
+    predicted = [
+        WordSpan(speaker="Alice", start=1.0, end=1.2, text="wagon"),
+        WordSpan(speaker="Alice", start=1.05, end=1.25, text="Dragon!"),
+    ]
+
+    metrics = score_word_speaker_alignment(reference, predicted, tolerance_seconds=0.2)
+
+    assert metrics["timed_speaker_hit_words"] == 1
+    assert metrics["lexical_matched_words"] == 1
+    assert metrics["lexical_correct_words"] == 1
+    assert metrics["speaker_attributed_lexical_accuracy"] == 1.0
+
+
+def test_score_word_speaker_alignment_does_not_reuse_predicted_words():
+    reference = [
+        WordSpan(speaker="Alice", start=0.0, end=0.2, text="one"),
+        WordSpan(speaker="Alice", start=0.2, end=0.4, text="two"),
+        WordSpan(speaker="Alice", start=0.4, end=0.6, text="three"),
+    ]
+    predicted = [
+        WordSpan(speaker="Alice", start=0.0, end=0.6, text="one two three"),
+    ]
+
+    metrics = score_word_speaker_alignment(reference, predicted, tolerance_seconds=0.35)
+
+    assert metrics["reference_words"] == 3
+    assert metrics["predicted_words"] == 1
+    assert metrics["matched_words"] == 1
+    assert metrics["correct_words"] == 1
+    assert metrics["confusion"]["Alice"]["<unmatched>"] == 2
 
 
 def test_summarize_graph_pair_diagnostics_reports_pre_post_confusion_delta():

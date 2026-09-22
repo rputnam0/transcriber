@@ -63,6 +63,33 @@ def test_transcribe_file_maps_sentences_to_repo_segments():
     assert model.calls[0][1]["overlap_duration"] == 15.0
 
 
+def test_parakeet_keeps_word_times_and_joins_subword_pieces():
+    sentence = _FakeSentence("Hello everyone.", 0.1, 1.4)
+    sentence.tokens = [
+        types.SimpleNamespace(text=" Hello", start=0.1, end=0.4, confidence=0.9),
+        types.SimpleNamespace(text=" every", start=0.5, end=0.8, confidence=0.8),
+        types.SimpleNamespace(text="one", start=0.8, end=1.2, confidence=0.7),
+        types.SimpleNamespace(text=".", start=1.2, end=1.4, confidence=0.9),
+    ]
+    segments = transcribe_file("unused.wav", _FakeModel(_FakeResult([sentence])))
+    assert [w["word"] for w in segments[0]["words"]] == ["Hello", "everyone."]
+    assert segments[0]["words"][1]["start"] == 0.5
+    assert segments[0]["words"][1]["end"] == 1.2
+
+
+def test_delayed_punctuation_does_not_extend_word_into_next_speaker():
+    from transcriber.parakeet_backend import _tokens_to_words
+
+    tokens = [
+        types.SimpleNamespace(text=" on", start=6.24, end=6.56),
+        types.SimpleNamespace(text=".", start=10.0, end=10.32),
+        types.SimpleNamespace(text=" Um", start=10.32, end=10.64),
+    ]
+    words = _tokens_to_words(tokens)
+    assert words[0] == {"word": "on.", "start": 6.24, "end": 6.56}
+    assert words[1]["start"] == 10.32
+
+
 def test_transcribe_file_maps_nemo_timestamps_to_repo_segments():
     result = _FakeNemoResult(
         [
@@ -78,6 +105,18 @@ def test_transcribe_file_maps_nemo_timestamps_to_repo_segments():
         {"start": 0.1, "end": 0.9, "text": "Hello there", "speaker": None},
         {"start": 1.2, "end": 1.8, "text": "General Kenobi", "speaker": None},
     ]
+
+
+def test_parakeet_keeps_separate_whitespace_token_before_number():
+    from transcriber.parakeet_backend import _tokens_to_words
+
+    tokens = [
+        types.SimpleNamespace(text=text, start=i, end=i + 1)
+        for i, text in enumerate(["cost", " ", "64", "0", " gold"])
+    ]
+    words = _tokens_to_words(tokens)
+    assert [word["word"] for word in words] == ["cost", "640", "gold"]
+    assert words[1]["start"] == 2
 
 
 def test_resolve_dtype_respects_float16_alias(monkeypatch):
@@ -96,3 +135,13 @@ def test_resolve_dtype_respects_float16_alias(monkeypatch):
     assert parakeet_backend._resolve_dtype("fp16") == ("float16-dtype", "float16")
     assert parakeet_backend._resolve_dtype("float32") == ("float32-dtype", "float32")
     assert parakeet_backend._resolve_dtype("int8") == ("bfloat16-dtype", "bfloat16")
+
+
+def test_unknown_decoder_markers_never_become_transcript_words():
+    from types import SimpleNamespace
+    from transcriber.parakeet_backend import _result_to_segments
+
+    sentence = SimpleNamespace(
+        text="<unk>" * 200, start=1, end=2, tokens=[SimpleNamespace(text="<unk>", start=1, end=2)]
+    )
+    assert _result_to_segments(SimpleNamespace(sentences=[sentence])) == []

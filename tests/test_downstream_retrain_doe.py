@@ -165,7 +165,14 @@ def _baseline_fixture(tmp_path: Path) -> dict[str, Path]:
         },
     )
 
-    eval_manifest_path = output_root / "artifacts" / "eval" / "canonical_baseline" / "manifest" / "eval_manifest.json"
+    eval_manifest_path = (
+        output_root
+        / "artifacts"
+        / "eval"
+        / "canonical_baseline"
+        / "manifest"
+        / "eval_manifest.json"
+    )
     _write_json(
         eval_manifest_path,
         {
@@ -275,7 +282,11 @@ def _evaluate_stub(metric_map: dict[tuple[str, str], dict[str, float]]):
         output_dir.mkdir(parents=True, exist_ok=True)
         output_text = str(output_dir)
         experiment_name = next(
-            (name for name in experiment_names if f"/{name}/" in output_text or output_text.endswith(name)),
+            (
+                name
+                for name in experiment_names
+                if f"/{name}/" in output_text or output_text.endswith(name)
+            ),
             "baseline",
         )
         session_name = output_dir.name
@@ -297,7 +308,9 @@ def _evaluate_stub(metric_map: dict[tuple[str, str], dict[str, float]]):
     return fake_evaluate_multitrack_session
 
 
-def _training_stub(*, dataset, profile_dir, model_name, classifier_c, classifier_n_neighbors, base_summary=None):
+def _training_stub(
+    *, dataset, profile_dir, model_name, classifier_c, classifier_n_neighbors, base_summary=None
+):
     profile_dir = Path(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
     (profile_dir / "segment_classifier.meta.json").write_text(
@@ -369,7 +382,10 @@ def test_phase_a_classifier_only_writes_report_and_skips_hard_negative_builder(
             },
             "phase_a": {
                 "family_sweep": [
-                    {"name": "knn_k7", "classifier": {"model_name": "knn", "classifier_n_neighbors": 7}},
+                    {
+                        "name": "knn_k7",
+                        "classifier": {"model_name": "knn", "classifier_n_neighbors": 7},
+                    },
                     {
                         "name": "lda_knn_k11",
                         "classifier": {"model_name": "lda_knn", "classifier_n_neighbors": 11},
@@ -384,10 +400,26 @@ def test_phase_a_classifier_only_writes_report_and_skips_hard_negative_builder(
     metric_map = {
         ("knn_k7", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
         ("knn_k7", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("lda_knn_k11", "Session22"): {"accuracy": 0.7560, "coverage": 0.98, "matched_accuracy": 0.7700},
-        ("lda_knn_k11", "Session61"): {"accuracy": 0.6450, "coverage": 0.97, "matched_accuracy": 0.6640},
-        ("lda_knn_k11", "short_segment_slice"): {"accuracy": 0.6750, "coverage": 0.96, "matched_accuracy": 0.7010},
+        ("knn_k7", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("lda_knn_k11", "Session22"): {
+            "accuracy": 0.7560,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7700,
+        },
+        ("lda_knn_k11", "Session61"): {
+            "accuracy": 0.6450,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6640,
+        },
+        ("lda_knn_k11", "short_segment_slice"): {
+            "accuracy": 0.6750,
+            "coverage": 0.96,
+            "matched_accuracy": 0.7010,
+        },
         ("lda_knn_k11_thr_0_38_margin_0_04", "Session22"): {
             "accuracy": 0.7565,
             "coverage": 0.98,
@@ -403,9 +435,21 @@ def test_phase_a_classifier_only_writes_report_and_skips_hard_negative_builder(
             "coverage": 0.96,
             "matched_accuracy": 0.7040,
         },
-        ("knn_k7_thr_0_38_margin_0_04", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("knn_k7_thr_0_38_margin_0_04", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7_thr_0_38_margin_0_04", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+        ("knn_k7_thr_0_38_margin_0_04", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("knn_k7_thr_0_38_margin_0_04", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("knn_k7_thr_0_38_margin_0_04", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
     }
 
     monkeypatch.setattr(
@@ -420,7 +464,9 @@ def test_phase_a_classifier_only_writes_report_and_skips_hard_negative_builder(
     )
 
     def fail_hard_negative_builder(*args, **kwargs):
-        raise AssertionError("hard-negative builder should not run during classifier-only promotion")
+        raise AssertionError(
+            "hard-negative builder should not run during classifier-only promotion"
+        )
 
     monkeypatch.setattr(
         downstream_retrain_doe,
@@ -453,7 +499,10 @@ def test_phase_b_hard_negative_refresh_promotes_best_experiment(tmp_path, monkey
             },
             "phase_a": {
                 "family_sweep": [
-                    {"name": "knn_k7", "classifier": {"model_name": "knn", "classifier_n_neighbors": 7}},
+                    {
+                        "name": "knn_k7",
+                        "classifier": {"model_name": "knn", "classifier_n_neighbors": 7},
+                    },
                 ],
                 "calibration": {"top_n": 1, "thresholds": [0.36], "classifier_min_margins": [0.06]},
             },
@@ -478,16 +527,56 @@ def test_phase_b_hard_negative_refresh_promotes_best_experiment(tmp_path, monkey
     metric_map = {
         ("knn_k7", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
         ("knn_k7", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("control_current", "Session22"): {"accuracy": 0.7625, "coverage": 0.98, "matched_accuracy": 0.7765},
-        ("control_current", "Session61"): {"accuracy": 0.6350, "coverage": 0.97, "matched_accuracy": 0.6520},
-        ("control_current", "short_segment_slice"): {"accuracy": 0.6670, "coverage": 0.96, "matched_accuracy": 0.6920},
-        ("combined_precision_v1", "Session22"): {"accuracy": 0.7580, "coverage": 0.98, "matched_accuracy": 0.7730},
-        ("combined_precision_v1", "Session61"): {"accuracy": 0.6460, "coverage": 0.97, "matched_accuracy": 0.6630},
-        ("combined_precision_v1", "short_segment_slice"): {"accuracy": 0.6760, "coverage": 0.96, "matched_accuracy": 0.7040},
+        ("knn_k7", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("control_current", "Session22"): {
+            "accuracy": 0.7625,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7765,
+        },
+        ("control_current", "Session61"): {
+            "accuracy": 0.6350,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6520,
+        },
+        ("control_current", "short_segment_slice"): {
+            "accuracy": 0.6670,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6920,
+        },
+        ("combined_precision_v1", "Session22"): {
+            "accuracy": 0.7580,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7730,
+        },
+        ("combined_precision_v1", "Session61"): {
+            "accuracy": 0.6460,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6630,
+        },
+        ("combined_precision_v1", "short_segment_slice"): {
+            "accuracy": 0.6760,
+            "coverage": 0.96,
+            "matched_accuracy": 0.7040,
+        },
     }
     monkeypatch.setattr(
         downstream_retrain_doe,
@@ -547,7 +636,12 @@ def test_hard_negative_refresh_rejects_eval_session_records(tmp_path, monkeypatc
         {
             "dev_only": True,
             "phase_a": {
-                "family_sweep": [{"name": "knn_k7", "classifier": {"model_name": "knn", "classifier_n_neighbors": 7}}],
+                "family_sweep": [
+                    {
+                        "name": "knn_k7",
+                        "classifier": {"model_name": "knn", "classifier_n_neighbors": 7},
+                    }
+                ],
                 "calibration": {"top_n": 1, "thresholds": [0.36], "classifier_min_margins": [0.06]},
             },
             "phase_b": {
@@ -560,13 +654,41 @@ def test_hard_negative_refresh_rejects_eval_session_records(tmp_path, monkeypatc
     metric_map = {
         ("knn_k7", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
         ("knn_k7", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("control_current", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("control_current", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("control_current", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+        ("knn_k7", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("control_current", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("control_current", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("control_current", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
     }
     monkeypatch.setattr(
         downstream_retrain_doe,
@@ -611,7 +733,12 @@ def test_hard_negative_refresh_rejects_final_eval_session_records(tmp_path, monk
         {
             "dev_only": True,
             "phase_a": {
-                "family_sweep": [{"name": "knn_k7", "classifier": {"model_name": "knn", "classifier_n_neighbors": 7}}],
+                "family_sweep": [
+                    {
+                        "name": "knn_k7",
+                        "classifier": {"model_name": "knn", "classifier_n_neighbors": 7},
+                    }
+                ],
                 "calibration": {"top_n": 1, "thresholds": [0.36], "classifier_min_margins": [0.06]},
             },
             "phase_b": {
@@ -624,13 +751,41 @@ def test_hard_negative_refresh_rejects_final_eval_session_records(tmp_path, monk
     metric_map = {
         ("knn_k7", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
         ("knn_k7", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
-        ("control_current", "Session22"): {"accuracy": 0.7627, "coverage": 0.98, "matched_accuracy": 0.7770},
-        ("control_current", "Session61"): {"accuracy": 0.6333, "coverage": 0.97, "matched_accuracy": 0.6515},
-        ("control_current", "short_segment_slice"): {"accuracy": 0.6663, "coverage": 0.96, "matched_accuracy": 0.6916},
+        ("knn_k7", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("knn_k7_thr_0_36_margin_0_06", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
+        ("control_current", "Session22"): {
+            "accuracy": 0.7627,
+            "coverage": 0.98,
+            "matched_accuracy": 0.7770,
+        },
+        ("control_current", "Session61"): {
+            "accuracy": 0.6333,
+            "coverage": 0.97,
+            "matched_accuracy": 0.6515,
+        },
+        ("control_current", "short_segment_slice"): {
+            "accuracy": 0.6663,
+            "coverage": 0.96,
+            "matched_accuracy": 0.6916,
+        },
     }
     monkeypatch.setattr(
         downstream_retrain_doe,

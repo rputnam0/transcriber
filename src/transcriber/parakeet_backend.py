@@ -221,11 +221,34 @@ def load_model(
     )
 
 
+def _tokens_to_words(tokens: list) -> List[dict]:
+    """Keep MLX token timing while joining word-internal sentencepiece tokens."""
+    words: List[dict] = []
+    pending_space = False
+    for token in tokens:
+        text = str(getattr(token, "text", "")).replace("<unk>", "")
+        if not text.strip():
+            pending_space = pending_space or bool(text)
+            continue
+        start = float(getattr(token, "start", 0.0))
+        end = float(getattr(token, "end", start))
+        if not words or pending_space or text[0].isspace():
+            words.append({"word": text.strip(), "start": start, "end": end})
+        else:
+            words[-1]["word"] += text
+            # TDT can emit punctuation at the next utterance, after seconds of silence.
+            # Punctuation is text, not acoustic evidence that the preceding voice continued.
+            if any(character.isalnum() for character in text):
+                words[-1]["end"] = end
+        pending_space = text[-1].isspace()
+    return words
+
+
 def _result_to_segments(result: object) -> List[dict]:
     sentences = getattr(result, "sentences", None) or []
     segments: List[dict] = []
     for sentence in sentences:
-        text = getattr(sentence, "text", "").strip()
+        text = getattr(sentence, "text", "").replace("<unk>", "").strip()
         if not text:
             continue
         segments.append(
@@ -236,6 +259,9 @@ def _result_to_segments(result: object) -> List[dict]:
                 "speaker": None,
             }
         )
+        words = _tokens_to_words(getattr(sentence, "tokens", None) or [])
+        if words:
+            segments[-1]["words"] = words
 
     if segments:
         return segments

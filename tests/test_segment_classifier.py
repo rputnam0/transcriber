@@ -189,6 +189,25 @@ def test_load_labeled_records_parses_timed_transcript_and_aliases(tmp_path):
     assert records[0]["end"] == 10
 
 
+def test_load_labeled_records_can_preserve_inferred_overlap(tmp_path):
+    transcript = tmp_path / "Session 6.txt"
+    transcript.write_text(
+        "\n".join(
+            [
+                "Alice 00:00:07 This sentence continues for several words.",
+                "Bob 00:00:08 Brief interruption.",
+                "Alice 00:00:12 Later turn.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_labeled_records(transcript, timed_end_mode="speaker_estimate")
+
+    assert records[0]["end"] > records[1]["start"]
+    assert records[0]["end"] <= records[2]["start"]
+
+
 def test_load_labeled_records_maps_raw_track_ids_from_jsonl(tmp_path):
     transcript = tmp_path / "Session_32.jsonl"
     transcript.write_text(
@@ -701,7 +720,9 @@ def test_materialize_classifier_dataset_from_mixed_base_reuses_cached_variant(
         "_load_audio_array",
         lambda path: (np.zeros(16000, dtype=np.float32), 16000),
     )
-    monkeypatch.setattr(segment_classifier, "build_waveform_augmenter", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        segment_classifier, "build_waveform_augmenter", lambda *args, **kwargs: object()
+    )
 
     import transcriber.diarization as diarization
 
@@ -715,7 +736,9 @@ def test_materialize_classifier_dataset_from_mixed_base_reuses_cached_variant(
             {},
         )
 
-    monkeypatch.setattr(diarization, "extract_embeddings_for_segments", fake_extract_embeddings_for_segments)
+    monkeypatch.setattr(
+        diarization, "extract_embeddings_for_segments", fake_extract_embeddings_for_segments
+    )
 
     output_dir = tmp_path / "light_variant"
     first_dataset, first_summary = materialize_classifier_dataset_from_mixed_base(

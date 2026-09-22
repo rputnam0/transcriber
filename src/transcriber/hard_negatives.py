@@ -325,9 +325,9 @@ def build_hard_negative_dataset(
         normalize_pair(left, right): max(int(cap), 0)
         for (left, right), cap in dict(pair_caps or {}).items()
     }
-    grouped: Dict[
-        Tuple[str, str], Dict[str, List[Tuple[Dict[str, object], np.ndarray]]]
-    ] = defaultdict(lambda: defaultdict(list))
+    grouped: Dict[Tuple[str, str], Dict[str, List[Tuple[Dict[str, object], np.ndarray]]]] = (
+        defaultdict(lambda: defaultdict(list))
+    )
     for item in raw_candidates:
         metadata = item[0]
         pair = normalize_pair(str(metadata["speaker"]), str(metadata["confusion_partner"]))
@@ -369,9 +369,7 @@ def build_hard_negative_dataset(
             filler = [item for item in ordered if id(item[0]) not in selected_ids]
             capped.extend(filler[:remaining_slots])
 
-    speaker_cap_value = (
-        max(int(per_speaker_cap), 0) if per_speaker_cap is not None else None
-    )
+    speaker_cap_value = max(int(per_speaker_cap), 0) if per_speaker_cap is not None else None
     if speaker_cap_value is not None:
         by_speaker: Dict[str, List[Tuple[Dict[str, object], np.ndarray]]] = defaultdict(list)
         for item in capped:
@@ -416,7 +414,9 @@ def build_hard_negative_dataset(
             "rejections": {"empty": True},
             "limits": {
                 "per_pair_cap": int(per_pair_cap),
-                "pair_caps": {f"{left}::{right}": cap for (left, right), cap in effective_pair_caps.items()},
+                "pair_caps": {
+                    f"{left}::{right}": cap for (left, right), cap in effective_pair_caps.items()
+                },
                 "per_speaker_cap": speaker_cap_value,
                 "max_fraction": float(max_fraction),
                 "global_cap": global_cap,
@@ -485,7 +485,9 @@ def build_hard_negative_dataset(
         "by_style_threshold": dict(by_style_threshold),
         "by_pair_style_threshold": {
             pair_key: dict(counter)
-            for pair_key, counter in sorted(by_pair_style_threshold.items(), key=lambda item: item[0])
+            for pair_key, counter in sorted(
+                by_pair_style_threshold.items(), key=lambda item: item[0]
+            )
         },
         "heuristics": {
             "uses_eval_confusions": bool(eval_summaries),
@@ -493,7 +495,9 @@ def build_hard_negative_dataset(
         },
         "limits": {
             "per_pair_cap": int(per_pair_cap),
-            "pair_caps": {f"{left}::{right}": cap for (left, right), cap in effective_pair_caps.items()},
+            "pair_caps": {
+                f"{left}::{right}": cap for (left, right), cap in effective_pair_caps.items()
+            },
             "per_speaker_cap": speaker_cap_value,
             "max_fraction": float(max_fraction),
             "global_cap": global_cap,

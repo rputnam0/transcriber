@@ -9,9 +9,9 @@ This canonical note summarizes the current decision:
 
 See the split artifacts for details:
 
-- [Sources Ledger](/Users/rexputnam/Documents/projects/transcriber/docs/sources/speaker_bank_diarization_tuning_sources.md)
-- [Evidence Table](/Users/rexputnam/Documents/projects/transcriber/docs/sources/speaker_bank_diarization_tuning_evidence_table.md)
-- [Math Spec](/Users/rexputnam/Documents/projects/transcriber/docs/specs/speaker_bank_diarization_tuning_math_spec.md)
-- [Implementation Spec](/Users/rexputnam/Documents/projects/transcriber/docs/specs/speaker_bank_diarization_tuning_implementation_spec.md)
-- [Open Items](/Users/rexputnam/Documents/projects/transcriber/docs/specs/speaker_bank_diarization_tuning_open_items.md)
-- [Decision Report](/Users/rexputnam/Documents/projects/transcriber/docs/specs/speaker_bank_diarization_tuning_decision_report.md)
+- [Sources Ledger](../sources/speaker_bank_diarization_tuning_sources.md)
+- [Evidence Table](../sources/speaker_bank_diarization_tuning_evidence_table.md)
+- [Math Spec](speaker_bank_diarization_tuning_math_spec.md)
+- [Implementation Spec](speaker_bank_diarization_tuning_implementation_spec.md)
+- [Open Items](speaker_bank_diarization_tuning_open_items.md)
+- [Decision Report](speaker_bank_diarization_tuning_decision_report.md)

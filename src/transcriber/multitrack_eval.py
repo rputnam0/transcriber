@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -201,49 +202,76 @@ def score_word_speaker_alignment(
     confusion: Dict[str, Counter[str]] = defaultdict(Counter)
     per_speaker_total: Counter[str] = Counter()
     per_speaker_correct: Counter[str] = Counter()
+    per_speaker_lexical_correct: Counter[str] = Counter()
 
-    cursor = 0
-    for ref in sorted(reference_words, key=lambda item: (item.start, item.end)):
+    used_predicted: set[int] = set()
+    reference = sorted(reference_words, key=lambda item: (item.start, item.end))
+    for ref in reference:
         per_speaker_total[ref.speaker] += 1
-        midpoint = ref.midpoint
-        while cursor < len(predicted) and predicted[cursor].end < midpoint - tolerance_seconds:
-            cursor += 1
-        best_match: Optional[WordSpan] = None
-        best_distance: Optional[tuple[float, float]] = None
-        probe = max(cursor - 1, 0)
-        while probe < len(predicted):
-            pred = predicted[probe]
-            if pred.start > midpoint + tolerance_seconds:
-                break
-            if pred.start <= midpoint <= pred.end:
-                interval_distance = 0.0
-            else:
-                interval_distance = min(abs(midpoint - pred.start), abs(midpoint - pred.end))
-            if interval_distance <= tolerance_seconds:
-                candidate_distance = (interval_distance, abs(pred.midpoint - midpoint))
-                if best_distance is None or candidate_distance < best_distance:
-                    best_match = pred
-                    best_distance = candidate_distance
-            probe += 1
+        best_match_index, best_match = _best_temporal_word_match(
+            ref,
+            predicted,
+            used_predicted,
+            tolerance_seconds=tolerance_seconds,
+        )
 
         if best_match is None:
             confusion[ref.speaker]["<unmatched>"] += 1
             continue
 
+        if best_match_index is not None:
+            used_predicted.add(best_match_index)
         matched += 1
         confusion[ref.speaker][best_match.speaker] += 1
         if best_match.speaker == ref.speaker:
             correct += 1
             per_speaker_correct[ref.speaker] += 1
 
+    lexical_matched = 0
+    lexical_correct = 0
+    used_lexical_predicted: set[int] = set()
+    for ref in reference:
+        normalized_ref = _normalize_word_for_alignment(ref.text)
+        if not normalized_ref:
+            continue
+        best_match_index, best_match = _best_temporal_word_match(
+            ref,
+            predicted,
+            used_lexical_predicted,
+            tolerance_seconds=tolerance_seconds,
+            normalized_text=normalized_ref,
+        )
+        if best_match is None:
+            continue
+        if best_match_index is not None:
+            used_lexical_predicted.add(best_match_index)
+        lexical_matched += 1
+        if best_match.speaker == ref.speaker:
+            lexical_correct += 1
+            per_speaker_lexical_correct[ref.speaker] += 1
+
     total = len(reference_words)
+    timed_speaker_hit_rate = (correct / total) if total else 0.0
+    lexical_accuracy = (lexical_correct / total) if total else 0.0
+    lexical_matched_accuracy = lexical_correct / lexical_matched if lexical_matched else 0.0
     return {
         "reference_words": total,
+        "predicted_words": len(predicted),
         "matched_words": matched,
         "correct_words": correct,
+        "timed_speaker_hit_words": correct,
         "coverage": (matched / total) if total else 0.0,
-        "accuracy": (correct / total) if total else 0.0,
+        "accuracy": timed_speaker_hit_rate,
+        "accuracy_metric": "timed_speaker_hit_rate",
+        "timed_speaker_hit_rate": timed_speaker_hit_rate,
         "matched_accuracy": (correct / matched) if matched else 0.0,
+        "lexical_matched_words": lexical_matched,
+        "lexical_correct_words": lexical_correct,
+        "lexical_coverage": (lexical_matched / total) if total else 0.0,
+        "lexical_accuracy": lexical_accuracy,
+        "lexical_matched_accuracy": lexical_matched_accuracy,
+        "speaker_attributed_lexical_accuracy": lexical_accuracy,
+        "speaker_attributed_lexical_matched_accuracy": lexical_matched_accuracy,
         "per_speaker_accuracy": {
             speaker: {
                 "total": per_speaker_total[speaker],
@@ -253,11 +281,64 @@ def score_word_speaker_alignment(
                     if per_speaker_total[speaker]
                     else 0.0
                 ),
+                "lexical_correct": per_speaker_lexical_correct[speaker],
+                "lexical_accuracy": (
+                    per_speaker_lexical_correct[speaker] / per_speaker_total[speaker]
+                    if per_speaker_total[speaker]
+                    else 0.0
+                ),
+                "speaker_attributed_lexical_accuracy": (
+                    per_speaker_lexical_correct[speaker] / per_speaker_total[speaker]
+                    if per_speaker_total[speaker]
+                    else 0.0
+                ),
             }
             for speaker in sorted(per_speaker_total)
         },
         "confusion": {speaker: dict(counts) for speaker, counts in sorted(confusion.items())},
     }
+
+
+def _best_temporal_word_match(
+    reference: WordSpan,
+    predicted: Sequence[WordSpan],
+    used_indices: set[int],
+    *,
+    tolerance_seconds: float,
+    normalized_text: str | None = None,
+) -> tuple[int | None, WordSpan | None]:
+    midpoint = reference.midpoint
+    best_match: WordSpan | None = None
+    best_match_index: int | None = None
+    best_distance: tuple[float, float, int] | None = None
+    for index, pred in enumerate(predicted):
+        if index in used_indices:
+            continue
+        if pred.end < midpoint - tolerance_seconds:
+            continue
+        if pred.start > midpoint + tolerance_seconds:
+            break
+        if (
+            normalized_text is not None
+            and _normalize_word_for_alignment(pred.text) != normalized_text
+        ):
+            continue
+        if pred.start <= midpoint <= pred.end:
+            interval_distance = 0.0
+        else:
+            interval_distance = min(abs(midpoint - pred.start), abs(midpoint - pred.end))
+        if interval_distance > tolerance_seconds:
+            continue
+        candidate_distance = (interval_distance, abs(pred.midpoint - midpoint), index)
+        if best_distance is None or candidate_distance < best_distance:
+            best_match = pred
+            best_match_index = index
+            best_distance = candidate_distance
+    return best_match_index, best_match
+
+
+def _normalize_word_for_alignment(text: str) -> str:
+    return re.sub(r"[^a-z0-9']+", "", str(text or "").lower()).strip("'")
 
 
 def _normalized_pair_key(left: object, right: object) -> str | None:
@@ -291,12 +372,8 @@ def summarize_graph_pair_diagnostics(
     post_graph_metrics: Mapping[str, object],
     speaker_bank_summary: Optional[Mapping[str, object]],
 ) -> Dict[str, Dict[str, int]]:
-    pre_confusions = _confusion_pair_counts(
-        dict(pre_graph_metrics or {}).get("confusion") or {}
-    )
-    post_confusions = _confusion_pair_counts(
-        dict(post_graph_metrics or {}).get("confusion") or {}
-    )
+    pre_confusions = _confusion_pair_counts(dict(pre_graph_metrics or {}).get("confusion") or {})
+    post_confusions = _confusion_pair_counts(dict(post_graph_metrics or {}).get("confusion") or {})
     graph_pairs = dict(dict(speaker_bank_summary or {}).get("graph", {}).get("pairs") or {})
     pair_keys = set(pre_confusions) | set(post_confusions) | set(graph_pairs)
     diagnostics: Dict[str, Dict[str, int]] = {}
@@ -1103,7 +1180,9 @@ def evaluate_multitrack_session(
             purity_path.write_text(json.dumps(diarization_purity, indent=2), encoding="utf-8")
         pre_graph_segments = copy.deepcopy(raw_segments)
         pre_graph_summary: Optional[Dict[str, object]] = None
-        if speaker_bank_config is not None and getattr(speaker_bank_config, "session_graph_enabled", False):
+        if speaker_bank_config is not None and getattr(
+            speaker_bank_config, "session_graph_enabled", False
+        ):
             pre_graph_config = copy.deepcopy(speaker_bank_config)
             pre_graph_config.session_graph_enabled = False
             pre_graph_segments, pre_graph_summary = apply_profile_to_cached_segments(
@@ -1116,9 +1195,8 @@ def evaluate_multitrack_session(
                 segment_classifier=segment_classifier,
                 hf_token=_speaker_hf_token(),
                 diarization_model_name=str(defaults.get("diarization_model") or ""),
-                force_device=device_override or (
-                    str(defaults.get("device")) if defaults.get("device") else None
-                ),
+                force_device=device_override
+                or (str(defaults.get("device")) if defaults.get("device") else None),
                 quiet=True,
             )
         relabeled_segments, speaker_bank_summary = apply_profile_to_cached_segments(
@@ -1131,9 +1209,8 @@ def evaluate_multitrack_session(
             segment_classifier=segment_classifier,
             hf_token=_speaker_hf_token(),
             diarization_model_name=str(defaults.get("diarization_model") or ""),
-            force_device=device_override or (
-                str(defaults.get("device")) if defaults.get("device") else None
-            ),
+            force_device=device_override
+            or (str(defaults.get("device")) if defaults.get("device") else None),
             quiet=True,
         )
         consolidated_pairs = consolidate([(str(mixed_path), relabeled_segments)])
@@ -1151,7 +1228,9 @@ def evaluate_multitrack_session(
         predicted_words = extract_words_from_segments(relabeled_segments)
         metrics = score_word_speaker_alignment(reference_words, predicted_words)
         pre_graph_metrics = (
-            score_word_speaker_alignment(reference_words, extract_words_from_segments(pre_graph_segments))
+            score_word_speaker_alignment(
+                reference_words, extract_words_from_segments(pre_graph_segments)
+            )
             if pre_graph_summary is not None
             else None
         )

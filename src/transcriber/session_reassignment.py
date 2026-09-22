@@ -414,7 +414,9 @@ def _segment_words(segment: Mapping[str, object]) -> List[Dict[str, object]]:
 
 
 def _segment_text(words: Sequence[Mapping[str, object]]) -> str:
-    return " ".join(str(word.get("text") or "").strip() for word in words if str(word.get("text") or "").strip()).strip()
+    return " ".join(
+        str(word.get("text") or "").strip() for word in words if str(word.get("text") or "").strip()
+    ).strip()
 
 
 def _merge_repaired_segments(
@@ -483,9 +485,7 @@ def repair_diarization_segments(
             gap = float(word["start"]) - float(prev["end"])
             raw_changed = str(word.get("speaker_raw") or "") != str(prev.get("speaker_raw") or "")
             if raw_changed or gap >= float(config.split_on_word_gap_seconds):
-                boundary_overlap_heavy = raw_changed or gap > float(
-                    config.max_seed_overlap_seconds
-                )
+                boundary_overlap_heavy = raw_changed or gap > float(config.max_seed_overlap_seconds)
                 chunks.append(current)
                 chunk_overlap_flags.append(current_overlap_heavy or boundary_overlap_heavy)
                 current = [word]
@@ -502,13 +502,17 @@ def repair_diarization_segments(
             end = float(chunk[-1]["end"])
             raw_label = str(chunk[0].get("speaker_raw") or "").strip()
             chunk_segment = copy.deepcopy(segment)
-            if abs(float(segment.get("start") or start) - start) <= float(config.snap_boundary_seconds):
+            if abs(float(segment.get("start") or start) - start) <= float(
+                config.snap_boundary_seconds
+            ):
                 snapped_boundaries += 1
             if abs(float(segment.get("end") or end) - end) <= float(config.snap_boundary_seconds):
                 snapped_boundaries += 1
             chunk_segment["start"] = start
             chunk_segment["end"] = end
-            chunk_segment["speaker_raw"] = raw_label or segment.get("speaker_raw") or segment.get("speaker")
+            chunk_segment["speaker_raw"] = (
+                raw_label or segment.get("speaker_raw") or segment.get("speaker")
+            )
             chunk_segment["text"] = _segment_text(chunk)
             chunk_segment["words"] = chunk
             chunk_segment["speaker_repair_was_split"] = len(chunks) > 1
@@ -599,9 +603,7 @@ def _graph_config_from_speaker_bank_config(config: object) -> SessionGraphConfig
         temporal_max_gap_seconds=float(
             getattr(config, "session_graph_temporal_max_gap_seconds", 2.0)
         ),
-        same_raw_label_weight=float(
-            getattr(config, "session_graph_same_raw_label_weight", 0.25)
-        ),
+        same_raw_label_weight=float(getattr(config, "session_graph_same_raw_label_weight", 0.25)),
         same_top1_weight=float(getattr(config, "session_graph_same_top1_weight", 0.10)),
         alpha=float(getattr(config, "session_graph_alpha", 0.85)),
         max_iters=max(int(getattr(config, "session_graph_max_iters", 30)), 1),
@@ -626,15 +628,9 @@ def _repair_config_from_speaker_bank_config(config: object) -> DiarizationRepair
             getattr(config, "repair_merge_same_raw_gap_seconds", 0.20)
         ),
         snap_boundary_seconds=float(getattr(config, "repair_snap_boundary_seconds", 0.20)),
-        max_overlap_trim_seconds=float(
-            getattr(config, "repair_max_overlap_trim_seconds", 0.30)
-        ),
-        split_on_word_gap_seconds=float(
-            getattr(config, "repair_split_on_word_gap_seconds", 0.35)
-        ),
-        max_seed_overlap_seconds=float(
-            getattr(config, "repair_max_seed_overlap_seconds", 0.15)
-        ),
+        max_overlap_trim_seconds=float(getattr(config, "repair_max_overlap_trim_seconds", 0.30)),
+        split_on_word_gap_seconds=float(getattr(config, "repair_split_on_word_gap_seconds", 0.35)),
+        max_seed_overlap_seconds=float(getattr(config, "repair_max_seed_overlap_seconds", 0.15)),
         min_segment_duration_seconds=float(
             getattr(config, "repair_min_segment_duration_seconds", 0.35)
         ),
@@ -1004,8 +1000,9 @@ def apply_profile_to_segments(
     relabeled, repair_summary = repair_diarization_segments(relabeled, config=repair_config)
     summary["repair"] = repair_summary
 
-    segment_embeddings = list(precomputed_segment_embeddings or [])
-    if repair_config.enabled or not segment_embeddings:
+    match_per_segment = bool(getattr(speaker_bank_config, "match_per_segment", True))
+    segment_embeddings = list(precomputed_segment_embeddings or []) if match_per_segment else []
+    if match_per_segment and (repair_config.enabled or not segment_embeddings):
         segment_embeddings = _build_segment_embedding_cache(
             audio_path,
             relabeled,
@@ -1321,7 +1318,10 @@ def apply_profile_to_segments(
         classifier_min_margin=float(getattr(speaker_bank_config, "classifier_min_margin", 0.0)),
         graph_config=graph_config,
     )
-    embedding_map = {item.segment_index: np.asarray(item.embedding, dtype=np.float32) for item in segment_embeddings}
+    embedding_map = {
+        item.segment_index: np.asarray(item.embedding, dtype=np.float32)
+        for item in segment_embeddings
+    }
     graph_matches = _run_session_graph(evidence, embedding_map, config=graph_config)
     graph_summary = {
         "enabled": bool(graph_config.enabled),
@@ -1465,12 +1465,13 @@ def apply_profile_to_segments(
                     )
 
     graph_summary["pairs"] = {
-        pair_key: graph_pair_summary[pair_key]
-        for pair_key in sorted(graph_pair_summary)
+        pair_key: graph_pair_summary[pair_key] for pair_key in sorted(graph_pair_summary)
     }
     summary["graph"] = graph_summary
     summary["segment_counts"]["matched"] = sum(
         1 for segment in relabeled if str(segment.get("speaker") or "").strip().lower() != "unknown"
     )
-    summary["segment_counts"]["unknown"] = len(relabeled) - int(summary["segment_counts"]["matched"])
+    summary["segment_counts"]["unknown"] = len(relabeled) - int(
+        summary["segment_counts"]["matched"]
+    )
     return relabeled, summary, segment_embeddings

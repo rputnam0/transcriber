@@ -12,6 +12,29 @@ from transcriber.session_reassignment import (
 )
 
 
+def test_disabled_segment_matching_uses_only_label_embedding():
+    from transcriber.speaker_bank import SpeakerBankConfig
+
+    class Bank:
+        def match(self, vector, **kwargs):
+            return {"speaker": "Alice", "score": 0.9, "margin": 0.5}
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Per-segment extraction was explicitly disabled")
+
+    segments, summary, embeddings = apply_profile_to_segments(
+        audio_path="unused.wav",
+        segments=[{"start": 0, "end": 2, "text": "hello", "speaker": "A"}],
+        label_embeddings={"A": np.array([1.0, 0.0])},
+        speaker_bank=Bank(),
+        speaker_bank_config=SpeakerBankConfig(match_per_segment=False),
+        extract_embeddings_for_segments_fn=unexpected,
+    )
+    assert segments[0]["speaker"] == "Alice"
+    assert summary["matched"] == 1
+    assert embeddings == []
+
+
 class _GraphSpeakerBank:
     def score_candidates(self, embedding, **kwargs):  # noqa: ANN003, ARG002
         vector = np.asarray(embedding, dtype=np.float32)

@@ -104,8 +104,12 @@ def _aggregate_eval_summary(summary: Dict[str, object]) -> Dict[str, object]:
     per_speaker_total: Dict[str, int] = {}
     for item in results:
         for speaker, payload in (item.get("metrics", {}).get("per_speaker_accuracy") or {}).items():
-            per_speaker_correct[speaker] = per_speaker_correct.get(speaker, 0) + int(payload.get("correct") or 0)
-            per_speaker_total[speaker] = per_speaker_total.get(speaker, 0) + int(payload.get("total") or 0)
+            per_speaker_correct[speaker] = per_speaker_correct.get(speaker, 0) + int(
+                payload.get("correct") or 0
+            )
+            per_speaker_total[speaker] = per_speaker_total.get(speaker, 0) + int(
+                payload.get("total") or 0
+            )
     return {
         "mean_accuracy": _mean(accuracy_values),
         "mean_coverage": _mean(coverage_values),
@@ -121,7 +125,9 @@ def _aggregate_eval_summary(summary: Dict[str, object]) -> Dict[str, object]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run cached purity/balance DOE against existing eval caches.")
+    parser = argparse.ArgumentParser(
+        description="Run cached purity/balance DOE against existing eval caches."
+    )
     parser.add_argument("--bank-profile-dir", required=True)
     parser.add_argument("--mixed-dataset-dir", required=True)
     parser.add_argument("--speaker-mapping", required=True)
@@ -153,7 +159,9 @@ def main() -> None:
     if bank_built is None:
         raise SystemExit("Failed to load bank dataset")
     bank_dataset, bank_summary = bank_built
-    mixed_dataset, mixed_summary = load_classifier_dataset(Path(args.mixed_dataset_dir).expanduser().resolve())
+    mixed_dataset, mixed_summary = load_classifier_dataset(
+        Path(args.mixed_dataset_dir).expanduser().resolve()
+    )
 
     bank_dataset = relabel_classifier_dataset_sources(bank_dataset, "bank")
     mixed_dataset = relabel_classifier_dataset_sources(mixed_dataset, "mixed_raw")
@@ -275,7 +283,9 @@ def main() -> None:
             flush=True,
         )
 
-    results.sort(key=lambda item: (float(item["mean_accuracy"]), float(item["mean_coverage"])), reverse=True)
+    results.sort(
+        key=lambda item: (float(item["mean_accuracy"]), float(item["mean_coverage"])), reverse=True
+    )
     payload = {"results": results}
     report_path = output_root / "report.json"
     report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

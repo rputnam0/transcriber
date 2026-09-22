@@ -75,3 +75,77 @@ def test_extract_embeddings_for_segments_accepts_tensor_like_batches(monkeypatch
     assert len(results) == 1
     assert results[0].speaker == "SPEAKER_00"
     assert np.allclose(results[0].embedding, np.array([1.0, 0.0], dtype=np.float32))
+
+
+def test_embedding_does_not_change_with_a_longer_batch_neighbor(monkeypatch):
+    from transcriber import diarization
+
+    class CenteringEmbedder:
+        sample_rate = 16000
+
+        def __call__(self, waves, masks=None):
+            # Like WeSpeaker's frontend, statistics are computed before pooling masks.
+            values = waves[:, 0].numpy()
+            return np.stack([values.mean(axis=1), values.std(axis=1)], axis=1)
+
+    monkeypatch.setattr(diarization, "_resolve_embedder", lambda **kwargs: CenteringEmbedder())
+    kwargs = dict(
+        hf_token=None,
+        force_device="cpu",
+        pre_pad=0,
+        post_pad=0,
+        audio_waveform=np.ones(16000, dtype=np.float32),
+        audio_sample_rate=16000,
+    )
+    alone, _ = diarization.extract_embeddings_for_segments("", [(0, 0.5, "A")], **kwargs)
+    batched, _ = diarization.extract_embeddings_for_segments(
+        "", [(0, 0.5, "A"), (0, 1, "B")], **kwargs
+    )
+    assert np.allclose(alone[0].embedding, batched[0].embedding)
+
+
+def test_embedding_skips_crops_shorter_than_model_minimum(monkeypatch):
+    from transcriber import diarization
+
+    class Embedder:
+        sample_rate = 16000
+        min_num_samples = 400
+
+        def __call__(self, waves, masks=None):
+            assert waves.shape[-1] >= self.min_num_samples
+            return np.ones((len(waves), 2), dtype=np.float32)
+
+    monkeypatch.setattr(diarization, "_resolve_embedder", lambda **kwargs: Embedder())
+    results, summary = diarization.extract_embeddings_for_segments(
+        "",
+        [(0, 0.01, "too_short"), (0, 0.5, "valid")],
+        None,
+        force_device="cpu",
+        pre_pad=0,
+        post_pad=0,
+        audio_waveform=np.ones(16000, dtype=np.float32),
+        audio_sample_rate=16000,
+    )
+    assert [result.speaker for result in results] == ["valid"]
+    assert summary["skipped"] == 1
+
+
+def test_explicit_mps_embedding_device_is_not_silently_replaced(monkeypatch):
+    from transcriber import diarization
+
+    devices = []
+
+    class Embedder:
+        sample_rate = 16000
+
+    def resolve(**kwargs):
+        devices.append(kwargs["device"])
+        return Embedder()
+
+    monkeypatch.setattr(diarization, "_resolve_embedder", resolve)
+    # Empty input avoids requiring Apple hardware on Linux CI while exercising device routing.
+    results, _ = diarization.extract_embeddings_for_segments(
+        "", [], None, force_device="mps", audio_waveform=np.zeros(16000, np.float32)
+    )
+    assert results == []
+    assert devices == ["mps"]

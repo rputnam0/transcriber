@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -123,6 +124,61 @@ def test_match_with_single_embedding_relies_on_cosine(tmp_path):
     match = bank.match(query, threshold=0.7)
     assert match is not None
     assert match["speaker"] == "alice"
+
+
+def test_match_radius_factor_zero_disables_radius_gate(tmp_path):
+    bank = SpeakerBank(
+        tmp_path,
+        profile="radius_off",
+        cluster_method="dbscan",
+        dbscan_eps=1.0,
+        dbscan_min_samples=1,
+        prototypes_enabled=True,
+        prototypes_per_cluster=1,
+    )
+    bank.extend(
+        [
+            ("alice", np.array([1.0, 0.0], dtype=np.float32), "a1.wav", {}),
+            ("alice", np.array([0.99995, 0.01], dtype=np.float32), "a2.wav", {}),
+        ]
+    )
+    bank.save()
+
+    match = bank.match(
+        np.array([0.8, 0.6], dtype=np.float32),
+        threshold=0.7,
+        radius_factor=0.0,
+    )
+
+    assert match is not None
+    assert match["speaker"] == "alice"
+
+
+def test_whiten_scoring_handles_degenerate_eigenvalues_without_warning(tmp_path):
+    bank = SpeakerBank(
+        tmp_path,
+        profile="whiten_degenerate",
+        cluster_method="dbscan",
+        dbscan_eps=1.0,
+        dbscan_min_samples=1,
+        scoring_whiten=True,
+    )
+    bank.extend(
+        [
+            ("alice", np.array([1.0, 0.0], dtype=np.float32), "a1.wav", {}),
+            ("bob", np.array([1.0, 0.0], dtype=np.float32), "b1.wav", {}),
+        ]
+    )
+    bank.save()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        candidates = bank.score_candidates(
+            np.array([1.0, 0.0], dtype=np.float32),
+            radius_factor=0.0,
+        )
+
+    assert candidates
 
 
 def test_match_enforces_margin(tmp_path):

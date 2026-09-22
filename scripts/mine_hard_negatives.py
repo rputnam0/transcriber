@@ -20,15 +20,16 @@ from transcriber.prep_artifacts import (  # noqa: E402
     current_git_commit,
     save_manifest,
 )
-from transcriber.segment_classifier import load_classifier_dataset, save_classifier_dataset  # noqa: E402
+from transcriber.segment_classifier import (  # noqa: E402
+    load_classifier_dataset,
+    save_classifier_dataset,
+)
 
 
 def _parse_pair(value: str) -> Tuple[str, str]:
     left, sep, right = value.partition("::")
     if not sep or not left.strip() or not right.strip():
-        raise argparse.ArgumentTypeError(
-            "Seed pairs must look like 'Speaker A::Speaker B'."
-        )
+        raise argparse.ArgumentTypeError("Seed pairs must look like 'Speaker A::Speaker B'.")
     return left.strip(), right.strip()
 
 

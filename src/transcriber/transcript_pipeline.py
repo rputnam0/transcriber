@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .asr import AsrResult, transcribe_with_faster_whisper
+from .asr import AsrResult, AsrSegment, AsrWord, transcribe_with_faster_whisper
 from .diarization import (
     DiarizationResult,
     DiarizationTurn,
@@ -27,6 +27,29 @@ class TranscriptPipelineResult:
     metadata: dict
 
 
+def asr_result_from_segments(segments: Sequence[dict]) -> AsrResult:
+    """Adapt a backend's standard segment dictionaries without inventing word timestamps."""
+    return AsrResult(
+        segments=[
+            AsrSegment(
+                start=float(segment["start"]),
+                end=float(segment["end"]),
+                text=segment["text"],
+                words=[
+                    AsrWord(
+                        word=str(word.get("word") or word.get("text") or ""),
+                        start=float(word["start"]),
+                        end=float(word["end"]),
+                        score=word.get("score"),
+                    )
+                    for word in segment.get("words", [])
+                ],
+            )
+            for segment in segments
+        ]
+    )
+
+
 def _turn_to_dict(turn: DiarizationTurn) -> dict:
     return {"start": float(turn.start), "end": float(turn.end), "speaker": turn.speaker}
 
@@ -40,6 +63,8 @@ def _choose_turn_label(
     end: float,
     primary_turns: Sequence[DiarizationTurn],
     fallback_turns: Sequence[DiarizationTurn],
+    *,
+    max_distance_seconds: float = 0.35,
 ) -> Optional[str]:
     def _pick(turns: Sequence[DiarizationTurn]) -> Optional[str]:
         best_label: Optional[str] = None
@@ -62,9 +87,27 @@ def _choose_turn_label(
                     midpoint_label = turn.speaker
         if best_label is not None and best_overlap > 0.0:
             return best_label
-        return midpoint_label
+        return midpoint_label if midpoint_distance == 0.0 else None
 
-    return _pick(primary_turns) or _pick(fallback_turns)
+    label = _pick(primary_turns) or _pick(fallback_turns)
+    if label is not None:
+        return label
+    turns = [*primary_turns, *fallback_turns]
+    if not turns:
+        return None
+    # One-frame boundary fragments are weak evidence across silence. Prefer a
+    # supported speech turn for nearest-gap fallback, retaining short-only input.
+    supported = [turn for turn in turns if turn.end - turn.start >= 0.05]
+    turns = supported or turns
+
+    # With no overlap, measure the gap between intervals. A long final word can
+    # begin beside a turn while its midpoint lies outside the fallback allowance.
+    def gap(turn: DiarizationTurn) -> float:
+        return max(turn.start - end, start - turn.end, 0.0)
+
+    nearest = min(turns, key=gap)
+    distance = gap(nearest)
+    return nearest.speaker if distance <= max_distance_seconds else None
 
 
 def _assign_word_speakers(
@@ -192,13 +235,35 @@ def _aggregate_speaker_embeddings(
     diarization_model_name: Optional[str],
     force_device: Optional[str],
     quiet: bool,
-    pre_pad: float = 0.15,
-    post_pad: float = 0.15,
     batch_size: int = 16,
 ) -> Dict[str, np.ndarray]:
-    turns = _merge_adjacent_turns(diarization.exclusive_segments or diarization.segments)
-    if not turns:
-        turns = list(diarization.exclusive_segments or diarization.segments)
+    # Exclusive labels do not remove concurrent voices from the underlying waveform.
+    # Subtract other speakers before selecting identity evidence, and never pad it back in.
+    regular = diarization.segments or diarization.exclusive_segments
+    clean = []
+    for turn in regular:
+        intervals = [(turn.start, turn.end)]
+        for other in regular:
+            if other.speaker == turn.speaker:
+                continue
+            remaining = []
+            for start, end in intervals:
+                if other.end <= start or other.start >= end:
+                    remaining.append((start, end))
+                else:
+                    if start < other.start:
+                        remaining.append((start, other.start))
+                    if other.end < end:
+                        remaining.append((other.end, end))
+            intervals = remaining
+        clean.extend(
+            DiarizationTurn(start, end, turn.speaker) for start, end in intervals if end > start
+        )
+    clean = _merge_adjacent_turns(clean, max_gap_seconds=0.0, min_duration=0.0)
+    turns = [turn for turn in clean if turn.end - turn.start >= 0.8]
+    represented = {turn.speaker for turn in turns}
+    # A short-only speaker must not disappear just because another speaker has longer turns.
+    turns.extend(turn for turn in clean if turn.speaker not in represented)
     if not turns:
         return {}
     payload = [(turn.start, turn.end, turn.speaker) for turn in turns]
@@ -209,20 +274,24 @@ def _aggregate_speaker_embeddings(
         diarization_model_name=diarization_model_name,
         force_device=force_device,
         quiet=quiet,
-        pre_pad=pre_pad,
-        post_pad=post_pad,
+        pre_pad=0.0,
+        post_pad=0.0,
         batch_size=batch_size,
     )
     by_label: Dict[str, List[np.ndarray]] = {}
+    weights: Dict[str, List[float]] = {}
     for result in embed_results:
         by_label.setdefault(result.speaker, []).append(
             np.asarray(result.embedding, dtype=np.float32)
+        )
+        weights.setdefault(result.speaker, []).append(
+            min(max(result.end - result.start, 0.01), 5.0)
         )
 
     embeddings: Dict[str, np.ndarray] = {}
     for label, vectors in by_label.items():
         matrix = np.stack(vectors)
-        centroid = np.mean(matrix, axis=0)
+        centroid = np.average(matrix, axis=0, weights=weights[label])
         norm = float(np.linalg.norm(centroid))
         if norm <= 0.0:
             continue
@@ -262,6 +331,34 @@ def transcribe_with_faster_pipeline(
         local_files_only=local_files_only,
         batch_size=batch_size,
     )
+    return diarize_asr_result(
+        audio_path,
+        asr_result,
+        hf_token=hf_token,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        pyannote_on_cpu=pyannote_on_cpu,
+        diarization_model_name=diarization_model_name,
+        force_device=force_device,
+        quiet=quiet,
+        enable_diarization=enable_diarization,
+    )
+
+
+def diarize_asr_result(
+    audio_path: str,
+    asr_result: AsrResult,
+    *,
+    hf_token: Optional[str] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    pyannote_on_cpu: bool = False,
+    diarization_model_name: Optional[str] = None,
+    force_device: Optional[str] = None,
+    quiet: bool = True,
+    enable_diarization: bool = True,
+) -> TranscriptPipelineResult:
+    """Apply the same diarization and identity evidence path to any word-timed ASR result."""
     structured_segments = asr_result.to_dict_segments()
     diarization_segments: List[dict] = []
     exclusive_segments: List[dict] = []
@@ -292,7 +389,9 @@ def transcribe_with_faster_pipeline(
             )
             metadata["diarization"] = diarization.metadata
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Direct pyannote diarization failed for %s: %s", audio_path, exc)
+            raise RuntimeError(
+                "Speaker diarization failed; no diarized transcript was produced"
+            ) from exc
 
     return TranscriptPipelineResult(
         segments=structured_segments,

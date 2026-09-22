@@ -82,3 +82,61 @@ def test_transcribe_with_faster_pipeline_assigns_exclusive_speakers(monkeypatch)
     assert result.segments[1]["words"][0]["speaker"] == "SPEAKER_01"
     assert len(result.exclusive_diarization_segments) == 2
     assert sorted(result.speaker_embeddings) == ["SPEAKER_00", "SPEAKER_01"]
+
+
+def test_word_uses_overlapping_fallback_before_distant_exclusive_turn():
+    from transcriber.transcript_pipeline import _choose_turn_label
+    from transcriber.diarization import DiarizationTurn as Turn
+
+    assert _choose_turn_label(10, 10.4, [Turn(0, 1, "A")], [Turn(10, 11, "B")]) == "B"
+    assert _choose_turn_label(10, 10.4, [Turn(0, 1, "A")], []) is None
+    assert _choose_turn_label(1.05, 1.1, [Turn(0, 1, "A")], []) == "A"
+    # Parakeet can give the trailing word a long span beginning just after speech.
+    assert _choose_turn_label(1.1, 2.0, [Turn(0, 1, "A")], []) == "A"
+    assert _choose_turn_label(1.36, 2.0, [Turn(0, 1, "A")], []) is None
+    assert _choose_turn_label(1.1, 1.3, [Turn(0, 1, "A"), Turn(1, 1.017, "B")], []) == "A"
+
+
+def test_identity_excerpts_keep_brief_speakers_and_exclude_other_voices(monkeypatch):
+    from transcriber import transcript_pipeline as pipeline
+    from transcriber.diarization import DiarizationResult, DiarizationTurn as Turn
+
+    # B has only a half-second clean interjection. C overlaps A and has no clean evidence.
+    regular = [Turn(0, 3, "A"), Turn(1, 2, "C"), Turn(3, 3.5, "B")]
+    exclusive = [Turn(0, 3, "A"), Turn(3, 3.5, "B")]
+    captured = {}
+
+    def fake_embeddings(path, segments, token, **kwargs):
+        captured["segments"] = segments
+        captured.update(kwargs)
+        return [], {}
+
+    monkeypatch.setattr(pipeline, "extract_embeddings_for_segments", fake_embeddings)
+    pipeline._aggregate_speaker_embeddings(
+        "unused.wav",
+        DiarizationResult(regular, exclusive, {}),
+        hf_token=None,
+        diarization_model_name=None,
+        force_device="cpu",
+        quiet=True,
+    )
+    assert {speaker for _, _, speaker in captured["segments"]} == {"A", "B"}
+    assert all(end <= 1 or start >= 2 for start, end, _ in captured["segments"])
+    assert captured["pre_pad"] == captured["post_pad"] == 0
+
+
+def test_diarization_failure_is_reported_to_caller(monkeypatch):
+    import pytest
+    from transcriber import transcript_pipeline as pipeline
+    from transcriber.asr import AsrResult
+
+    monkeypatch.setattr(pipeline, "transcribe_with_faster_whisper", lambda *a, **k: AsrResult([]))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(pipeline, "diarize_audio", fail)
+    with pytest.raises(RuntimeError, match="diarization"):
+        pipeline.transcribe_with_faster_pipeline(
+            "unused.wav", model_name="tiny", force_device="cpu"
+        )

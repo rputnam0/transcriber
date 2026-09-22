@@ -185,7 +185,9 @@ def load_manifest(path: Path) -> Optional[Dict[str, object]]:
 def save_manifest(path: Path, manifest: Mapping[str, object]) -> Path:
     manifest_path = Path(path).expanduser()
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(_normalize_json_value(dict(manifest)), indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(_normalize_json_value(dict(manifest)), indent=2), encoding="utf-8"
+    )
     return manifest_path
 
 
@@ -244,7 +246,9 @@ def build_stage_manifest(
         "stage_signature": signature_payload["stage_signature"],
         "parent_stages": signature_payload["parent_stages"],
         "outputs": _normalize_json_value(dict(outputs)),
-        "required_paths": [str(Path(path).expanduser()) for path in required_paths if str(path).strip()],
+        "required_paths": [
+            str(Path(path).expanduser()) for path in required_paths if str(path).strip()
+        ],
         "git_commit": git_commit or current_git_commit(),
     }
 
@@ -396,7 +400,14 @@ class StageMetricsLogger:
         return record
 
     def bind(self, *, stage: str, variant: Optional[str] = None):
-        def _callback(*, status: str, session: Optional[str] = None, cache_hit: Optional[bool] = None, elapsed_seconds: Optional[float] = None, extra: Optional[Mapping[str, object]] = None) -> Dict[str, object]:
+        def _callback(
+            *,
+            status: str,
+            session: Optional[str] = None,
+            cache_hit: Optional[bool] = None,
+            elapsed_seconds: Optional[float] = None,
+            extra: Optional[Mapping[str, object]] = None,
+        ) -> Dict[str, object]:
             return self.log(
                 stage=stage,
                 status=status,
@@ -530,7 +541,9 @@ def build_coverage_report(
     min_sessions_per_speaker: int = 3,
     min_sample_ratio: float = 0.5,
 ) -> Dict[str, object]:
-    per_domain_counts: Dict[str, Dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    per_domain_counts: Dict[str, Dict[str, Counter[str]]] = defaultdict(
+        lambda: defaultdict(Counter)
+    )
     per_domain_sessions: Dict[str, Dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     for label, domain, session in zip(dataset.labels, dataset.domains, dataset.sessions):

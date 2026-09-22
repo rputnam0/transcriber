@@ -89,7 +89,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train and evaluate segment-classifier variants on held-out multitrack sessions.",
     )
-    parser.add_argument("--input-path", required=True, help="Training ZIP root or specific ZIP file.")
+    parser.add_argument(
+        "--input-path", required=True, help="Training ZIP root or specific ZIP file."
+    )
     parser.add_argument(
         "--extra-input-path",
         action="append",
@@ -102,7 +104,9 @@ def main() -> None:
         required=True,
         help="Existing speaker-bank profile directory that already contains bank.json and embeddings.npy.",
     )
-    parser.add_argument("--output-root", required=True, help="Directory for variant profiles and reports.")
+    parser.add_argument(
+        "--output-root", required=True, help="Directory for variant profiles and reports."
+    )
     parser.add_argument(
         "--eval-session",
         action="append",
@@ -142,8 +146,12 @@ def main() -> None:
     )
     parser.add_argument("--classifier-c", type=float, action="append", default=[1.0, 4.0])
     parser.add_argument("--classifier-n-neighbors", type=int, action="append", default=[7, 15])
-    parser.add_argument("--classifier-min-confidence", type=float, action="append", default=[0.0, 0.2])
-    parser.add_argument("--classifier-min-margin", type=float, action="append", default=[0.08, 0.15])
+    parser.add_argument(
+        "--classifier-min-confidence", type=float, action="append", default=[0.0, 0.2]
+    )
+    parser.add_argument(
+        "--classifier-min-margin", type=float, action="append", default=[0.08, 0.15]
+    )
     parser.add_argument("--quiet", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -153,7 +161,9 @@ def main() -> None:
 
     mapping_path = Path(args.speaker_mapping).expanduser().resolve()
     mapping = _load_yaml_or_json(str(mapping_path)) or {}
-    base_config = _load_yaml_or_json(str(Path(args.config).expanduser().resolve())) if args.config else {}
+    base_config = (
+        _load_yaml_or_json(str(Path(args.config).expanduser().resolve())) if args.config else {}
+    )
     eval_sessions = _parse_eval_session(args.eval_session)
     speaker_aliases = _parse_aliases(args.speaker_alias)
 

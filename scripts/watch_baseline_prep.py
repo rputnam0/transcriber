@@ -42,8 +42,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("metrics_log", type=Path, help="Path to stage_metrics.jsonl.")
     parser.add_argument("--poll-seconds", type=float, default=5.0, help="Polling interval.")
-    parser.add_argument("--stall-seconds", type=float, default=900.0, help="Warn after this much inactivity.")
-    parser.add_argument("--rss-gib-threshold", type=float, default=20.0, help="Warn above this RSS threshold.")
+    parser.add_argument(
+        "--stall-seconds", type=float, default=900.0, help="Warn after this much inactivity."
+    )
+    parser.add_argument(
+        "--rss-gib-threshold", type=float, default=20.0, help="Warn above this RSS threshold."
+    )
     parser.add_argument(
         "--gpu-detach-grace",
         type=int,
@@ -85,7 +89,10 @@ def main() -> int:
             parts.append(f"gpu={_format_bytes(gpu_memory_bytes)}")
             print(" ".join(parts), flush=True)
 
-            if rss_bytes >= float(args.rss_gib_threshold) * (1024**3) and rss_bytes >= last_rss_bytes:
+            if (
+                rss_bytes >= float(args.rss_gib_threshold) * (1024**3)
+                and rss_bytes >= last_rss_bytes
+            ):
                 print(
                     f"WARNING: RSS is high and non-decreasing: {_format_bytes(rss_bytes)}",
                     flush=True,
@@ -94,7 +101,9 @@ def main() -> int:
             if gpu_memory_bytes is None:
                 gpu_detached_count += 1
                 if gpu_detached_count >= int(args.gpu_detach_grace):
-                    print("WARNING: GPU memory has been absent across multiple records.", flush=True)
+                    print(
+                        "WARNING: GPU memory has been absent across multiple records.", flush=True
+                    )
             else:
                 gpu_detached_count = 0
 

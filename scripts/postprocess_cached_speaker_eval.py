@@ -6,7 +6,11 @@ from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from transcriber.multitrack_eval import WordSpan, extract_words_from_jsonl, score_word_speaker_alignment
+from transcriber.multitrack_eval import (
+    WordSpan,
+    extract_words_from_jsonl,
+    score_word_speaker_alignment,
+)
 from transcriber.segment_postprocess import smooth_short_speaker_flips
 
 
@@ -30,7 +34,13 @@ def _guess_reference_path(
     if session_name.lower() == "session22" and session22_reference_root is not None:
         return session22_reference_root / predicted_window_dir.name / "clips" / "clips.jsonl"
     if session_name.lower() == "session61" and session61_reference_root is not None:
-        return session61_reference_root / predicted_window_dir.name / "reference" / "clips" / "clips.jsonl"
+        return (
+            session61_reference_root
+            / predicted_window_dir.name
+            / "reference"
+            / "clips"
+            / "clips.jsonl"
+        )
     return None
 
 
@@ -82,7 +92,11 @@ def main() -> None:
                 session22_reference_root=session22_reference_root,
                 session61_reference_root=session61_reference_root,
             )
-            if predicted_jsonl.exists() and reference_jsonl is not None and reference_jsonl.exists():
+            if (
+                predicted_jsonl.exists()
+                and reference_jsonl is not None
+                and reference_jsonl.exists()
+            ):
                 pairs.append((predicted_jsonl, reference_jsonl))
         if pairs:
             session_windows[session_dir.name] = pairs
@@ -122,7 +136,9 @@ def main() -> None:
     )
     results.append(baseline)
 
-    for max_total_duration, max_score, run_segments in product(durations, max_scores, max_run_segments):
+    for max_total_duration, max_score, run_segments in product(
+        durations, max_scores, max_run_segments
+    ):
         result = {
             "config": {
                 "max_total_duration": float(max_total_duration),
@@ -186,7 +202,9 @@ def main() -> None:
         )
         results.append(result)
 
-    results.sort(key=lambda item: (float(item["mean_accuracy"]), float(item["mean_coverage"])), reverse=True)
+    results.sort(
+        key=lambda item: (float(item["mean_accuracy"]), float(item["mean_coverage"])), reverse=True
+    )
     payload = {
         "eval_root": str(eval_root),
         "results": results,

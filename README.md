@@ -1,5 +1,10 @@
 # Transcriber
 
+For the evaluated Apple Silicon pipeline for a **single mixed recording with named
+speakers**, see [Mac single-file transcription](docs/mac-single-file-transcription.md).
+It combines dedicated Qwen ASR with trained MOSS diarization and private enrollment
+profiles. It is a separate, resumable workflow from the regular CLI below.
+
 GPU-accelerated speech transcription powered by faster-whisper plus direct pyannote diarization. Works on single audio files, directories, or multi-track ZIPs.
 
 ## Features

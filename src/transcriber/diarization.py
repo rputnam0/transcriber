@@ -361,12 +361,13 @@ def extract_embeddings_for_segments(
     if batch_size <= 0:
         batch_size = 1
 
-    device = force_device if force_device in {"cpu", "cuda"} else _detect_device()
+    device = force_device if force_device in {"cpu", "cuda", "mps"} else _detect_device()
     if device == "cuda" and not _cudnn_usable():
         device = "cpu"
     diar_model_name = diarization_model_name or DEFAULT_DIARIZATION_MODEL
     embedder = _resolve_embedder(model_name=diar_model_name, hf_token=hf_token, device=device)
     sample_rate = int(getattr(embedder, "sample_rate", 16000) or 16000)
+    min_num_samples = max(int(getattr(embedder, "min_num_samples", 1) or 1), 1)
     if audio_waveform is not None:
         base_waveform = np.asarray(audio_waveform, dtype=np.float32).flatten()
         base_sr = int(audio_sample_rate or 16000)
@@ -405,7 +406,7 @@ def extract_embeddings_for_segments(
     skipped = 0
     batch: List[Tuple[int, float, float, str, np.ndarray]] = []
 
-    def _flush_batch() -> None:
+    def _embed_batch(batch: List[Tuple[int, float, float, str, np.ndarray]]) -> None:
         nonlocal skipped
         if not batch:
             return
@@ -451,6 +452,17 @@ def extract_embeddings_for_segments(
         del embedding_batch
         batch.clear()
 
+    def _flush_batch() -> None:
+        # WeSpeaker centers filterbanks before applying the pooling mask. Zero padding
+        # therefore changes an embedding even when every padded sample is masked out.
+        # Batch only equal-length crops so results do not depend on their neighbors.
+        by_length: Dict[int, List[Tuple[int, float, float, str, np.ndarray]]] = {}
+        for item in batch:
+            by_length.setdefault(item[-1].shape[0], []).append(item)
+        for same_length in by_length.values():
+            _embed_batch(same_length)
+        batch.clear()
+
     for index, start, end, speaker in segment_items:
         if end <= start:
             skipped += 1
@@ -466,7 +478,7 @@ def extract_embeddings_for_segments(
             skipped += 1
             continue
         wave = np.asarray(base_waveform[start_idx:end_idx], dtype=np.float32)
-        if wave.size == 0:
+        if wave.size < min_num_samples:
             skipped += 1
             continue
         if waveform_transform is not None:
@@ -474,7 +486,7 @@ def extract_embeddings_for_segments(
                 waveform_transform(wave.copy(), int(base_sr), speaker, index),
                 dtype=np.float32,
             ).flatten()
-            if wave.size == 0:
+            if wave.size < min_num_samples:
                 skipped += 1
                 continue
         batch.append((index, start, end, speaker, wave))
@@ -526,7 +538,7 @@ def extract_speaker_embeddings(
     force_device: Optional[str] = None,
     quiet: bool = True,
 ) -> Tuple[Dict[str, np.ndarray], Optional[List[dict]]]:
-    device = force_device if force_device in {"cpu", "cuda"} else _detect_device()
+    device = force_device if force_device in {"cpu", "cuda", "mps"} else _detect_device()
     if pyannote_on_cpu:
         device = "cpu"
     diarization = diarize_audio(

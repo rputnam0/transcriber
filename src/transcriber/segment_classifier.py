@@ -538,6 +538,7 @@ def _load_timed_transcript_records(
     *,
     speaker_aliases: Optional[Dict[str, str]] = None,
     speaker_mapping: Optional[Dict[str, object]] = None,
+    timed_end_mode: str = "next_line",
 ) -> List[dict]:
     entries: List[Tuple[str, float, str]] = []
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -568,10 +569,22 @@ def _load_timed_transcript_records(
     records: List[dict] = []
     for index, (speaker, start, text) in enumerate(entries):
         next_start = entries[index + 1][1] if index + 1 < len(entries) else None
-        if next_start is not None and next_start > start:
-            end = next_start
+        estimated_duration = max(1.0, min(20.0, 0.5 + len(text.split()) * 0.32))
+        if timed_end_mode == "next_line":
+            end = next_start if next_start is not None and next_start > start else None
+        elif timed_end_mode == "speaker_estimate":
+            next_speaker_start = next(
+                (
+                    future_start
+                    for future_speaker, future_start, _ in entries[index + 1 :]
+                    if future_speaker == speaker and future_start > start
+                ),
+                None,
+            )
+            end = min(start + estimated_duration, next_speaker_start or float("inf"))
         else:
-            estimated_duration = max(1.0, min(15.0, len(text.split()) * 0.35))
+            raise ValueError(f"Unsupported timed transcript end mode: {timed_end_mode}")
+        if end is None:
             end = start + estimated_duration
         records.append(
             {
@@ -590,6 +603,7 @@ def load_labeled_records(
     *,
     speaker_aliases: Optional[Dict[str, str]] = None,
     speaker_mapping: Optional[Dict[str, object]] = None,
+    timed_end_mode: str = "next_line",
 ) -> List[dict]:
     if path.suffix.lower() == ".jsonl":
         records = _load_jsonl_records(path)
@@ -607,6 +621,7 @@ def load_labeled_records(
         path,
         speaker_aliases=speaker_aliases,
         speaker_mapping=speaker_mapping,
+        timed_end_mode=timed_end_mode,
     )
 
 
@@ -1148,7 +1163,9 @@ def _build_mixed_base_signature(
 ) -> Dict[str, object]:
     return {
         "version": 1,
-        "session_sources": [build_path_identity(path, hash_contents=False) for path in session_sources],
+        "session_sources": [
+            build_path_identity(path, hash_contents=False) for path in session_sources
+        ],
         "transcript_search_roots": [
             build_path_identity(path, hash_contents=False) for path in transcript_search_roots
         ],
@@ -1189,7 +1206,9 @@ def _prepare_extracted_session_source(
             manifest = {}
         if manifest.get("source_identity") == source_identity:
             stem_inventory = list(manifest.get("stem_inventory") or [])
-            if stem_inventory and all((extracted_dir / str(item)).exists() for item in stem_inventory):
+            if stem_inventory and all(
+                (extracted_dir / str(item)).exists() for item in stem_inventory
+            ):
                 _emit_progress(
                     progress_callback,
                     status="extraction_cache_hit",
@@ -1249,7 +1268,13 @@ def _collect_labeled_stems(
 ) -> List[Tuple[Path, str]]:
     stems: List[Tuple[Path, str]] = []
     for path in sorted(extract_dir.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in {".ogg", ".wav", ".flac", ".mp3", ".m4a"}:
+        if not path.is_file() or path.suffix.lower() not in {
+            ".ogg",
+            ".wav",
+            ".flac",
+            ".mp3",
+            ".m4a",
+        }:
             continue
         label = choose_speaker(path.name, speaker_mapping)
         if label and label != "unknown":
@@ -1372,7 +1397,9 @@ def _build_classifier_dataset_from_rows(
             active_speakers=np.zeros((0,), dtype=np.int32),
         )
     return ClassifierDataset(
-        embeddings=np.vstack([np.asarray(row[0], dtype=np.float32) for row in rows]).astype(np.float32),
+        embeddings=np.vstack([np.asarray(row[0], dtype=np.float32) for row in rows]).astype(
+            np.float32
+        ),
         labels=[str(row[1]) for row in rows],
         domains=[str(row[2]) for row in rows],
         sources=[str(row[3]) for row in rows],
@@ -1501,7 +1528,9 @@ def materialize_classifier_dataset_from_mixed_base(
         if cached_summary.get("materialization_signature") == materialization_signature:
             return load_classifier_dataset(dataset_cache_dir)
 
-    collected_rows: List[Tuple[np.ndarray, str, str, str, str, float, float, float, float, int]] = []
+    collected_rows: List[Tuple[np.ndarray, str, str, str, str, float, float, float, float, int]] = (
+        []
+    )
     started_at = time.monotonic()
     for window_record in _load_prepared_window_records(mixed_base_dir):
         session_name = str(window_record.get("session") or "unknown")
@@ -1616,7 +1645,9 @@ def materialize_classifier_dataset_from_mixed_base(
     summary: Dict[str, object] = {
         "materialization_mode": "mixed_base_derived",
         "base_artifact_id": base_summary.get("artifact_id"),
-        "parent_artifacts": [base_summary.get("artifact_id")] if base_summary.get("artifact_id") else [],
+        "parent_artifacts": (
+            [base_summary.get("artifact_id")] if base_summary.get("artifact_id") else []
+        ),
         "materialization_signature": materialization_signature,
         "quality_filters": dict(base_summary.get("quality_filters") or {}),
         "source_groups": dict(base_summary.get("source_groups") or {}),
@@ -2329,7 +2360,9 @@ def train_segment_classifier_from_multitrack(
                         accepted_payload: List[Tuple[float, float, str]] = []
                         for start, end, label in payload:
                             start_index = max(0, int(math.floor(float(start) * sample_rate)))
-                            end_index = max(start_index + 1, int(math.ceil(float(end) * sample_rate)))
+                            end_index = max(
+                                start_index + 1, int(math.ceil(float(end) * sample_rate))
+                            )
                             metrics = build_audio_quality_metrics(
                                 waveform[start_index : min(end_index, waveform.shape[0])],
                                 sample_rate,
@@ -2550,9 +2583,13 @@ def train_segment_classifier_from_multitrack(
                             "window_index": index,
                             "speaker_count": int(window["speaker_count"]),
                             "turn_count": int(window.get("turn_count") or 0),
-                            "median_turn_duration": float(window.get("median_turn_duration") or 0.0),
+                            "median_turn_duration": float(
+                                window.get("median_turn_duration") or 0.0
+                            ),
                             "short_turn_fraction": float(window.get("short_turn_fraction") or 0.0),
-                            "median_words_per_turn": float(window.get("median_words_per_turn") or 0.0),
+                            "median_words_per_turn": float(
+                                window.get("median_words_per_turn") or 0.0
+                            ),
                             "style_profile": str(window.get("style_profile") or "generic"),
                             "style_score": float(window.get("style_score") or 0.0),
                             "start": start,

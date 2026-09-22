@@ -13,7 +13,7 @@
 
 | index_file | purpose | used_for_evidence | note |
 | --- | --- | --- | --- |
-| [docs/PR-robust-speaker-identification.md](/Users/rexputnam/Documents/projects/transcriber/docs/PR-robust-speaker-identification.md) | Existing repo design notes | no | Useful local context only; not normative evidence. |
+| [docs/PR-robust-speaker-identification.md](../PR-robust-speaker-identification.md) | Existing repo design notes | no | Useful local context only; not normative evidence. |
 | pyannote README / model card indexes | Source discovery | no | Used to find official fine-tuning and model-capability statements. |
 
 ## Coverage Against Scope-Locked Claims

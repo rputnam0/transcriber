@@ -137,7 +137,9 @@ def _slugify(value: str) -> str:
 
 
 def _profile_name(prefix: str, phase: str, experiment_name: str, output_dir: Path) -> str:
-    digest = sha1(f"{output_dir.resolve()}::{phase}::{experiment_name}".encode("utf-8")).hexdigest()[:10]
+    digest = sha1(
+        f"{output_dir.resolve()}::{phase}::{experiment_name}".encode("utf-8")
+    ).hexdigest()[:10]
     return f"{prefix}_{_slugify(phase)}_{_slugify(experiment_name)}_{digest}"
 
 
@@ -251,9 +253,7 @@ def _load_experiment_spec(spec_path: Path) -> Dict[str, object]:
     return {
         "dev_only": bool(raw.get("dev_only", True)),
         "acceptance": {
-            "session61_matched_accuracy_gain": float(
-                acceptance["session61_matched_accuracy_gain"]
-            ),
+            "session61_matched_accuracy_gain": float(acceptance["session61_matched_accuracy_gain"]),
             "session22_accuracy_regression_max": float(
                 acceptance["session22_accuracy_regression_max"]
             ),
@@ -264,7 +264,10 @@ def _load_experiment_spec(spec_path: Path) -> Dict[str, object]:
                 "top_n": int(dict(phase_a.get("calibration") or {}).get("top_n", 2)),
                 "thresholds": [
                     float(value)
-                    for value in list(dict(phase_a.get("calibration") or {}).get("thresholds") or [0.34, 0.36, 0.38])
+                    for value in list(
+                        dict(phase_a.get("calibration") or {}).get("thresholds")
+                        or [0.34, 0.36, 0.38]
+                    )
                 ],
                 "classifier_min_margins": [
                     float(value)
@@ -290,17 +293,24 @@ def _load_context(
     recipe_path = Path(str(baseline_summary["recipe_path"])).expanduser().resolve()
     recipe = _load_yaml_or_json(str(recipe_path)) or {}
     narrow_doe_recipe = json.loads(
-        Path(str(baseline_summary["narrow_doe_recipe_path"])).expanduser().read_text(
-            encoding="utf-8"
-        )
+        Path(str(baseline_summary["narrow_doe_recipe_path"]))
+        .expanduser()
+        .read_text(encoding="utf-8")
     )
     base_config_path = Path(str(recipe["base_config"])).expanduser().resolve()
     base_config = _load_yaml_or_json(str(base_config_path)) or {}
     speaker_mapping_path = Path(str(recipe["speaker_mapping"])).expanduser().resolve()
     output_root = Path(str(baseline_summary["output_root"])).expanduser().resolve()
-    eval_manifest_path = Path(
-        str(baseline_summary.get("dev_eval_manifest_path") or baseline_summary["eval_manifest_path"])
-    ).expanduser().resolve()
+    eval_manifest_path = (
+        Path(
+            str(
+                baseline_summary.get("dev_eval_manifest_path")
+                or baseline_summary["eval_manifest_path"]
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
     eval_manifest = json.loads(eval_manifest_path.read_text(encoding="utf-8"))
     canonical_suite = dict(eval_manifest.get("canonical_suite") or {})
     short_slice = dict(canonical_suite.get("short_segment_slice") or {})
@@ -339,7 +349,9 @@ def _load_context(
         short_slice_window=dict(short_slice.get("window") or {}),
         prepared_eval_root=output_root / "prepared_eval",
         bank_profile_dir=Path(str(narrow_doe_recipe["bank_profile_dir"])).expanduser().resolve(),
-        baseline_profile_dir=Path(str(narrow_doe_recipe["baseline_profile_dir"])).expanduser().resolve(),
+        baseline_profile_dir=Path(str(narrow_doe_recipe["baseline_profile_dir"]))
+        .expanduser()
+        .resolve(),
         base_training_dataset_dir=Path(str(narrow_doe_recipe["base_training_dataset_dir"]))
         .expanduser()
         .resolve(),
@@ -485,10 +497,9 @@ def _evaluate_dev_suite(
         )
         session_results[spec.name] = _aggregate_eval_summary(summary)
 
-        if (
-            context.short_slice_window
-            and _normalize_session_name(spec.name) == _normalize_session_name(context.short_slice_session)
-        ):
+        if context.short_slice_window and _normalize_session_name(
+            spec.name
+        ) == _normalize_session_name(context.short_slice_session):
             short_summary = evaluate_multitrack_session(
                 session_zip=spec.session_zip,
                 session_jsonl=spec.transcript,
@@ -596,14 +607,8 @@ def _resolve_phase_b_hard_negative_settings(
 def _forbidden_eval_sessions(context: DownstreamContext) -> List[str]:
     all_eval_specs = context.eval_specs + context.eval_final_specs + context.mining_eval_specs
     return sorted(
-        {
-            _normalize_session_name(spec.name)
-            for spec in all_eval_specs
-        }
-        | {
-            _normalize_session_name(spec.session_zip.stem)
-            for spec in all_eval_specs
-        }
+        {_normalize_session_name(spec.name) for spec in all_eval_specs}
+        | {_normalize_session_name(spec.session_zip.stem) for spec in all_eval_specs}
     )
 
 
@@ -727,7 +732,9 @@ def _run_hard_negative_refresh_experiment(
             "purpose": "hard_negative_mining",
         },
     )
-    mining_training_summary_path = _write_training_summary(mining_profile_dir, mining_training_summary)
+    mining_training_summary_path = _write_training_summary(
+        mining_profile_dir, mining_training_summary
+    )
     mining_eval_dir = experiment_dir / "mining_eval"
     mining_eval_results, mining_config_path = _evaluate_dev_suite(
         context=DownstreamContext(
@@ -751,29 +758,29 @@ def _run_hard_negative_refresh_experiment(
     if short_summary_path.exists():
         eval_summaries.append(json.loads(short_summary_path.read_text(encoding="utf-8")))
 
-    hard_negative_dataset, hard_negative_records, hard_negative_summary = build_hard_negative_dataset(
-        eval_summaries=eval_summaries,
-        candidate_pool_dirs=candidate_pool_dirs,
-        base_dataset_samples=base_training_dataset.samples,
-        seed_pairs=list(hard_negative_settings["seed_confusion_pairs"]),
-        top_confusion_pairs=int(hard_negative_settings["top_confusion_pairs"]),
-        max_eval_margin=float(hard_negative_settings["hard_negative_max_margin"]),
-        min_mixed_dominant_share=float(
-            hard_negative_settings["hard_negative_min_dominant_share"]
-        ),
-        per_pair_cap=int(hard_negative_settings["hard_negative_per_pair_cap"]),
-        pair_caps=_parse_pair_caps(
-            list(hard_negative_settings["hard_negative_pair_caps"])
-        ),
-        per_speaker_cap=hard_negative_settings["hard_negative_per_speaker_cap"],
-        max_fraction=float(hard_negative_settings["hard_negative_max_fraction"]),
-        style_profile_name=str(hard_negative_settings["hard_negative_style_profile_name"]),
-        style_score_threshold=float(
-            hard_negative_settings["hard_negative_style_score_threshold"]
-        ),
-        min_style_samples_per_pair=int(
-            hard_negative_settings["hard_negative_min_style_samples_per_pair"]
-        ),
+    hard_negative_dataset, hard_negative_records, hard_negative_summary = (
+        build_hard_negative_dataset(
+            eval_summaries=eval_summaries,
+            candidate_pool_dirs=candidate_pool_dirs,
+            base_dataset_samples=base_training_dataset.samples,
+            seed_pairs=list(hard_negative_settings["seed_confusion_pairs"]),
+            top_confusion_pairs=int(hard_negative_settings["top_confusion_pairs"]),
+            max_eval_margin=float(hard_negative_settings["hard_negative_max_margin"]),
+            min_mixed_dominant_share=float(
+                hard_negative_settings["hard_negative_min_dominant_share"]
+            ),
+            per_pair_cap=int(hard_negative_settings["hard_negative_per_pair_cap"]),
+            pair_caps=_parse_pair_caps(list(hard_negative_settings["hard_negative_pair_caps"])),
+            per_speaker_cap=hard_negative_settings["hard_negative_per_speaker_cap"],
+            max_fraction=float(hard_negative_settings["hard_negative_max_fraction"]),
+            style_profile_name=str(hard_negative_settings["hard_negative_style_profile_name"]),
+            style_score_threshold=float(
+                hard_negative_settings["hard_negative_style_score_threshold"]
+            ),
+            min_style_samples_per_pair=int(
+                hard_negative_settings["hard_negative_min_style_samples_per_pair"]
+            ),
+        )
     )
     _assert_records_exclude_eval_sessions(records=hard_negative_records, context=context)
 
@@ -969,7 +976,9 @@ def run_downstream_retrain_doe(
             "skipped": promoted_phase_a is not None,
             "classifier_seed": phase_b_classifier_seed,
             "results": phase_b_results,
-            "candidate_variants": list(dict(spec["phase_b"]).get("candidate_variants") or ["mixed_raw"]),
+            "candidate_variants": list(
+                dict(spec["phase_b"]).get("candidate_variants") or ["mixed_raw"]
+            ),
         },
         "best_result": all_results[0] if all_results else None,
         "promoted_result": promoted_result,

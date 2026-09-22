@@ -369,7 +369,8 @@ class SpeakerBank:
             return self._score_embeddings
 
         eps = max(float(np.max(eigenvalues)) * 1e-6, 1e-8)
-        inv_sqrt = np.where(eigenvalues > eps, 1.0 / np.sqrt(eigenvalues), 0.0)
+        safe_eigenvalues = np.where(eigenvalues > eps, eigenvalues, 1.0)
+        inv_sqrt = np.where(eigenvalues > eps, 1.0 / np.sqrt(safe_eigenvalues), 0.0)
         whitening = eigenvectors @ np.diag(inv_sqrt) @ eigenvectors.T
         transformed = centered @ whitening
         norms = np.linalg.norm(transformed, axis=1, keepdims=True)
@@ -644,7 +645,7 @@ class SpeakerBank:
                     if candidate_vec.size != vec.size:
                         continue
                     candidate_distance = float(np.linalg.norm(vec - candidate_vec))
-                    if cluster.variance > 0:
+                    if radius_factor > 0 and cluster.variance > 0:
                         distance_limit = math.sqrt(cluster.variance) * radius_factor
                         if candidate_distance > max(distance_limit, 1e-4):
                             continue

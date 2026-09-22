@@ -33,5 +33,15 @@ config/speaker_mapping.yaml
 config/transcriber.yaml
 config/transcriber.watch.yaml
 
+# Private campaign evidence and trained voice assets are backed up separately.
+config/early_session_rosters.json
+docs/analysis/
+docs/speaker-id-experiment-ledger.md
+*.safetensors
+*.npz
+*.pt
+*.pth
+*.7z
+
 # Local reference scripts
 docs/example.py

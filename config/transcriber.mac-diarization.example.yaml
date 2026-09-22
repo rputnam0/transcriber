@@ -1,0 +1,22 @@
+# Apple Silicon ASR plus CPU diarization. Rebuild enrollment after the padding fix.
+# Supply --speaker-bank-path with the absolute path to the new speech-only profile.
+backend: parakeet
+model: parakeet
+compute_type: float32
+cache_mode: env
+pyannote_on_cpu: true
+diarization_model: pyannote/speaker-diarization-community-1
+max_speakers: 6
+speaker_bank:
+  enabled: true
+  path: mac-speech-only
+  use_existing: true
+  train_from_stems: false
+  match_per_segment: false
+  emit_pca: false
+  scoring:
+    threshold: 0.5
+    margin: 0.1
+    whiten: false
+  prototypes:
+    enabled: false

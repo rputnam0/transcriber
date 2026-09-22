@@ -1633,7 +1633,13 @@ def run_speaker_bank_training(
         added = 0
         speaker_counts: Dict[str, int] = defaultdict(int)
         for diar_label, vec in embeddings.items():
-            target_speaker, _ = choose_speaker(diar_label, mapping_pre, return_match=True)
+            target_speaker, diar_label_matched = choose_speaker(
+                diar_label,
+                mapping_pre,
+                return_match=True,
+            )
+            if not diar_label_matched:
+                target_speaker = label
             vector = np.asarray(vec, dtype=np.float32)
             speaker_bank.extend(
                 [
@@ -2046,20 +2052,31 @@ def run_transcribe(
 
     if backend == "parakeet":
         logger.info("Using parakeet-mlx backend.")
+        from .diarization import (
+            extract_embeddings_for_segments as diar_extract_embeddings_for_segments,
+        )
+        from .transcript_pipeline import asr_result_from_segments, diarize_asr_result
         from .parakeet_backend import (
             load_model as parakeet_load,
             resolve_model_name as parakeet_resolve_model_name,
             transcribe_file as parakeet_transcribe,
         )
 
-        if min_speakers is not None or max_speakers is not None:
-            logger.warning(
-                "Parakeet backend does not support diarization; ignoring min/max speaker hints."
-            )
-        if pyannote_on_cpu:
-            logger.warning(
-                "Parakeet backend does not use direct pyannote controls; ignoring --pyannote-on-cpu."
-            )
+        extract_embeddings_for_segments_fn = diar_extract_embeddings_for_segments
+        hf_token = (
+            os.getenv("HUGGING_FACE_HUB_TOKEN")
+            or os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACE_TOKEN")
+        )
+        # MLX handles ASR on Apple Silicon; pyannote and the bank share a CPU embedder.
+        speaker_bank_embed_device = "cpu" if pyannote_on_cpu or device != "cuda" else "cuda"
+        mapping_covers_all = bool(mapping_pre) and all(mapping_hits.get(f, False) for f in files)
+        diarization_forced = min_speakers is not None or max_speakers is not None
+        multi_track_zip = tmp_root is not None and len(files) > 1
+        known_single_speaker = bool(single_file_speaker) and len(files) == 1
+        enable_diarization = diarization_forced or not (
+            multi_track_zip or mapping_covers_all or known_single_speaker
+        )
 
         parakeet_model_name = parakeet_resolve_model_name(model_name)
         if parakeet_model_name != model_name:
@@ -2107,6 +2124,29 @@ def run_transcribe(
                     pbar.set_postfix_str("asr")
             else:
                 segs = parakeet_transcribe(f, model, batch_size=batch_size)
+            result = diarize_asr_result(
+                f,
+                asr_result_from_segments(segs),
+                hf_token=hf_token,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                pyannote_on_cpu=pyannote_on_cpu,
+                diarization_model_name=diarization_model
+                or (speaker_bank_config.diarization_model if speaker_bank_config else None),
+                force_device=speaker_bank_embed_device,
+                quiet=quiet,
+                enable_diarization=enable_diarization,
+            )
+            segs = result.segments
+            if speaker_bank and speaker_bank_config and speaker_bank_config.use_existing:
+                summary = _apply_speaker_bank(segs, result.speaker_embeddings, f)
+                speaker_bank_debug_by_file[f] = summary
+                if speaker_bank_summary is not None:
+                    speaker_bank_summary["files"][Path(f).name] = summary
+            if result.diarization_segments:
+                diar_by_file[f] = result.diarization_segments
+            if result.exclusive_diarization_segments:
+                exclusive_diar_by_file[f] = result.exclusive_diarization_segments
             dur = int(time.time() - start_ts)
             logger.warning("Finished: %s in %ds (segments=%d)", Path(f).name, dur, len(segs))
             per_file_segments.append((f, segs))
@@ -2227,7 +2267,19 @@ def run_transcribe(
                 "matches": {},
                 "segment_counts": {"matched": 0, "unknown": 0},
             }
-            if result.speaker_embeddings:
+            segment_labels_available = any(
+                segment.get("speaker_raw") or segment.get("speaker") for segment in segs
+            )
+            should_apply_speaker_bank = bool(
+                speaker_bank
+                and speaker_bank_config
+                and speaker_bank_config.use_existing
+                and (
+                    result.speaker_embeddings
+                    or (speaker_bank_config.match_per_segment and segment_labels_available)
+                )
+            )
+            if should_apply_speaker_bank:
                 bank_summary = _apply_speaker_bank(segs, result.speaker_embeddings, f)
                 summary.update(bank_summary)
             speaker_bank_debug_by_file[f] = summary

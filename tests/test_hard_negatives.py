@@ -157,7 +157,7 @@ def test_build_hard_negative_dataset_applies_per_pair_and_global_caps(tmp_path):
                 "session": "Session 61",
                 "start": 12.0,
                 "end": 13.0,
-            }
+            },
         ],
         embeddings=[
             np.asarray([0.8, 0.2], dtype=np.float32),
@@ -243,7 +243,7 @@ def test_build_hard_negative_dataset_applies_per_speaker_cap(tmp_path):
                 "session": "Session 61",
                 "start": 12.0,
                 "end": 13.0,
-            }
+            },
         ],
         embeddings=[
             np.asarray([0.8, 0.2], dtype=np.float32),
@@ -604,7 +604,9 @@ def test_build_hard_negative_dataset_prioritizes_session61_like_candidates(tmp_p
     }
 
 
-def test_build_hard_negative_dataset_uses_style_score_threshold_even_if_profile_is_generic(tmp_path):
+def test_build_hard_negative_dataset_uses_style_score_threshold_even_if_profile_is_generic(
+    tmp_path,
+):
     candidate_pool_dir = tmp_path / "mixed_candidates"
     save_candidate_pool(
         candidate_pool_dir,

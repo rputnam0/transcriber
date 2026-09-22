@@ -45,7 +45,9 @@ def _extract_words(rows: List[dict]) -> List[dict]:
     return words
 
 
-def _dominant_reference_speaker(segment: dict, reference_words: List[dict], tolerance: float) -> tuple[Optional[str], int]:
+def _dominant_reference_speaker(
+    segment: dict, reference_words: List[dict], tolerance: float
+) -> tuple[Optional[str], int]:
     counts: Counter[str] = Counter()
     midpoint = (float(segment["start"]) + float(segment["end"])) / 2.0
     for word in reference_words:
@@ -74,15 +76,31 @@ def _guess_reference_path(
     if session_name.lower() == "session22" and session22_reference_root is not None:
         return session22_reference_root / predicted_window_dir.name / "clips" / "clips.jsonl"
     if session_name.lower() == "session61" and session61_reference_root is not None:
-        return session61_reference_root / predicted_window_dir.name / "reference" / "clips" / "clips.jsonl"
+        return (
+            session61_reference_root
+            / predicted_window_dir.name
+            / "reference"
+            / "clips"
+            / "clips.jsonl"
+        )
     return None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect cached speaker-eval errors for flip/smoothing patterns.")
-    parser.add_argument("--eval-root", required=True, help="Cached eval root containing Session22/Session61 folders.")
-    parser.add_argument("--session22-reference-root", help="Reference cache root for Session22 windows.")
-    parser.add_argument("--session61-reference-root", help="Reference cache root for Session61 windows.")
+    parser = argparse.ArgumentParser(
+        description="Inspect cached speaker-eval errors for flip/smoothing patterns."
+    )
+    parser.add_argument(
+        "--eval-root",
+        required=True,
+        help="Cached eval root containing Session22/Session61 folders.",
+    )
+    parser.add_argument(
+        "--session22-reference-root", help="Reference cache root for Session22 windows."
+    )
+    parser.add_argument(
+        "--session61-reference-root", help="Reference cache root for Session61 windows."
+    )
     parser.add_argument("--tolerance", type=float, default=0.35)
     args = parser.parse_args()
 
@@ -169,9 +187,14 @@ def main() -> None:
                 if 0 < index < len(segments) - 1:
                     previous_speaker = str(segments[index - 1]["predicted_speaker"])
                     next_speaker = str(segments[index + 1]["predicted_speaker"])
-                    if previous_speaker == next_speaker and previous_speaker != str(segment["predicted_speaker"]):
+                    if previous_speaker == next_speaker and previous_speaker != str(
+                        segment["predicted_speaker"]
+                    ):
                         sandwich_patterns["sandwich_total"] += 1
-                        if previous_speaker == reference_speaker and segment["predicted_speaker"] != reference_speaker:
+                        if (
+                            previous_speaker == reference_speaker
+                            and segment["predicted_speaker"] != reference_speaker
+                        ):
                             sandwich_patterns["sandwich_fixable"] += 1
                         if segment["predicted_speaker"] == reference_speaker:
                             sandwich_patterns["sandwich_already_correct"] += 1
@@ -186,15 +209,21 @@ def main() -> None:
     summary = {
         "eval_root": str(eval_root),
         "sessions": session_results,
-        "correct_duration_median": median(overall_correct_durations) if overall_correct_durations else 0.0,
-        "wrong_duration_median": median(overall_wrong_durations) if overall_wrong_durations else 0.0,
+        "correct_duration_median": (
+            median(overall_correct_durations) if overall_correct_durations else 0.0
+        ),
+        "wrong_duration_median": (
+            median(overall_wrong_durations) if overall_wrong_durations else 0.0
+        ),
         "wrong_duration_pct_le_2s": (
-            sum(1 for value in overall_wrong_durations if value <= 2.0) / len(overall_wrong_durations)
+            sum(1 for value in overall_wrong_durations if value <= 2.0)
+            / len(overall_wrong_durations)
             if overall_wrong_durations
             else 0.0
         ),
         "correct_duration_pct_le_2s": (
-            sum(1 for value in overall_correct_durations if value <= 2.0) / len(overall_correct_durations)
+            sum(1 for value in overall_correct_durations if value <= 2.0)
+            / len(overall_correct_durations)
             if overall_correct_durations
             else 0.0
         ),

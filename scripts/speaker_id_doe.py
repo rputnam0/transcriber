@@ -103,7 +103,9 @@ def _write_eval_config(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run speaker-ID DOE experiments.")
-    parser.add_argument("--base-profile-dir", required=True, help="Existing speaker-bank profile directory.")
+    parser.add_argument(
+        "--base-profile-dir", required=True, help="Existing speaker-bank profile directory."
+    )
     parser.add_argument(
         "--train-input",
         action="append",
@@ -222,7 +224,9 @@ def main() -> None:
 
     experiments: List[Dict[str, object]] = []
     model_names = [item.strip().lower() for item in args.models.split(",") if item.strip()]
-    training_modes = [item.strip().lower() for item in args.training_modes.split(",") if item.strip()]
+    training_modes = [
+        item.strip().lower() for item in args.training_modes.split(",") if item.strip()
+    ]
     c_values = _parse_csv_floats(args.c_values)
     knn_values = _parse_csv_ints(args.knn_values)
     min_confidences = _parse_csv_floats(args.min_confidences)
@@ -292,9 +296,9 @@ def main() -> None:
                                 excluded_speakers=args.excluded_speaker or None,
                                 model_name=model_name,
                                 classifier_c=float(hyper_value) if hyper_name == "c" else 1.0,
-                                classifier_n_neighbors=int(hyper_value)
-                                if hyper_name == "n_neighbors"
-                                else 7,
+                                classifier_n_neighbors=(
+                                    int(hyper_value) if hyper_name == "n_neighbors" else 7
+                                ),
                                 training_mode=training_mode,
                                 augmentation_profile=args.augmentation_profile,
                                 augmentation_copies=args.augmentation_copies,
@@ -319,14 +323,18 @@ def main() -> None:
 
                             eval_results: List[Dict[str, object]] = []
                             for session_zip, transcript_path in eval_specs:
-                                eval_output_dir = output_dir / "eval" / profile_name / session_zip.stem
+                                eval_output_dir = (
+                                    output_dir / "eval" / profile_name / session_zip.stem
+                                )
                                 eval_cache_root = output_dir / "prepared" / session_zip.stem
                                 summary = evaluate_multitrack_session(
                                     session_zip=session_zip,
                                     session_jsonl=transcript_path,
                                     output_dir=eval_output_dir,
                                     cache_root=eval_cache_root,
-                                    speaker_mapping_path=Path(args.speaker_mapping).expanduser().resolve(),
+                                    speaker_mapping_path=Path(args.speaker_mapping)
+                                    .expanduser()
+                                    .resolve(),
                                     config_path=eval_config_path,
                                     window_seconds=300.0,
                                     hop_seconds=60.0,
@@ -348,8 +356,12 @@ def main() -> None:
                                         "session_zip": str(session_zip),
                                         "transcript": str(transcript_path),
                                         "summary_path": str(eval_output_dir / "summary.json"),
-                                        "mean_accuracy": sum(accuracies) / len(accuracies) if accuracies else 0.0,
-                                        "mean_coverage": sum(coverages) / len(coverages) if coverages else 0.0,
+                                        "mean_accuracy": (
+                                            sum(accuracies) / len(accuracies) if accuracies else 0.0
+                                        ),
+                                        "mean_coverage": (
+                                            sum(coverages) / len(coverages) if coverages else 0.0
+                                        ),
                                     }
                                 )
                                 release_runtime_caches()
@@ -365,19 +377,23 @@ def main() -> None:
                                 "eval_results": eval_results,
                             }
                             experiment["mean_eval_accuracy"] = (
-                                sum(float(item["mean_accuracy"]) for item in eval_results) / len(eval_results)
+                                sum(float(item["mean_accuracy"]) for item in eval_results)
+                                / len(eval_results)
                                 if eval_results
                                 else 0.0
                             )
                             experiment["mean_eval_coverage"] = (
-                                sum(float(item["mean_coverage"]) for item in eval_results) / len(eval_results)
+                                sum(float(item["mean_coverage"]) for item in eval_results)
+                                / len(eval_results)
                                 if eval_results
                                 else 0.0
                             )
                             experiments.append(experiment)
 
                             report_path = output_dir / "speaker_id_doe_report.json"
-                            report_path.write_text(json.dumps(experiments, indent=2), encoding="utf-8")
+                            report_path.write_text(
+                                json.dumps(experiments, indent=2), encoding="utf-8"
+                            )
                             release_runtime_caches()
                             print(
                                 json.dumps(

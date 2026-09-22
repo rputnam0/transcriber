@@ -143,7 +143,9 @@ def _baseline_metric(
     session_name: str,
     metric_name: str,
 ) -> Optional[float]:
-    dev_eval = dict(baseline_summary.get("dev_eval") or baseline_summary.get("canonical_eval") or {})
+    dev_eval = dict(
+        baseline_summary.get("dev_eval") or baseline_summary.get("canonical_eval") or {}
+    )
     session_metrics = dict(dev_eval.get(session_name) or {})
     value = session_metrics.get(metric_name)
     return float(value) if value is not None else None
@@ -166,13 +168,19 @@ def main() -> None:
 
     baseline_summary_path = Path(args.baseline_summary).expanduser().resolve()
     baseline_summary = json.loads(baseline_summary_path.read_text(encoding="utf-8"))
-    recipe = _load_yaml_or_json(str(Path(baseline_summary["recipe_path"]).expanduser().resolve())) or {}
+    recipe = (
+        _load_yaml_or_json(str(Path(baseline_summary["recipe_path"]).expanduser().resolve())) or {}
+    )
     dev_eval_manifest_path = Path(
-        str(baseline_summary.get("dev_eval_manifest_path") or baseline_summary["eval_manifest_path"])
+        str(
+            baseline_summary.get("dev_eval_manifest_path") or baseline_summary["eval_manifest_path"]
+        )
     ).expanduser()
     dev_eval_manifest = json.loads(dev_eval_manifest_path.read_text(encoding="utf-8"))
     narrow_doe_recipe = json.loads(
-        Path(str(baseline_summary["narrow_doe_recipe_path"])).expanduser().read_text(encoding="utf-8")
+        Path(str(baseline_summary["narrow_doe_recipe_path"]))
+        .expanduser()
+        .read_text(encoding="utf-8")
     )
     pair_spec = _load_yaml_or_json(str(Path(args.pair_spec).expanduser().resolve())) or {}
 
@@ -184,10 +192,14 @@ def main() -> None:
     hf_cache_root = profile_dir.parent.parent
     base_config = _load_yaml_or_json(str(Path(recipe["base_config"]).expanduser().resolve())) or {}
     speaker_mapping_path = Path(str(recipe["speaker_mapping"])).expanduser().resolve()
-    diarization_model = str(recipe.get("diarization_model") or "pyannote/speaker-diarization-community-1")
+    diarization_model = str(
+        recipe.get("diarization_model") or "pyannote/speaker-diarization-community-1"
+    )
     classifier = dict(narrow_doe_recipe.get("classifier") or {})
     base_overrides = dict(narrow_doe_recipe.get("speaker_bank_overrides") or {})
-    prepared_eval_root = Path(str(baseline_summary["output_root"])).expanduser().resolve() / "prepared_eval"
+    prepared_eval_root = (
+        Path(str(baseline_summary["output_root"])).expanduser().resolve() / "prepared_eval"
+    )
 
     eval_specs = list(recipe.get("eval_dev") or recipe.get("eval") or [])
     canonical_suite = dict(dev_eval_manifest.get("canonical_suite") or {})
@@ -271,12 +283,12 @@ def main() -> None:
             dict(session_results.get("Session61") or {}).get("mean_matched_accuracy") or 0.0
         )
         short_slice_matched = float(
-            dict(session_results.get("short_segment_slice") or {}).get("mean_matched_accuracy") or 0.0
+            dict(session_results.get("short_segment_slice") or {}).get("mean_matched_accuracy")
+            or 0.0
         )
         dev_acceptance = (
-            (baseline_session22 is None or session22_accuracy >= baseline_session22 - 0.01)
-            and (baseline_session61 is None or session61_matched >= baseline_session61 + 0.01)
-        )
+            baseline_session22 is None or session22_accuracy >= baseline_session22 - 0.01
+        ) and (baseline_session61 is None or session61_matched >= baseline_session61 + 0.01)
 
         results.append(
             {

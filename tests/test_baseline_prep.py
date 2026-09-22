@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 
 import transcriber.baseline_prep as baseline_prep
-from transcriber.segment_classifier import ClassifierDataset, load_classifier_dataset, save_classifier_dataset
+from transcriber.segment_classifier import (
+    ClassifierDataset,
+    load_classifier_dataset,
+    save_classifier_dataset,
+)
 
 
 def _dataset(
@@ -104,9 +108,7 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 "baseline_pack": ["mixed_raw", "light_x1", "discord_x1"],
                 "build_variants": ["mixed_raw", "light_x1", "discord_x1"],
                 "top_confusion_pairs": 0,
-                "hard_negative_pair_caps": [
-                    {"pair": ["Player Alice", "Player Bob"], "value": 1}
-                ],
+                "hard_negative_pair_caps": [{"pair": ["Player Alice", "Player Bob"], "value": 1}],
                 "current_winner": {
                     "threshold": 0.36,
                     "classifier_min_margin": 0.06,
@@ -163,7 +165,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
     build_calls = {"multitrack": 0, "materialize": 0}
     hard_negative_call: dict[str, object] = {}
 
-    def _write_dataset_artifacts(dataset_cache_dir: Path, dataset: ClassifierDataset, *, mixed_base: bool) -> dict:
+    def _write_dataset_artifacts(
+        dataset_cache_dir: Path, dataset: ClassifierDataset, *, mixed_base: bool
+    ) -> dict:
         dataset_cache_dir.mkdir(parents=True, exist_ok=True)
         summary = {
             "quality_filters": {
@@ -283,7 +287,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         )
         return {"artifacts": {"meta": str(profile_dir / "segment_classifier.meta.json")}}
 
-    def fake_evaluate_multitrack_session(*, session_zip, output_dir, windows_override=None, **kwargs):
+    def fake_evaluate_multitrack_session(
+        *, session_zip, output_dir, windows_override=None, **kwargs
+    ):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         predicted_path = output_dir / "predicted.jsonl"
@@ -383,7 +389,11 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
                 "end": 1.0,
             }
         ]
-        return hard_negative_dataset, records, {"tracked_pairs": [("Player Alice", "Player Bob")], "selected": 1}
+        return (
+            hard_negative_dataset,
+            records,
+            {"tracked_pairs": [("Player Alice", "Player Bob")], "selected": 1},
+        )
 
     monkeypatch.setattr(
         baseline_prep,
@@ -400,9 +410,13 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         baseline_prep, "build_classifier_dataset_from_bank", fake_build_classifier_dataset_from_bank
     )
     monkeypatch.setattr(
-        baseline_prep, "train_segment_classifier_from_dataset", fake_train_segment_classifier_from_dataset
+        baseline_prep,
+        "train_segment_classifier_from_dataset",
+        fake_train_segment_classifier_from_dataset,
     )
-    monkeypatch.setattr(baseline_prep, "evaluate_multitrack_session", fake_evaluate_multitrack_session)
+    monkeypatch.setattr(
+        baseline_prep, "evaluate_multitrack_session", fake_evaluate_multitrack_session
+    )
     monkeypatch.setattr(
         baseline_prep,
         "_derive_short_segment_slice",
@@ -411,7 +425,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
             {"start": 0.0, "end": 30.0, "speaker_count": 2},
         ),
     )
-    monkeypatch.setattr(baseline_prep, "build_hard_negative_dataset", fake_build_hard_negative_dataset)
+    monkeypatch.setattr(
+        baseline_prep, "build_hard_negative_dataset", fake_build_hard_negative_dataset
+    )
     monkeypatch.setattr(baseline_prep, "current_git_commit", lambda **kwargs: "deadbeef")
 
     first_summary = baseline_prep.prepare_baseline(recipe_path=recipe_path)
@@ -452,7 +468,9 @@ def test_prepare_baseline_stages_resume_and_materialize_variants_from_mixed_base
         "eval",
     }
     assert second_summary["stage_manifests"] == first_summary["stage_manifests"]
-    eval_manifest = json.loads(Path(first_summary["eval_manifest_path"]).read_text(encoding="utf-8"))
+    eval_manifest = json.loads(
+        Path(first_summary["eval_manifest_path"]).read_text(encoding="utf-8")
+    )
     final_eval_manifest = json.loads(
         Path(first_summary["final_eval_manifest_path"]).read_text(encoding="utf-8")
     )
