@@ -64,7 +64,10 @@ class _GraphSpeakerBank:
         top2 = candidates[1]
         threshold = float(kwargs.get("threshold") or 0.0)
         margin = float(kwargs.get("margin") or 0.0)
-        if float(top1["score"]) >= threshold and (float(top1["score"]) - float(top2["score"])) >= margin:
+        if (
+            float(top1["score"]) >= threshold
+            and (float(top1["score"]) - float(top2["score"])) >= margin
+        ):
             return dict(top1)
         return None
 
@@ -101,7 +104,10 @@ class _NamedSpeakerBank:
         top2 = candidates[1]
         threshold = float(kwargs.get("threshold") or 0.0)
         margin = float(kwargs.get("margin") or 0.0)
-        if float(top1["score"]) >= threshold and (float(top1["score"]) - float(top2["score"])) >= margin:
+        if (
+            float(top1["score"]) >= threshold
+            and (float(top1["score"]) - float(top2["score"])) >= margin
+        ):
             return dict(top1)
         return None
 

@@ -622,3 +622,19 @@ def test_watch_task_kind_waits_for_completed_split_part_markers(tmp_path):
     )
 
     assert action is None
+
+
+def test_apply_config_defaults_honors_multitrack_options():
+    parser = argparse.ArgumentParser()
+    cli._apply_config_defaults(
+        parser,
+        {
+            "multitrack_sentence_level": False,
+            "multitrack_pause_threshold": 1.2,
+            "speaker_roster": ["Kaladen Shash"],
+        },
+    )
+    args = parser.parse_args([])
+    assert args.multitrack_sentence_level is False
+    assert args.multitrack_pause_threshold == 1.2
+    assert args.speaker_roster == ["Kaladen Shash"]

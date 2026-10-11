@@ -113,3 +113,6 @@ Default root `~/hf_cache`: HF hub (`$HF_HOME/hub`), models (`$HF_HOME/models`), 
 
 ## Development
 - Lint: `make lint`  |  Tests: `make test`  |  Local run: `make run INPUT=audio/sample.wav MODEL=medium`
+
+See [sentence-level multitrack transcription](docs/multitrack-transcription.md) for
+word-timed splitting, legacy output settings, and speaker roster validation.
