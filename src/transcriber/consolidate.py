@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
@@ -96,8 +98,101 @@ def _allow_fuzzy_speaker_match(candidate: str, simplified: str) -> bool:
     return any(ch.isalpha() for ch in candidate)
 
 
-def consolidate(all_segments: List[Tuple[str, List[dict]]]) -> List[Tuple[str, str, str]]:
+def split_segments(segments: List[dict], pause_threshold: float = 0.8) -> List[dict]:
+    """Split timed words without changing their order, timestamps, or speaker metadata.
+
+    Untimed or incomplete word lists retain their original segment rather than losing text.
+    Only punctuation-only fragments are attached to a neighbour; short replies stand alone.
+    """
+    if not math.isfinite(pause_threshold) or pause_threshold <= 0:
+        raise ValueError("pause_threshold must be finite and greater than zero")
+    result: List[dict] = []
+    for segment in segments:
+        words = segment.get("words") or []
+        # Ignore whitespace differences, but require complete lexical coverage.
+        word_text = "".join(str(word.get("word", "")) for word in words)
+        original_text = str(segment.get("text", ""))
+        if (
+            not words
+            or re.sub(r"\s+", "", word_text) != re.sub(r"\s+", "", original_text)
+            or any(word.get("start") is None or word.get("end") is None for word in words)
+        ):
+            result.append(segment)
+            continue
+        groups: List[List[dict]] = []
+        pending: List[dict] = []
+        for index, word in enumerate(words):
+            pending.append(word)
+            text = str(word["word"]).strip()
+            final = bool(re.search(r"[.!?…][\"'”’)}\]]*$", text))
+            if text.lower() in {"mr.", "mrs.", "ms.", "dr.", "st.", "e.g.", "i.e."}:
+                final = False
+            pause = index + 1 < len(words) and (
+                float(words[index + 1]["start"]) - float(word["end"]) >= pause_threshold
+            )
+            if final or pause:
+                groups.append(pending)
+                pending = []
+        if pending:
+            groups.append(pending)
+        # Punctuation alone has no meaning; preserve it alongside adjacent words.
+        merged: List[List[dict]] = []
+        for group in groups:
+            if not any(any(ch.isalnum() for ch in str(w["word"])) for w in group) and merged:
+                merged[-1].extend(group)
+            elif merged and not any(any(ch.isalnum() for ch in str(w["word"])) for w in merged[-1]):
+                merged[-1].extend(group)
+            else:
+                merged.append(group)
+        for group in merged:
+            result.append(
+                {
+                    **segment,
+                    "start": group[0]["start"],
+                    "end": group[-1]["end"],
+                    "text": " ".join(str(w["word"]).strip() for w in group).strip(),
+                    "words": group,
+                }
+            )
+    return result
+
+
+def split_multitrack_segments(
+    all_segments: List[Tuple[str, List[dict]]],
+    *,
+    sentence_level: bool = True,
+    pause_threshold: float = 0.8,
+) -> List[Tuple[str, List[dict]]]:
+    """Leave single-file sessions alone; use the same split records for every export."""
+    if not sentence_level or len(all_segments) <= 1:
+        return all_segments
+    return [
+        (filename, split_segments(segments, pause_threshold)) for filename, segments in all_segments
+    ]
+
+
+def check_speaker_roster(pairs: List[Tuple[str, str, str]], roster: List[str] | None) -> List[str]:
+    """Report unexpected display names without dropping their dialogue."""
+    if roster is None:
+        return []
+    unexpected = sorted({speaker for _, speaker, _ in pairs} - set(roster))
+    if unexpected:
+        logging.getLogger("transcriber").warning(
+            "Output speakers outside configured roster: %s", ", ".join(unexpected)
+        )
+    return unexpected
+
+
+def consolidate(
+    all_segments: List[Tuple[str, List[dict]]],
+    *,
+    sentence_level: bool = True,
+    pause_threshold: float = 0.8,
+) -> List[Tuple[str, str, str]]:
     """Flatten per-file segments into a single timeline sorted by start time."""
+    all_segments = split_multitrack_segments(
+        all_segments, sentence_level=sentence_level, pause_threshold=pause_threshold
+    )
     flattened: List[Tuple[float, str, str]] = []
     for filename, segments in all_segments:
         fallback_speaker = Path(filename).stem
@@ -133,7 +228,7 @@ def save_outputs(
 
     if write_jsonl_file:
         jsonl_path = out_dir / f"{base_stem}.jsonl"
-        jsonl_lines: list[str] = []
+        jsonl_records: list[dict] = []
         for filename, segments in per_file_segments:
             file_label = Path(filename).name
             for segment in segments:
@@ -157,19 +252,27 @@ def save_outputs(
                     record["speaker_match"] = segment["speaker_match"]
                 if "words" in segment:
                     record["words"] = segment["words"]
-                jsonl_lines.append(json.dumps(record, ensure_ascii=False) + "\n")
-        _atomic_write_text(jsonl_path, "".join(jsonl_lines))
+                jsonl_records.append(record)
+        jsonl_records.sort(key=lambda record: record["start"])
+        _atomic_write_text(
+            jsonl_path,
+            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in jsonl_records),
+        )
 
     if write_srt_file:
         srt_path = out_dir / f"{base_stem}.srt"
         ordered = []
         for filename, segments in per_file_segments:
             for segment in segments:
+                text = segment.get("text", "").strip()
+                if text and len(per_file_segments) > 1:
+                    speaker = segment.get("speaker") or Path(filename).stem
+                    text = f"{speaker}: {text}"
                 ordered.append(
                     (
                         float(segment.get("start") or 0.0),
                         float(segment.get("end") or 0.0),
-                        segment.get("text", "").strip(),
+                        text,
                     )
                 )
         ordered.sort(key=lambda item: item[0])
