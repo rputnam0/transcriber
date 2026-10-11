@@ -21,7 +21,13 @@ from tqdm import tqdm
 
 from .audio import cleanup_tmp, gather_inputs, is_audio_file, load_audio_mono
 from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
-from .consolidate import consolidate, save_outputs, choose_speaker
+from .consolidate import (
+    consolidate,
+    save_outputs,
+    choose_speaker,
+    split_multitrack_segments,
+    check_speaker_roster,
+)
 from .postprocess import (
     PostProcessConfig,
     SplitSessionPendingError,
@@ -311,6 +317,9 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         "output_dir": "output_dir",
         "non_session_output_dir": "non_session_output_dir",
         "speaker_mapping": "speaker_mapping",
+        "multitrack_sentence_level": "multitrack_sentence_level",
+        "multitrack_pause_threshold": "multitrack_pause_threshold",
+        "speaker_roster": "speaker_roster",
         "min_speakers": "min_speakers",
         "max_speakers": "max_speakers",
         "cache_root": "cache_root",
@@ -1791,7 +1800,12 @@ def run_transcribe(
     device: str | None = None,
     speaker_bank_config: SpeakerBankConfig | None = None,
     postprocess_config: PostProcessConfig | None = None,
+    multitrack_sentence_level: bool = True,
+    multitrack_pause_threshold: float = 0.8,
+    speaker_roster: List[str] | None = None,
 ) -> None:
+    if not math.isfinite(multitrack_pause_threshold) or multitrack_pause_threshold <= 0:
+        raise ValueError("multitrack_pause_threshold must be finite and greater than zero")
     # Ensure cuDNN/cuBLAS split libraries are visible to the loader
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
@@ -2491,7 +2505,13 @@ def run_transcribe(
                         _set_segment_speaker_label(s, single_file_speaker)
                 per_file_segments[i] = (fname, segs)
 
-    consolidated_pairs = consolidate(per_file_segments)
+    per_file_segments = split_multitrack_segments(
+        per_file_segments,
+        sentence_level=multitrack_sentence_level,
+        pause_threshold=multitrack_pause_threshold,
+    )
+    consolidated_pairs = consolidate(per_file_segments, sentence_level=False)
+    check_speaker_roster(consolidated_pairs, speaker_roster)
 
     base = Path(input_path).stem
     effective_output_dir = _effective_output_dir_for_input(
@@ -3141,6 +3161,9 @@ def watch_and_transcribe(
                         else:
                             run_transcribe(
                                 input_path=f,
+                                multitrack_sentence_level=args.multitrack_sentence_level,
+                                multitrack_pause_threshold=args.multitrack_pause_threshold,
+                                speaker_roster=args.speaker_roster,
                                 backend=args.backend,
                                 model_name=args.model,
                                 compute_type=args.compute_type,
@@ -3276,6 +3299,14 @@ def main():
         dest="speaker_mapping",
         help="YAML/JSON mapping of speaker IDs -> names",
     )
+    ap.add_argument(
+        "--multitrack-sentence-level",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split multitrack timed words into sentence/pause lines (default: enabled)",
+    )
+    ap.add_argument("--multitrack-pause-threshold", type=float, default=0.8)
+    ap.add_argument("--speaker-roster", nargs="+", help="Allowed output display names")
     ap.add_argument("--min-speakers", type=int)
     ap.add_argument("--max-speakers", type=int)
     ap.add_argument("--no-srt", action="store_true", help="Don't write combined SRT")
@@ -3611,6 +3642,9 @@ def main():
 
     run_transcribe(
         input_path=effective_input,
+        multitrack_sentence_level=args.multitrack_sentence_level,
+        multitrack_pause_threshold=args.multitrack_pause_threshold,
+        speaker_roster=args.speaker_roster,
         backend=args.backend,
         model_name=args.model,
         compute_type=args.compute_type,
