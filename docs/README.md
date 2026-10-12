@@ -4,6 +4,8 @@
 
 - [Repository README](../README.md): regular CLI, isolated speaker audio, multitrack
   inputs, pyannote speaker bank, configuration, and watch mode.
+- [Multitrack transcription](multitrack-transcription.md) and [Session 4 ASR study](multitrack-asr-study.md):
+  local Whisper defaults, sentence-level exports, paired quality evidence and throughput.
 - [Mac single-file transcription](mac-single-file-transcription.md): install,
   restore private voices, run/resume a complete mixed recording, and listen to named
   transcripts. Includes the completed release and quality limitations.

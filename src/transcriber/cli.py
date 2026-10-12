@@ -21,7 +21,13 @@ from tqdm import tqdm
 
 from .audio import cleanup_tmp, gather_inputs, is_audio_file, load_audio_mono
 from .audio_augment import AudioAugmentationConfig, build_waveform_augmenter
-from .consolidate import consolidate, save_outputs, choose_speaker
+from .consolidate import (
+    consolidate,
+    save_outputs,
+    choose_speaker,
+    split_multitrack_segments,
+    check_speaker_roster,
+)
 from .postprocess import (
     PostProcessConfig,
     SplitSessionPendingError,
@@ -244,18 +250,23 @@ def _resolve_backend_choice(
         return requested
 
     explicit_multi_speaker = min_speakers is not None or max_speakers is not None
-    multi_track_zip_input = tmp_root is not None and len(files) > 1
     speaker_aware_run = bool(
         speaker_bank_config and speaker_bank_config.enabled and not single_file_speaker
     )
 
-    if explicit_multi_speaker or speaker_aware_run:
+    if explicit_multi_speaker:
         return "faster"
 
     if device == "cuda":
         return "faster"
 
-    if _supports_parakeet_cpu_runtime() and (multi_track_zip_input or bool(single_file_speaker)):
+    if len(files) > 1:
+        return "mlx-whisper" if _is_apple_silicon() else "faster"
+
+    if speaker_aware_run:
+        return "faster"
+
+    if _supports_parakeet_cpu_runtime() and bool(single_file_speaker):
         return "parakeet"
 
     return "faster"
@@ -311,6 +322,9 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
         "output_dir": "output_dir",
         "non_session_output_dir": "non_session_output_dir",
         "speaker_mapping": "speaker_mapping",
+        "multitrack_sentence_level": "multitrack_sentence_level",
+        "multitrack_pause_threshold": "multitrack_pause_threshold",
+        "speaker_roster": "speaker_roster",
         "min_speakers": "min_speakers",
         "max_speakers": "max_speakers",
         "cache_root": "cache_root",
@@ -1791,7 +1805,12 @@ def run_transcribe(
     device: str | None = None,
     speaker_bank_config: SpeakerBankConfig | None = None,
     postprocess_config: PostProcessConfig | None = None,
+    multitrack_sentence_level: bool = True,
+    multitrack_pause_threshold: float = 0.8,
+    speaker_roster: List[str] | None = None,
 ) -> None:
+    if not math.isfinite(multitrack_pause_threshold) or multitrack_pause_threshold <= 0:
+        raise ValueError("multitrack_pause_threshold must be finite and greater than zero")
     # Ensure cuDNN/cuBLAS split libraries are visible to the loader
     _ensure_cuda_libs_on_path()
     _preload_cudnn_libs()
@@ -2050,17 +2069,30 @@ def run_transcribe(
             len(bank_info.get("speakers", [])),
         )
 
-    if backend == "parakeet":
-        logger.info("Using parakeet-mlx backend.")
+    if backend in {"parakeet", "mlx-whisper"}:
+        logger.info("Using %s local backend.", backend)
         from .diarization import (
             extract_embeddings_for_segments as diar_extract_embeddings_for_segments,
         )
         from .transcript_pipeline import asr_result_from_segments, diarize_asr_result
-        from .parakeet_backend import (
-            load_model as parakeet_load,
-            resolve_model_name as parakeet_resolve_model_name,
-            transcribe_file as parakeet_transcribe,
-        )
+
+        if backend == "parakeet":
+            from .parakeet_backend import (
+                load_model as local_load,
+                resolve_model_name as local_resolve,
+                transcribe_file as local_transcribe,
+            )
+        else:
+            from .mlx_whisper_backend import resolve_model_name as local_resolve
+            from .mlx_whisper_backend import transcribe_file as whisper_transcribe
+
+            def local_load(name, **kwargs):
+                return {"model_name": name, **kwargs}
+
+            def local_transcribe(path, model, *, batch_size):
+                options = {k: v for k, v in model.items() if k != "device"}
+                options["join_segments"] = len(files) > 1 and multitrack_sentence_level
+                return whisper_transcribe(path, **options)
 
         extract_embeddings_for_segments_fn = diar_extract_embeddings_for_segments
         hf_token = (
@@ -2078,22 +2110,23 @@ def run_transcribe(
             multi_track_zip or mapping_covers_all or known_single_speaker
         )
 
-        parakeet_model_name = parakeet_resolve_model_name(model_name)
-        if parakeet_model_name != model_name:
+        local_model_name = local_resolve(model_name)
+        if local_model_name != model_name:
             logger.warning(
-                "Parakeet backend remapped model=%s to %s.",
+                "Local backend remapped model=%s to %s.",
                 model_name,
-                parakeet_model_name,
+                local_model_name,
             )
 
         logger.warning(
-            "ASR Backend (parakeet): model=%s compute=%s device=%s",
-            parakeet_model_name,
+            "ASR Backend (%s): model=%s compute=%s device=%s",
+            backend,
+            local_model_name,
             compute_type,
             device or "auto",
         )
-        model = parakeet_load(
-            parakeet_model_name,
+        model = local_load(
+            local_model_name,
             compute_type=compute_type,
             device=device or "auto",
             download_root=hf_cache_root,
@@ -2103,7 +2136,7 @@ def run_transcribe(
         iter_files = (
             tqdm(
                 files,
-                desc="Transcribing (parakeet)",
+                desc=f"Transcribing ({backend})",
                 unit="file",
                 bar_format="{l_bar}{bar} | ETA: {remaining} | {n_fmt}/{total_fmt}",
                 dynamic_ncols=True,
@@ -2119,11 +2152,11 @@ def run_transcribe(
                 from tqdm import tqdm as _tqdm
 
                 with _tqdm(total=1, desc=f"{label}", leave=False, unit="phase") as pbar:
-                    segs = parakeet_transcribe(f, model, batch_size=batch_size)
+                    segs = local_transcribe(f, model, batch_size=batch_size)
                     pbar.update(1)
                     pbar.set_postfix_str("asr")
             else:
-                segs = parakeet_transcribe(f, model, batch_size=batch_size)
+                segs = local_transcribe(f, model, batch_size=batch_size)
             result = diarize_asr_result(
                 f,
                 asr_result_from_segments(segs),
@@ -2491,7 +2524,13 @@ def run_transcribe(
                         _set_segment_speaker_label(s, single_file_speaker)
                 per_file_segments[i] = (fname, segs)
 
-    consolidated_pairs = consolidate(per_file_segments)
+    per_file_segments = split_multitrack_segments(
+        per_file_segments,
+        sentence_level=multitrack_sentence_level,
+        pause_threshold=multitrack_pause_threshold,
+    )
+    consolidated_pairs = consolidate(per_file_segments, sentence_level=False)
+    check_speaker_roster(consolidated_pairs, speaker_roster)
 
     base = Path(input_path).stem
     effective_output_dir = _effective_output_dir_for_input(
@@ -2502,6 +2541,17 @@ def run_transcribe(
 
     transcript_output_path = Path(effective_output_dir) / f"{base}.txt"
     craig_input_metadata = _load_craig_input_metadata(input_path)
+    craig_input_metadata.update(
+        asr_backend=backend,
+        asr_requested_model=model_name,
+        asr_model=(local_model_name if backend in {"parakeet", "mlx-whisper"} else model_name),
+        asr_compute_type=(fw_compute if backend == "faster" else compute_type),
+    )
+    if backend == "mlx-whisper":
+        from .mlx_whisper_backend import DEFAULT_MODEL, DEFAULT_REVISION
+
+        if local_model_name == DEFAULT_MODEL:
+            craig_input_metadata["asr_model_revision"] = DEFAULT_REVISION
     _write_transcription_completion_marker(
         transcript_output_path,
         input_path=input_path,
@@ -3141,6 +3191,9 @@ def watch_and_transcribe(
                         else:
                             run_transcribe(
                                 input_path=f,
+                                multitrack_sentence_level=args.multitrack_sentence_level,
+                                multitrack_pause_threshold=args.multitrack_pause_threshold,
+                                speaker_roster=args.speaker_roster,
                                 backend=args.backend,
                                 model_name=args.model,
                                 compute_type=args.compute_type,
@@ -3223,7 +3276,9 @@ def main():
         description="Transcription with ASR, diarization, and speaker naming"
     )
     ap.add_argument("input", nargs="?", help="Path to audio file, directory, or .zip of audios")
-    ap.add_argument("--backend", choices=["auto", "faster", "parakeet"], default="auto")
+    ap.add_argument(
+        "--backend", choices=["auto", "faster", "parakeet", "mlx-whisper"], default="auto"
+    )
     ap.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
@@ -3276,6 +3331,14 @@ def main():
         dest="speaker_mapping",
         help="YAML/JSON mapping of speaker IDs -> names",
     )
+    ap.add_argument(
+        "--multitrack-sentence-level",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split multitrack timed words into sentence/pause lines (default: enabled)",
+    )
+    ap.add_argument("--multitrack-pause-threshold", type=float, default=0.8)
+    ap.add_argument("--speaker-roster", nargs="+", help="Allowed output display names")
     ap.add_argument("--min-speakers", type=int)
     ap.add_argument("--max-speakers", type=int)
     ap.add_argument("--no-srt", action="store_true", help="Don't write combined SRT")
@@ -3611,6 +3674,9 @@ def main():
 
     run_transcribe(
         input_path=effective_input,
+        multitrack_sentence_level=args.multitrack_sentence_level,
+        multitrack_pause_threshold=args.multitrack_pause_threshold,
+        speaker_roster=args.speaker_roster,
         backend=args.backend,
         model_name=args.model,
         compute_type=args.compute_type,

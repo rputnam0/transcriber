@@ -1,4 +1,4 @@
-backend: auto  # auto -> faster for CUDA/speaker-aware runs, parakeet for ZIP stems or explicit single-speaker CPU runs
+backend: auto  # Whisper for multitrack (MLX on Apple Silicon); faster for speaker-aware mixes
 # device options: auto (default), cuda, cpu
 device: auto
 model: large-v3
@@ -21,6 +21,11 @@ output_dir: outputs
 # Disable these flags to skip generating the associated files.
 write_srt: true
 write_jsonl: true
+# Split timed multitrack segments for TXT, JSONL and SRT. False keeps legacy ASR lines.
+multitrack_sentence_level: true
+multitrack_pause_threshold: 0.8  # seconds of silence within a sentence
+# Optional list of allowed display names; unexpected speakers produce a warning.
+speaker_roster:
 
 # Speaker labeling / diarization
 speaker_mapping: config/speaker_mapping.example.yaml

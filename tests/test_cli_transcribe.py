@@ -240,6 +240,8 @@ def test_run_transcribe_stamps_craig_recording_metadata_into_marker(monkeypatch,
     )
 
     marker = json.loads((transcript_dir / "Session 65.transcribe.json").read_text(encoding="utf-8"))
+    assert marker["asr_backend"] == "faster"
+    assert marker["asr_model"] == "tiny"
     assert marker["recording_id"] == "rec-65"
     assert marker["title"] == "Session 65"
 
