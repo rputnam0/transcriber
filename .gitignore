@@ -45,3 +45,6 @@ docs/speaker-id-experiment-ledger.md
 
 # Local reference scripts
 docs/example.py
+
+# Independent local MLX environment
+.venv-asr/

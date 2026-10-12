@@ -20,7 +20,7 @@ assets and recordings are deliberately excluded from Git. See the [documentation
 index](docs/README.md) for current instructions, release status, and historical experiments.
 
 ## Features
-- Faster-whisper backend with native word timestamps
+- Whisper large-v3 multitrack default with native word timestamps (MLX on Apple Silicon)
 - Direct pyannote `speaker-diarization-community-1` diarization with exclusive speaker turns
 - Speaker-bank labeling for recurring speakers in multi-speaker sessions
 - Parakeet backend (Apple Silicon local ASR with timestamps; no diarization)
@@ -46,16 +46,16 @@ index](docs/README.md) for current instructions, release status, and historical 
 - `--device cpu` forces CPU. Use `--pyannote-on-cpu` when you want diarization and speaker embeddings to stay on CPU as well.
 
 ## Platform Notes
-- `backend: auto` is the default. It resolves to `faster` for CUDA and speaker-aware runs, and to `parakeet` for multi-track ZIP stems or explicit single-speaker CPU runs on Apple Silicon and Linux.
+- `backend: auto` is the default. It resolves to `faster` for CUDA and speaker-aware runs, to `mlx-whisper` for multitrack ZIPs/directories on Apple Silicon, and to `faster` for multitrack on other platforms. Explicit single-speaker CPU runs retain `parakeet`.
 - Windows stays on `faster` under `auto`; the current Parakeet runtime support is Linux plus Apple Silicon.
 - Linux x86_64 / WSL2: `uv sync` installs the GPU-enabled Torch and ONNX Runtime stack used by the `faster` backend, plus the NeMo Parakeet runtime for CPU fallback.
-- Apple Silicon: `uv sync` installs CPU-safe dependencies plus `parakeet-mlx`.
+- Apple Silicon: `uv sync` installs CPU-safe dependencies, `mlx-whisper`, and `parakeet-mlx`. MLX ASR uses the Apple GPU; `--device cpu` controls pyannote for that path.
 - The CLI still auto-preloads pip-installed cuDNN/cuBLAS split libraries on Linux, so most users do not need extra `LD_LIBRARY_PATH` setup.
 
 ## CLI (Synopsis)
-- `uv run transcribe INPUT [--backend auto|faster|parakeet] [options]`
+- `uv run transcribe INPUT [--backend auto|faster|parakeet|mlx-whisper] [options]`
 - Common options: `--model large-v3` `--compute-type float16|int8_float16` `--device auto|cuda|cpu` `--batch-size N` `--auto-batch/--no-auto-batch` `--speaker-mapping PATH` `--min-speakers/--max-speakers` `--output-dir outputs` `--cache-root PATH|--cache-mode home|repo|env` `--local-files-only` `--log-level INFO|WARNING` `--config PATH`
-- `auto` is the default runtime backend.
+- `auto` is the default runtime backend. Multitrack uses Whisper; `--backend parakeet` explicitly retains the previous recognizer.
 
 ## Configuration
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.

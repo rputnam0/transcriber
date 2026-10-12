@@ -41,19 +41,42 @@ recordings. Map `bfschmity_0` to Kaladen Shash, correcting the old Kaladin Shash
 Roster checks identify configuration mistakes; they do not measure acoustic speaker
 accuracy or bleed between recording tracks.
 
-For Apple Silicon Craig ZIPs, `backend: auto` selects Parakeet; `model: parakeet` and
-`model: large-v3` resolve to `mlx-community/parakeet-tdt-0.6b-v3`. The default compute
-type is float16. Explicitly disable `speaker_bank` and `postprocess` for isolated-stem
-reruns that only need local ASR. Copy Drive audio locally before running. Keep audio,
-local configuration, caches, and transcript exports outside Git (the existing ignore
-rules cover `.audio/`, `.hf_cache/`, `config/transcriber.yaml`, and `transcripts/`).
+For Apple Silicon multitrack ZIPs and directories, `backend: auto` selects
+`mlx-whisper` with pinned Whisper large-v3 weights. Other platforms use `faster`.
+`--backend parakeet` explicitly selects the previous recognizer. The default compute
+type is float16; MLX also accepts float32. MLX uses the Apple GPU regardless of the
+pyannote `--device cpu` setting. Its `batch_size` argument is unused: windows decode
+sequentially to bound memory. See the [ASR study](multitrack-asr-study.md) for the
+comparison, historical settings, limitations, and throughput.
+
+The local path decodes 60-second cores with three seconds of real context on each
+side. Each word belongs to the core containing its midpoint, preventing duplicated
+context at boundaries. It skips only cores whose decoded samples are **all exactly
+zero**, preserving quiet speech without an amplitude/VAD cutoff. Whisper's own
+no-speech test and two-second hallucination-silence heuristic remain enabled.
+Temperature is zero, language is English, and previous-text conditioning is disabled.
+For sentence-level multitrack exports, timed words are joined across decoder segments
+and core windows before applying the configured sentence/pause splitter. Native
+decoder boundaries therefore do not force short fragments. Disabling sentence-level
+output retains the original recognizer segments. Word timing uses Whisper
+cross-attention/DTW; the historical notebook did not align.
+
+Explicitly disable `speaker_bank` and `postprocess` for isolated-stem reruns that
+only need local ASR. Copy Drive audio locally before running. Set `hf_cache_root:
+.hf_cache` in local config to cache model weights and verified per-window recognition.
+Audio hashes, model-file hashes, decoder settings and the recognizer version identify the
+cache; altered cache provenance fails rather than silently reusing text. A rerun
+reuses completed windows, including when the original extraction path has changed.
+The `.transcribe.json` completion marker records the resolved backend/model, compute
+type and default MLX model revision. Keep local configuration, audio, caches and
+exports outside Git.
 
 ```sh
 uv run transcribe '.audio/session4/Session 4.zip' \
-  --config config/transcriber.yaml --output-dir transcripts/multitrack_resplit
+  --config config/transcriber.yaml --output-dir transcripts/multitrack_final
 ```
 
-The CLI creates `transcripts/multitrack_resplit/Session 4/Session 4.{txt,jsonl,srt}`.
+The CLI creates `transcripts/multitrack_final/Session 4/Session 4.{txt,jsonl,srt}`.
 Compare per-speaker concatenated words against the original before replacing any
 consumer transcript. Whitespace may change as lines split; ASR differences must be
 reported separately. Review statistics should include full-line and dialogue-only

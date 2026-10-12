@@ -1,4 +1,4 @@
-backend: auto  # auto -> faster for CUDA/speaker-aware runs, parakeet for ZIP stems or explicit single-speaker CPU runs
+backend: auto  # Whisper for multitrack (MLX on Apple Silicon); faster for speaker-aware mixes
 # device options: auto (default), cuda, cpu
 device: auto
 model: large-v3
