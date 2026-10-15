@@ -230,10 +230,6 @@ def _is_apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}
 
 
-def _supports_parakeet_cpu_runtime() -> bool:
-    return _is_apple_silicon() or sys.platform == "linux"
-
-
 def _resolve_backend_choice(
     backend: str,
     *,
@@ -244,30 +240,29 @@ def _resolve_backend_choice(
     single_file_speaker: str | None,
     device: str | None,
     speaker_bank_config: SpeakerBankConfig | None,
+    mapping_covers_all: bool = False,
 ) -> str:
     requested = (backend or "auto").lower()
     if requested != "auto":
         return requested
 
     explicit_multi_speaker = min_speakers is not None or max_speakers is not None
-    speaker_aware_run = bool(
-        speaker_bank_config and speaker_bank_config.enabled and not single_file_speaker
+    speaker_aware_run = bool(speaker_bank_config and speaker_bank_config.enabled)
+
+    if explicit_multi_speaker or speaker_aware_run:
+        return "faster"
+
+    if device in {"cuda", "cpu"}:
+        return "faster"
+
+    known_tracks = (tmp_root is not None and len(files) > 1) or (
+        bool(single_file_speaker) and len(files) == 1
     )
-
-    if explicit_multi_speaker:
-        return "faster"
-
-    if device == "cuda":
-        return "faster"
+    if _is_apple_silicon() and (known_tracks or mapping_covers_all):
+        return "qwen"
 
     if len(files) > 1:
         return "mlx-whisper" if _is_apple_silicon() else "faster"
-
-    if speaker_aware_run:
-        return "faster"
-
-    if _supports_parakeet_cpu_runtime() and bool(single_file_speaker):
-        return "parakeet"
 
     return "faster"
 
@@ -316,6 +311,8 @@ def _apply_config_defaults(ap: argparse.ArgumentParser, cfg: Dict) -> None:
     defaults: Dict[str, object] = {}
     key_map = {
         "backend": "backend",
+        "vocabulary": "vocabulary",
+        "asr_python": "asr_python",
         "model": "model",
         "compute_type": "compute_type",
         "batch_size": "batch_size",
@@ -1808,6 +1805,8 @@ def run_transcribe(
     multitrack_sentence_level: bool = True,
     multitrack_pause_threshold: float = 0.8,
     speaker_roster: List[str] | None = None,
+    vocabulary_path: str | None = None,
+    asr_python: str | None = None,
 ) -> None:
     if not math.isfinite(multitrack_pause_threshold) or multitrack_pause_threshold <= 0:
         raise ValueError("multitrack_pause_threshold must be finite and greater than zero")
@@ -1848,6 +1847,28 @@ def run_transcribe(
         )
 
     files, tmp_root = gather_inputs(input_path)
+    # Resolve track identity before choosing a backend. Qwen is only automatic for
+    # inputs whose speaker is known from the archive, mapping, or explicit label.
+    try:
+        mapping_pre = _load_yaml_or_json(speaker_mapping_path)
+    except BaseException as exc:  # noqa: PIE786
+        logging.getLogger("transcriber").error(
+            "Failed to load speaker mapping %s: %s (continuing without mapping)",
+            speaker_mapping_path,
+            exc,
+        )
+        mapping_pre = {}
+    file_labels: Dict[str, str] = {}
+    mapping_hits: Dict[str, bool] = {}
+    for f in files:
+        if mapping_pre:
+            label, matched = choose_speaker(f, mapping_pre, return_match=True)
+            file_labels[f] = label
+            mapping_hits[f] = matched
+        else:
+            file_labels[f] = Path(f).stem
+            mapping_hits[f] = False
+    mapping_covers_all = bool(mapping_pre) and bool(files) and all(mapping_hits.values())
     resolved_backend = _resolve_backend_choice(
         backend,
         files=files,
@@ -1857,10 +1878,17 @@ def run_transcribe(
         single_file_speaker=single_file_speaker,
         device=device,
         speaker_bank_config=speaker_bank_config,
+        mapping_covers_all=mapping_covers_all,
     )
     if resolved_backend != backend:
         logger.info("Resolved backend=%s to backend=%s for this run.", backend, resolved_backend)
     backend = resolved_backend
+    if backend == "qwen" and speaker_bank_config and speaker_bank_config.enabled:
+        cleanup_tmp(tmp_root)
+        raise ValueError("Qwen isolated tracks require speaker_bank.enabled: false")
+    if vocabulary_path and backend != "qwen":
+        cleanup_tmp(tmp_root)
+        raise ValueError("--vocabulary currently requires --backend qwen")
     if not files:
         raise SystemExit(f"No audio files found in: {input_path}")
 
@@ -1876,28 +1904,6 @@ def run_transcribe(
         model_cache_dir = str(root_path / "models")
     else:
         model_cache_dir = None
-
-    # Preload mapping early so we can show friendly labels during progress
-    try:
-        mapping_pre = _load_yaml_or_json(speaker_mapping_path)
-    except BaseException as exc:  # noqa: PIE786
-        logging.getLogger("transcriber").error(
-            "Failed to load speaker mapping %s: %s (continuing without mapping)",
-            speaker_mapping_path,
-            exc,
-        )
-        mapping_pre = {}
-    file_labels: Dict[str, str] = {}
-    mapping_hits: Dict[str, bool] = {}
-    if mapping_pre:
-        for f in files:
-            label, matched = choose_speaker(f, mapping_pre, return_match=True)
-            file_labels[f] = label
-            mapping_hits[f] = matched
-    else:
-        for f in files:
-            file_labels[f] = Path(f).stem
-            mapping_hits[f] = False
 
     speaker_bank: Optional[SpeakerBank] = None
     speaker_bank_summary: Dict[str, object] = {}
@@ -2069,7 +2075,47 @@ def run_transcribe(
             len(bank_info.get("speakers", [])),
         )
 
-    if backend in {"parakeet", "mlx-whisper"}:
+    if backend == "qwen":
+        from .qwen_backend import MODEL, MODEL_REVISION, transcribe_files
+        from .vocabulary import load_vocabulary
+
+        try:
+            if not _is_apple_silicon() or device not in {None, "auto"}:
+                raise ValueError("Qwen uses Apple Silicon Metal; use --device auto on this Mac")
+            if min_speakers is not None or max_speakers is not None or speaker_bank:
+                raise ValueError(
+                    "Qwen isolated tracks use file identity, not diarization/speaker bank"
+                )
+            known_tracks = (
+                (tmp_root is not None and len(files) > 1)
+                or (bool(single_file_speaker) and len(files) == 1)
+                or mapping_covers_all
+            )
+            if not known_tracks:
+                raise ValueError(
+                    "Qwen requires a multitrack ZIP, a complete --speaker-mapping, "
+                    "or --single-file-speaker for a verified single-speaker recording"
+                )
+            vocabulary = load_vocabulary(vocabulary_path)
+            decoded = transcribe_files(
+                files,
+                vocabulary=vocabulary,
+                python=asr_python,
+                model=model_name,
+                cache_root=hf_cache_root,
+                work_dir=Path(output_dir) / ".qwen",
+                local_files_only=local_files_only,
+            )
+            if len(decoded) != len(files):
+                raise ValueError("Qwen returned an incomplete set of tracks")
+            for filename, segments in zip(files, decoded):
+                for segment in segments:
+                    _set_segment_speaker_label(segment, file_labels[filename])
+            per_file_segments.extend(zip(files, decoded))
+        except BaseException:
+            cleanup_tmp(tmp_root)
+            raise
+    elif backend in {"parakeet", "mlx-whisper"}:
         logger.info("Using %s local backend.", backend)
         from .diarization import (
             extract_embeddings_for_segments as diar_extract_embeddings_for_segments,
@@ -2544,7 +2590,15 @@ def run_transcribe(
     craig_input_metadata.update(
         asr_backend=backend,
         asr_requested_model=model_name,
-        asr_model=(local_model_name if backend in {"parakeet", "mlx-whisper"} else model_name),
+        asr_model=(
+            local_model_name
+            if backend in {"parakeet", "mlx-whisper"}
+            else (
+                MODEL
+                if backend == "qwen" and model_name in {"qwen", "large-v3", "medium.en"}
+                else model_name
+            )
+        ),
         asr_compute_type=(fw_compute if backend == "faster" else compute_type),
     )
     if backend == "mlx-whisper":
@@ -2552,6 +2606,9 @@ def run_transcribe(
 
         if local_model_name == DEFAULT_MODEL:
             craig_input_metadata["asr_model_revision"] = DEFAULT_REVISION
+    elif backend == "qwen":
+        if craig_input_metadata["asr_model"] == MODEL:
+            craig_input_metadata["asr_model_revision"] = MODEL_REVISION
     _write_transcription_completion_marker(
         transcript_output_path,
         input_path=input_path,
@@ -3195,6 +3252,8 @@ def watch_and_transcribe(
                                 multitrack_pause_threshold=args.multitrack_pause_threshold,
                                 speaker_roster=args.speaker_roster,
                                 backend=args.backend,
+                                vocabulary_path=getattr(args, "vocabulary", None),
+                                asr_python=getattr(args, "asr_python", None),
                                 model_name=args.model,
                                 compute_type=args.compute_type,
                                 batch_size=args.batch_size,
@@ -3277,8 +3336,10 @@ def main():
     )
     ap.add_argument("input", nargs="?", help="Path to audio file, directory, or .zip of audios")
     ap.add_argument(
-        "--backend", choices=["auto", "faster", "parakeet", "mlx-whisper"], default="auto"
+        "--backend", choices=["auto", "faster", "parakeet", "mlx-whisper", "qwen"], default="auto"
     )
+    ap.add_argument("--vocabulary", help="Canonical campaign.json or JSON word bank (Qwen)")
+    ap.add_argument("--asr-python", help="Isolated MLX Python interpreter for Qwen")
     ap.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
@@ -3678,6 +3739,8 @@ def main():
         multitrack_pause_threshold=args.multitrack_pause_threshold,
         speaker_roster=args.speaker_roster,
         backend=args.backend,
+        vocabulary_path=args.vocabulary,
+        asr_python=args.asr_python,
         model_name=args.model,
         compute_type=args.compute_type,
         batch_size=args.batch_size,

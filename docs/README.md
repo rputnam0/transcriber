@@ -2,10 +2,14 @@
 
 ## Current workflows
 
+- [Mac isolated-track transcription](mac-isolated-track-transcription.md): local
+  Qwen with a canonical campaign vocabulary, known file speakers, and aligned exports.
+- [Full-session Qwen trial](specs/qwen_full_session_pilot_20261012.md): measured
+  runtime, silence handling, review flags, and listening workspace for Session 47.
 - [Repository README](../README.md): regular CLI, isolated speaker audio, multitrack
   inputs, pyannote speaker bank, configuration, and watch mode.
 - [Multitrack transcription](multitrack-transcription.md) and [Session 4 ASR study](multitrack-asr-study.md):
-  local Whisper defaults, sentence-level exports, paired quality evidence and throughput.
+  sentence-level exports and the earlier local Whisper comparison.
 - [Mac single-file transcription](mac-single-file-transcription.md): install,
   restore private voices, run/resume a complete mixed recording, and listen to named
   transcripts. Includes the completed release and quality limitations.

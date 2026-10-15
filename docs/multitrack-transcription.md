@@ -41,9 +41,11 @@ recordings. Map `bfschmity_0` to Kaladen Shash, correcting the old Kaladin Shash
 Roster checks identify configuration mistakes; they do not measure acoustic speaker
 accuracy or bleed between recording tracks.
 
-For Apple Silicon multitrack ZIPs and directories, `backend: auto` selects
-`mlx-whisper` with pinned Whisper large-v3 weights. Other platforms use `faster`.
-`--backend parakeet` explicitly selects the previous recognizer. The default compute
+For Apple Silicon multitrack ZIPs and mapped directories, `backend: auto` now
+selects Qwen. The Whisper path described in this report remains available with
+`--backend mlx-whisper`; unmapped directories also use it automatically. Other
+platforms use `faster`. `--backend parakeet` explicitly selects an older recognizer.
+The following details describe the Whisper path from the Session 4 study. Its default compute
 type is float16; MLX also accepts float32. MLX uses the Apple GPU regardless of the
 pyannote `--device cpu` setting. Its `batch_size` argument is unused: windows decode
 sequentially to bound memory. See the [ASR study](multitrack-asr-study.md) for the
@@ -68,12 +70,13 @@ Audio hashes, model-file hashes, decoder settings and the recognizer version ide
 cache; altered cache provenance fails rather than silently reusing text. A rerun
 reuses completed windows, including when the original extraction path has changed.
 The `.transcribe.json` completion marker records the resolved backend/model, compute
-type and default MLX model revision. Keep local configuration, audio, caches and
+type and default model revision. Keep local configuration, audio, caches and
 exports outside Git.
 
 ```sh
 uv run transcribe '.audio/session4/Session 4.zip' \
-  --config config/transcriber.yaml --output-dir transcripts/multitrack_final
+  --backend mlx-whisper --config config/transcriber.yaml \
+  --output-dir transcripts/multitrack_final
 ```
 
 The CLI creates `transcripts/multitrack_final/Session 4/Session 4.{txt,jsonl,srt}`.

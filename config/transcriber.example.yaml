@@ -1,4 +1,4 @@
-backend: auto  # Whisper for multitrack (MLX on Apple Silicon); faster for speaker-aware mixes
+backend: auto  # Qwen for known Apple Silicon tracks; faster for mixes and other platforms
 # device options: auto (default), cuda, cpu
 device: auto
 model: large-v3
@@ -36,7 +36,7 @@ diarization_model: pyannote/speaker-diarization-community-1
 single_file_speaker:
 
 speaker_bank:
-  enabled: true
+  enabled: false  # Enable for mixed recordings that need recurring-speaker matching.
   path: default  # stored under cache_root/speaker_bank/
   threshold: 0.35
   radius_factor: 2.5

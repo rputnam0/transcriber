@@ -11,6 +11,7 @@ Local speech transcription for mixed recordings, isolated speaker audio, and mul
 
 | Input | Workflow |
 | --- | --- |
+| Isolated speaker tracks on Apple Silicon | [Qwen ASR + vocabulary](docs/mac-isolated-track-transcription.md): automatic for known speakers, aligned timestamps, and resumable chunks |
 | Mixed recording with enrolled voices on Apple Silicon | [Qwen ASR + trained MOSS](docs/mac-single-file-transcription.md): resumable full-recording processing, named turns, overlap handling, and an audio reader |
 | Isolated speaker recording or named multitrack stems | Regular `transcribe` CLI below; use speaker mapping for known track identities |
 | Mixed recording with generic speaker labels or a pyannote speaker bank | Regular CLI with the `faster` backend and pyannote diarization |
@@ -20,16 +21,16 @@ assets and recordings are deliberately excluded from Git. See the [documentation
 index](docs/README.md) for current instructions, release status, and historical experiments.
 
 ## Features
-- Whisper large-v3 multitrack default with native word timestamps (MLX on Apple Silicon)
+- Qwen3-ASR default for known isolated tracks on Apple Silicon, with aligned word timestamps
 - Direct pyannote `speaker-diarization-community-1` diarization with exclusive speaker turns
 - Speaker-bank labeling for recurring speakers in multi-speaker sessions
-- Parakeet backend (Apple Silicon local ASR with timestamps; no diarization)
+- Legacy Parakeet backend remains available explicitly for historical comparisons
 - Config‑driven runs with CLI override, clean progress bars, auto‑batching
 - Outputs: TXT (Speaker HH:MM:SS Text), SRT, JSONL, `.diarization.json`, `.exclusive_diarization.json`
 
 ## Requirements
 - Python 3.11, FFmpeg
-- `uv sync` is system-aware: Linux installs the default `faster` GPU stack plus the Parakeet CPU runtime, while Apple Silicon gets the CPU-safe stack plus `parakeet-mlx`.
+- `uv sync` installs the regular CLI and its platform-specific dependencies. The Qwen MLX runtime uses a separate environment; see the [Mac guide](docs/mac-isolated-track-transcription.md).
 - `HF_TOKEN` is required for gated pyannote models such as `pyannote/speaker-diarization-community-1`.
 
 ## Install & Run
@@ -37,7 +38,7 @@ index](docs/README.md) for current instructions, release status, and historical 
 - Minimal setup: `uv sync`
 - Config‑driven: `cp config/transcriber.example.yaml config/transcriber.yaml && uv run transcribe`
 - Direct CLI: `uv run transcribe audio/Session_32.zip --model large-v3 --speaker-mapping config/speaker_mapping.example.yaml`
-- Apple Silicon local run: `uv run transcribe audio/sample.wav --backend parakeet --model parakeet`
+- Apple Silicon isolated-track run: `uv run transcribe audio/sample.wav --single-file-speaker "Name"` after installing the Qwen runtime.
 - Docker (GPU): `make docker-build` then `HF_TOKEN=... make docker-run INPUT=audio/Session_32.zip MODEL=large-v3`
 
 ## Device Selection
@@ -46,16 +47,16 @@ index](docs/README.md) for current instructions, release status, and historical 
 - `--device cpu` forces CPU. Use `--pyannote-on-cpu` when you want diarization and speaker embeddings to stay on CPU as well.
 
 ## Platform Notes
-- `backend: auto` is the default. It resolves to `faster` for CUDA and speaker-aware runs, to `mlx-whisper` for multitrack ZIPs/directories on Apple Silicon, and to `faster` for multitrack on other platforms. Explicit single-speaker CPU runs retain `parakeet`.
-- Windows stays on `faster` under `auto`; the current Parakeet runtime support is Linux plus Apple Silicon.
-- Linux x86_64 / WSL2: `uv sync` installs the GPU-enabled Torch and ONNX Runtime stack used by the `faster` backend, plus the NeMo Parakeet runtime for CPU fallback.
+- `backend: auto` selects Qwen for verified isolated tracks on Apple Silicon: multitrack ZIPs, mapped directories, or `--single-file-speaker`. It selects `faster` for speaker-aware mixes, explicit CPU/CUDA runs, and non-Mac platforms. Unmapped Mac directories retain `mlx-whisper`.
+- Windows and Linux stay on `faster` under `auto`.
+- Linux x86_64 / WSL2: `uv sync` installs the GPU-enabled Torch and ONNX Runtime stack used by the `faster` backend.
 - Apple Silicon: `uv sync` installs CPU-safe dependencies, `mlx-whisper`, and `parakeet-mlx`. MLX ASR uses the Apple GPU; `--device cpu` controls pyannote for that path.
 - The CLI still auto-preloads pip-installed cuDNN/cuBLAS split libraries on Linux, so most users do not need extra `LD_LIBRARY_PATH` setup.
 
 ## CLI (Synopsis)
-- `uv run transcribe INPUT [--backend auto|faster|parakeet|mlx-whisper] [options]`
+- `uv run transcribe INPUT [--backend auto|qwen|faster|mlx-whisper|parakeet] [options]`
 - Common options: `--model large-v3` `--compute-type float16|int8_float16` `--device auto|cuda|cpu` `--batch-size N` `--auto-batch/--no-auto-batch` `--speaker-mapping PATH` `--min-speakers/--max-speakers` `--output-dir outputs` `--cache-root PATH|--cache-mode home|repo|env` `--local-files-only` `--log-level INFO|WARNING` `--config PATH`
-- `auto` is the default runtime backend. Multitrack uses Whisper; `--backend parakeet` explicitly retains the previous recognizer.
+- `auto` is the default runtime backend. Qwen needs the separate `.venv-qwen` runtime on Apple Silicon; `--backend mlx-whisper` explicitly retains the earlier multitrack recognizer.
 
 ## Configuration
 Auto‑discovery: `--config`, `TRANSCRIBER_CONFIG`, `./transcriber.yaml|.json`, `./config/…`, `~/.config/transcriber/config.yaml|.json`. See `config/transcriber.example.yaml`.
@@ -80,10 +81,8 @@ travisaurus6985_0: "Cyrus Schwert"
 
 Matching is case-insensitive; numeric prefixes like `2-foo_0.ogg` are ignored; for `x-foo_0`, `foo_0` is preferred.
 
-## Apple Silicon Parakeet
-- Use `--backend parakeet` to run the MLX Parakeet backend on Apple Silicon Macs.
-- Parakeet supports timestamps, TXT/SRT/JSONL output, and single-speaker label overrides.
-- Parakeet does not currently provide diarization, so `--min-speakers` and `--max-speakers` are ignored on that backend.
+## Legacy Parakeet
+- `--backend parakeet` remains available for reproducing older comparisons. It is not selected automatically.
 
 ## Speaker Bank
 - Enable the speaker embedding bank to tag recurring players across sessions: `--speaker-bank` (default when configured) or `speaker_bank.enabled` in the config.

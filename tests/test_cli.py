@@ -11,7 +11,6 @@ from transcriber.speaker_bank import SpeakerBankConfig
 
 def test_auto_backend_prefers_whisper_for_zip_stems_on_linux_cpu(monkeypatch):
     monkeypatch.setattr(cli, "_is_apple_silicon", lambda: False)
-    monkeypatch.setattr(cli, "_supports_parakeet_cpu_runtime", lambda: True)
 
     resolved = cli._resolve_backend_choice(
         "auto",
@@ -27,8 +26,8 @@ def test_auto_backend_prefers_whisper_for_zip_stems_on_linux_cpu(monkeypatch):
     assert resolved == "faster"
 
 
-def test_auto_backend_prefers_parakeet_for_explicit_single_speaker_cpu(monkeypatch):
-    monkeypatch.setattr(cli, "_supports_parakeet_cpu_runtime", lambda: True)
+def test_auto_backend_uses_faster_for_explicit_cpu(monkeypatch):
+    monkeypatch.setattr(cli, "_is_apple_silicon", lambda: True)
 
     resolved = cli._resolve_backend_choice(
         "auto",
@@ -41,11 +40,11 @@ def test_auto_backend_prefers_parakeet_for_explicit_single_speaker_cpu(monkeypat
         speaker_bank_config=None,
     )
 
-    assert resolved == "parakeet"
+    assert resolved == "faster"
 
 
 def test_auto_backend_prefers_faster_for_multi_speaker_runs(monkeypatch):
-    monkeypatch.setattr(cli, "_supports_parakeet_cpu_runtime", lambda: True)
+    monkeypatch.setattr(cli, "_is_apple_silicon", lambda: True)
 
     resolved = cli._resolve_backend_choice(
         "auto",
@@ -62,7 +61,7 @@ def test_auto_backend_prefers_faster_for_multi_speaker_runs(monkeypatch):
 
 
 def test_auto_backend_treats_single_file_zip_like_regular_audio(monkeypatch):
-    monkeypatch.setattr(cli, "_supports_parakeet_cpu_runtime", lambda: True)
+    monkeypatch.setattr(cli, "_is_apple_silicon", lambda: True)
 
     resolved = cli._resolve_backend_choice(
         "auto",
@@ -641,18 +640,30 @@ def test_apply_config_defaults_honors_multitrack_options():
     assert args.speaker_roster == ["Kaladen Shash"]
 
 
-def test_auto_backend_prefers_whisper_for_apple_multitrack_and_honors_override(monkeypatch):
+def test_auto_backend_uses_qwen_for_known_apple_tracks_and_honors_override(monkeypatch):
     monkeypatch.setattr(cli, "_is_apple_silicon", lambda: True)
     options = dict(
         files=["one.ogg", "two.ogg"],
-        tmp_root=None,
+        tmp_root="/tmp/extracted",
         min_speakers=None,
         max_speakers=None,
         single_file_speaker=None,
-        device="cpu",
+        device="auto",
         speaker_bank_config=None,
     )
-    assert cli._resolve_backend_choice("auto", **options) == "mlx-whisper"
+    assert cli._resolve_backend_choice("auto", **options) == "qwen"
     assert cli._resolve_backend_choice("parakeet", **options) == "parakeet"
+    assert cli._resolve_backend_choice("mlx-whisper", **options) == "mlx-whisper"
+    options["tmp_root"] = None
+    assert cli._resolve_backend_choice("auto", **options) == "mlx-whisper"
+    options["mapping_covers_all"] = True
+    assert cli._resolve_backend_choice("auto", **options) == "qwen"
+    options["files"] = ["one.ogg"]
+    options["mapping_covers_all"] = False
+    options["single_file_speaker"] = "Narrator"
+    assert cli._resolve_backend_choice("auto", **options) == "qwen"
+    options["speaker_bank_config"] = SpeakerBankConfig(enabled=True)
+    assert cli._resolve_backend_choice("auto", **options) == "faster"
+    options["speaker_bank_config"] = None
     options["device"] = "cuda"
     assert cli._resolve_backend_choice("auto", **options) == "faster"

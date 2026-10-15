@@ -1,0 +1,15 @@
+# Local Apple Silicon ASR for verified isolated-speaker inputs.
+backend: qwen
+model: qwen
+device: auto
+cache_mode: repo
+output_dir: outputs/qwen
+local_files_only: true
+# Install this interpreter with requirements/qwen-mac.lock.txt first.
+asr_python: .venv-qwen/bin/python
+# A campaign.json is read directly so confirmed name changes reach the next run.
+# vocabulary: /path/to/campaign.json
+speaker_bank:
+  enabled: false
+postprocess:
+  enabled: false

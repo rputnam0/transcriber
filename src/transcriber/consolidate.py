@@ -240,6 +240,8 @@ def save_outputs(
                     "text": segment.get("text", "").strip(),
                 }
                 for meta_key in (
+                    "review_required",
+                    "review_reason",
                     "speaker_raw",
                     "speaker_match_score",
                     "speaker_match_distance",

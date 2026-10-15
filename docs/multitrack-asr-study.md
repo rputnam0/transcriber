@@ -1,7 +1,10 @@
 # Session 4 multitrack ASR decision
 
-Whisper large-v3 is the local multitrack default. The paired study found substantial
-speech deletion in the previous Parakeet rerun, including Kaladen's quiet passages.
+This 2026-10-11 study selected Whisper large-v3 as the local multitrack default at
+that time. Qwen became the automatic Apple Silicon choice for known isolated tracks
+on 2026-10-15; use `--backend mlx-whisper` to reproduce this study's path. The
+paired study found substantial speech deletion in the previous Parakeet rerun,
+including Kaladen's quiet passages.
 The change retains sentence splitting from timed words, canonical track names and
 the configured roster check. Audio, detailed predictions and final exports are
 private; this report contains aggregate evidence only. No paid provider calls were made.
@@ -159,11 +162,12 @@ One sampled quiet Kaladen window contains a short final-word echo; the three-wor
 phrase flag does not count single-word repetitions. Silence guards are not proof
 that every non-silent prediction is correct.
 
-## Permanent path and final artifact
+## Study path and final artifact
 
-`backend: auto` selects MLX Whisper for Apple Silicon multitrack input and
-faster-whisper elsewhere. Explicit backend choices, mixed-recording diarization
-requests, CUDA selection and single-file behavior remain available.
+At the time of this study, `backend: auto` selected MLX Whisper for Apple Silicon
+multitrack input and faster-whisper elsewhere. Explicit backend choices,
+mixed-recording diarization requests, CUDA selection and single-file behavior
+remain available.
 For the study, speaker-bank matching and generative postprocessing are disabled;
 stem filenames supply the four canonical names. No learned voice attribution is
 needed for known isolated tracks.
