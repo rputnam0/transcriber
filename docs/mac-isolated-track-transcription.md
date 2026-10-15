@@ -90,6 +90,32 @@ this config also selects it. Unmapped directories and mixed recordings retain th
 other backends. Qwen processes chunks sequentially; the ordinary `--batch-size`
 setting does not change its decoding.
 
+### Craig archives supplied with Audacity projects
+
+An older `.aup` project may contain `<import filename="...ogg" offset="..."/>`
+entries rather than Audacity audio blocks. Its companion `_data.zip` can hold the
+original isolated tracks alongside `info.txt` and `raw.dat`. Copy the project
+and archive to local staging before inspecting or extracting them; leave the
+source storage unchanged. Read `info.txt` and compare every imported filename
+with the archive and the established speaker mapping. Stop for missing or unknown
+speakers instead of inferring a label from dialogue.
+
+Check each import's offset in the project. When every offset is zero, the imported
+tracks already share the recording origin: extract the imported files without
+trimming or shifting them, then supply their directory with a complete mapping, or package
+only those tracks in a ZIP. Do not pass the project, `raw.dat`, or an archive of
+Audacity blocks as an audio recording. Nonzero offsets require explicit timeline
+preparation before this backend can be used; it does not apply `.aup` offsets.
+
+Verify ZIP CRCs and decode every track through its end before recognition. Record
+source durations and decoder errors, and check the exported timestamps against
+those durations afterward. Different track end times alone do not establish
+truncation; preserve the source lengths and report the difference. Keep source
+provenance, local settings, and these checks beside the private outputs.
+Check the actual container with `ffprobe`: Craig tracks named `.ogg` can contain
+FLAC audio. The existing decoder reads their contents; no preparatory conversion
+is needed.
+
 ## Results, resume, and quality
 
 Exports use the normal per-input output directory and include TXT, SRT, and JSONL
