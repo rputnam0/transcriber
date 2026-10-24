@@ -31,17 +31,32 @@ class Recognizer:
     def __init__(self, model, processor):
         self.model, self.processor = model, processor
         tokenizer = processor.tokenizer
+        # Batched generation must pad prompts on the left so every row ends at its prompt.
+        tokenizer.padding_side = "left"
         self.stop_ids = {
             tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")
         } | {tokenizer.eos_token_id}
 
     def generate(self, clip, *, language, hotwords, max_tokens, temperature, verbose=False):
+        [result] = self.generate_batch(
+            [clip],
+            language=language,
+            hotwords=hotwords,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return result
+
+    def generate_batch(self, clips, *, language, hotwords, max_tokens, temperature):
         import torch
 
         if temperature != 0.0:
             raise ValueError("The CUDA Qwen runtime decodes greedily only")
         inputs = self.processor(
-            text=[prompt(language, hotwords)], audio=[clip], return_tensors="pt", padding=True
+            text=[prompt(language, hotwords)] * len(clips),
+            audio=list(clips),
+            return_tensors="pt",
+            padding=True,
         )
         inputs = inputs.to(self.model.device).to(self.model.dtype)
         with torch.inference_mode():
@@ -51,16 +66,18 @@ class Recognizer:
                 do_sample=False,
                 pad_token_id=self.processor.tokenizer.pad_token_id,
             )
-        sequence = getattr(output, "sequences", output)[0, inputs["input_ids"].shape[1] :]
-        tokens = []
-        for token in sequence.tolist():
-            if token in self.stop_ids:
-                break
-            tokens.append(token)
-        text = self.processor.tokenizer.decode(
-            tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        return SimpleNamespace(text=text, generation_tokens=len(tokens))
+        results = []
+        for sequence in getattr(output, "sequences", output)[:, inputs["input_ids"].shape[1] :]:
+            tokens = []
+            for token in sequence.tolist():
+                if token in self.stop_ids:
+                    break
+                tokens.append(token)
+            text = self.processor.tokenizer.decode(
+                tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            results.append(SimpleNamespace(text=text, generation_tokens=len(tokens)))
+        return results
 
 
 class Aligner:

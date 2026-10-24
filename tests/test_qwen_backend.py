@@ -315,3 +315,36 @@ def test_cuda_recognizer_matches_mlx_prompt_and_counts_budget():
         == 3
     )
     assert "system\n<|im_end|>" in seen["prompt"]
+
+
+def test_batched_first_pass_matches_sequential_decoding(tmp_path):
+    wave = np.arange(100 * 16000, dtype=np.float32) + 1
+    batches = []
+
+    def text(clip):
+        return f"Chunk{int(clip[0]) // 16000}."
+
+    class Model:
+        def generate(self, clip, **kwargs):
+            # Only the unhinted retry of the echoed chunk is decoded alone.
+            assert kwargs["hotwords"] is None
+            return SimpleNamespace(text="Retried.", generation_tokens=3)
+
+        def generate_batch(self, clips, **kwargs):
+            batches.append(len(clips))
+            out = [SimpleNamespace(text=text(c), generation_tokens=3) for c in clips]
+            out[0] = SimpleNamespace(text="Kaladen, Leopold, Cyrus, Zariel", generation_tokens=9)
+            return out
+
+    class Aligner:
+        def generate(self, *, audio, text, **kwargs):
+            return SimpleNamespace(segments=[dict(text=text.rstrip("."), start=4.0, end=4.5)])
+
+    bank = {"terms": ["Kaladen", "Leopold", "Cyrus", "Zariel"]}
+    result = transcribe_wave(
+        wave, Model(), Aligner(), vocabulary=bank, cache=tmp_path, provenance={}, batch_size=2
+    )
+    # Four windows decode as two batches; the echoed first chunk of each batch is retried alone.
+    assert batches == [2, 2]
+    assert [s["text"] for s in result] == ["Retried.", "Chunk27.", "Retried.", "Chunk87."]
+    assert json.loads((tmp_path / "000002.json").read_text())["retry_reason"] == "hint_echo"

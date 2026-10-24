@@ -35,6 +35,7 @@ RUNTIMES = {
         aligner=ALIGNER,
         aligner_revision=ALIGNER_REVISION,
         python=".venv-qwen/bin/python",
+        batch_size=1,
     ),
     "cuda": dict(
         model=CUDA_MODEL,
@@ -42,6 +43,8 @@ RUNTIMES = {
         aligner=CUDA_ALIGNER,
         aligner_revision=CUDA_ALIGNER_REVISION,
         python=".venv-qwen-cuda/bin/python",
+        # Batched first-pass decoding; 8 chunks peak near 7 GB of GPU memory.
+        batch_size=8,
     ),
 }
 
@@ -140,8 +143,14 @@ def aligned_words(text: str, aligned: list[dict], duration: float) -> list[dict]
     return words
 
 
-def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regions=None):
-    """Decode speech regions without removing their offsets on the source timeline."""
+def transcribe_wave(
+    wave, model, aligner, *, vocabulary, cache, provenance, regions=None, batch_size=1
+):
+    """Decode speech regions without removing their offsets on the source timeline.
+
+    With ``batch_size`` > 1 the first hinted decode of up to that many uncached chunks runs as one
+    ``model.generate_batch`` call; retries, alignment and the chunk records stay per chunk.
+    """
     rate, core_samples, padding = 16000, 30 * 16000, 3 * 16000
     segments = []
     regions = [[0, len(wave)]] if regions is None else regions
@@ -158,6 +167,24 @@ def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regi
                     end == region_end,
                 )
             )
+    first_pass = {}
+
+    def decode_ahead(first):
+        pending = []
+        for j in range(first, len(windows)):
+            if len(pending) == batch_size:
+                break
+            if not (cache / f"{j:06d}.json").exists() and wave[windows[j][2] : windows[j][3]].any():
+                pending.append(j)
+        results = model.generate_batch(
+            [wave[windows[j][2] : windows[j][3]] for j in pending],
+            language="English",
+            hotwords=vocabulary["terms"] or None,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        first_pass.update(zip(pending, results))
+
     for index, (start, end, lo, hi, final_window) in enumerate(windows):
         target = cache / f"{index:06d}.json"
         if target.exists():
@@ -172,7 +199,9 @@ def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regi
             if not clip.any():
                 text, aligned, generated = "", [], 0
             else:
-                result = model.generate(
+                if batch_size > 1 and index not in first_pass:
+                    decode_ahead(index)
+                result = first_pass.pop(index, None) or model.generate(
                     clip,
                     language="English",
                     hotwords=vocabulary["terms"] or None,
@@ -346,7 +375,7 @@ def run_worker(request: dict) -> dict:
         # MLX keeps its original key set so existing chunk caches still resume.
         provenance = dict(
             schema=6,
-            **({} if runtime == "mlx" else dict(runtime=runtime)),
+            **({} if runtime == "mlx" else dict(runtime=runtime, batch_size=pinned["batch_size"])),
             model_path=model_path,
             aligner_path=aligner_path,
             **runtime_versions,
@@ -380,6 +409,7 @@ def run_worker(request: dict) -> dict:
             cache=cache,
             provenance=provenance,
             regions=regions,
+            batch_size=pinned["batch_size"],
         )
         _save(
             cache / "result.json", dict(provenance=provenance, segments=segments, activity=speech)
