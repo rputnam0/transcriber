@@ -89,6 +89,22 @@ local-only. Drive does not host this audio player; upload TXT/SRT or standalone 
 HTML for reading there. Keep the `.turns.json` and `release_audit.json` privately for
 future re-export and audit.
 
+## Completion record
+
+When the release audit passes, the finish step writes `Session N.transcribe.json` beside
+`Session N.txt`. It records:
+
+- `transcription_method: qwen_mixed_voice_attribution`;
+- the pinned Qwen ASR and aligner revisions;
+- the MOSS checkpoint fingerprint;
+- SHA-256 values of the enrolled voice set (`speaker_model.npz`, `turn_refinement.json`);
+- the session roster;
+- the source audio hash;
+- the explicit unattributed label (`Unconfirmed speaker`).
+
+This record differs from the isolated-track `uv run transcribe` record. A consumer admits it only when
+configured to accept this method. Add `transcript_sha256` of the exact text bytes when installing it.
+
 ## Completed release
 
 The full-recording release covers sessions 1, 2, 3, 15, 36, and 40: approximately

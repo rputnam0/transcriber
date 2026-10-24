@@ -6,6 +6,8 @@ Use --wait only while inference/attribution workers are running in this task.
 
 from __future__ import annotations
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import html
 import json
 from pathlib import Path
@@ -14,6 +16,63 @@ from export_moss_transcripts import export
 from fuse_asr_diarization import fuse_session
 from run_mac_asr_quality import save
 from repair_context_asr import text_issues
+from resolve_mac_asr_models import MODELS
+
+METHOD = "qwen_mixed_voice_attribution"
+ASR_MODEL, ALIGNER_MODEL = MODELS
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while data := stream.read(8 * 1024 * 1024):
+            digest.update(data)
+    return digest.hexdigest()
+
+
+def completion_record(report, entry, transcript, roster_path, identity, policy):
+    """Completion marker for a validated release: Qwen words with enrolled-voice attribution.
+
+    Consumers admit this method only when configured to; it is not the isolated-track record.
+    """
+    asr, aligner = report["asr"]["asr"], report["asr"]["aligner"]
+    if asr["revision"] != MODELS[ASR_MODEL] or aligner["revision"] != MODELS[ALIGNER_MODEL]:
+        raise ValueError("ASR or aligner revision differs from the pinned models")
+    config = json.loads(Path(roster_path).read_text())
+    session = str(entry["session"])
+    allowed = config["session_rosters"][session]
+    names = {**config["display_names"], **config.get("session_display_names", {}).get(session, {})}
+    roster = dict(
+        session=entry["session"],
+        allowed_speakers=allowed,
+        display_names={handle: names[handle] for handle in allowed},
+    )
+    diarizer = report["diarizer"]
+    return dict(
+        status="completed",
+        transcription_method=METHOD,
+        input_path=entry["audio"],
+        input_sha256=file_sha256(entry["audio"]),
+        transcript_path=str(transcript),
+        generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        asr_backend="qwen",
+        asr_model=ASR_MODEL,
+        asr_model_revision=asr["revision"],
+        aligner=dict(model=ALIGNER_MODEL, revision=aligner["revision"]),
+        diarizer=dict(
+            method="moss_hybrid_local_names",
+            checkpoint_sha256=diarizer["checkpoint_sha256"],
+            decoder=diarizer["decoder"],
+        ),
+        voice_set=dict(
+            speaker_model_sha256=file_sha256(identity), turn_refinement_sha256=file_sha256(policy)
+        ),
+        roster=dict(
+            roster, sha256=hashlib.sha256(json.dumps(roster, sort_keys=True).encode()).hexdigest()
+        ),
+        unattributed_label="Unconfirmed speaker",
+        duration_seconds=report["duration_seconds"],
+    )
 
 
 def validate(moss, asr, fused, allowed):
@@ -142,8 +201,14 @@ def main():
     p.add_argument("--work", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--rosters", type=Path, default=Path("config/early_session_rosters.json"))
+    p.add_argument(
+        "--identity", type=Path, help="Enrolled voices; with --policy, writes .transcribe.json"
+    )
+    p.add_argument("--policy", type=Path)
     p.add_argument("--wait", action="store_true")
     args = p.parse_args()
+    if (args.identity is None) != (args.policy is None):
+        p.error("--identity and --policy are required together")
     plan = json.loads(args.plan.read_text())
     rosters = json.loads(args.rosters.read_text())
     reports = []
@@ -177,6 +242,12 @@ def main():
         report.update(session=s, source_note=e.get("source_note", ""))
         export(fused, args.rosters, s, args.output)
         add_audio(args.output, s, args.work / "listening" / f"session{s}.m4a")
+        if args.identity:
+            transcript = args.output / f"Session {s}.txt"
+            record = completion_record(
+                report, e, transcript, args.rosters, args.identity, args.policy
+            )
+            save(transcript.with_suffix(".transcribe.json"), record)
         reports.append(report)
         save(args.output / "release_audit.json", reports)
         index(args.output, plan, reports)
