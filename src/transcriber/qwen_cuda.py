@@ -43,7 +43,8 @@ class Recognizer:
         inputs = self.processor(
             text=[prompt(language, hotwords)], audio=[clip], return_tensors="pt", padding=True
         )
-        inputs = inputs.to(self.model.device).to(self.model.dtype)
+        # Features stay float32 for the float32 audio encoder; the model casts its output to bf16.
+        inputs = inputs.to(self.model.device)
         with torch.inference_mode():
             output = self.model.generate(
                 **inputs,
@@ -82,11 +83,19 @@ def load(model_path: str, aligner_path: str):
         raise RuntimeError("The CUDA Qwen runtime needs a visible CUDA device")
     options = dict(dtype=torch.bfloat16, device_map="cuda:0")
     asr = Qwen3ASRModel.from_pretrained(model_path, **options)
+    # mlx-audio runs the audio encoder in float32 (bf16 weights promoted, sinusoids computed in float32)
+    # and only the text decoder in bf16. Matching that keeps the two runtimes' decodes close.
+    tower = asr.model.thinker.audio_tower.float()
+    sinusoids = tower.positional_embedding
+    sinusoids.positional_embedding = type(sinusoids)(
+        *sinusoids.positional_embedding.shape
+    ).positional_embedding.to(sinusoids.positional_embedding.device)
     aligner = Qwen3ForcedAligner.from_pretrained(aligner_path, **options)
     versions = dict(
         torch=torch.__version__,
         cuda=torch.version.cuda,
         qwen_asr=version("qwen-asr"),
         dtype="bfloat16",
+        audio_encoder_dtype="float32",
     )
     return Recognizer(asr.model, asr.processor), Aligner(aligner), versions
