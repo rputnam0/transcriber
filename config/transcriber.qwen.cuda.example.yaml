@@ -1,0 +1,14 @@
+# Qwen3-ASR on an NVIDIA GPU for verified isolated-speaker inputs.
+# Install .venv-qwen-cuda from requirements/qwen-cuda.lock.txt first.
+backend: qwen
+model: qwen
+device: cuda
+# An absolute directory holding hub/ (pinned Qwen checkpoints) and vad/ (Silero speech detector).
+cache_root: /home/USER/.cache/huggingface
+local_files_only: true
+asr_python: .venv-qwen-cuda/bin/python
+# vocabulary: /path/to/campaign.json
+speaker_bank:
+  enabled: false
+postprocess:
+  enabled: false
