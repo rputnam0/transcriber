@@ -45,7 +45,12 @@ class Recognizer:
         )
         inputs = inputs.to(self.model.device).to(self.model.dtype)
         with torch.inference_mode():
-            output = self.model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+            )
         sequence = getattr(output, "sequences", output)[0, inputs["input_ids"].shape[1] :]
         tokens = []
         for token in sequence.tolist():

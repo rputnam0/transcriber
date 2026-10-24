@@ -263,7 +263,7 @@ def test_cuda_recognizer_matches_mlx_prompt_and_counts_budget():
     seen = {}
 
     class Tokenizer:
-        eos_token_id = 0
+        eos_token_id, pad_token_id = 0, 2
 
         def convert_tokens_to_ids(self, token):
             return {"<|im_end|>": 1, "<|endoftext|>": 2}[token]
@@ -285,7 +285,7 @@ def test_cuda_recognizer_matches_mlx_prompt_and_counts_budget():
     class Model:
         device, dtype = "cpu", torch.float32
 
-        def generate(self, *, max_new_tokens, do_sample, **inputs):
+        def generate(self, *, max_new_tokens, do_sample, pad_token_id, **inputs):
             new = list(range(10, 10 + max_new_tokens))
             return SimpleNamespace(sequences=torch.tensor([[0, 0, 0] + new[:5] + [1, 9]]))
 

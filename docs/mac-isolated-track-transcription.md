@@ -90,6 +90,35 @@ this config also selects it. Unmapped directories and mixed recordings retain th
 other backends. Qwen processes chunks sequentially; the ordinary `--batch-size`
 setting does not change its decoding.
 
+## NVIDIA GPU (CUDA)
+
+The same chunking, vocabulary, alignment and export run on Linux with an NVIDIA GPU
+through the official `Qwen/Qwen3-ASR-1.7B` and `Qwen/Qwen3-ForcedAligner-0.6B`
+checkpoints (bfloat16, pinned revisions) and the `qwen-asr` package. The decoder
+prompt is built exactly as mlx-audio builds it, so both runtimes receive the same
+request. CUDA is never selected automatically: pass `--backend qwen --device cuda`.
+The completion record names the runtime (`asr_runtime: cuda`), model, revision and
+aligner, and the chunk cache provenance records torch, CUDA and `qwen-asr` versions.
+
+```sh
+uv sync
+uv venv --python 3.12 .venv-qwen-cuda
+uv pip sync --python .venv-qwen-cuda/bin/python \
+  --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 \
+  --index-strategy unsafe-best-match requirements/qwen-cuda.lock.txt
+```
+
+Copy [the CUDA example config](../config/transcriber.qwen.cuda.example.yaml) to
+`config/transcriber.qwen.cuda.local.yaml`, set the absolute cache directory, and
+place the Silero model at `<cache>/vad/silero-vad-6.2.2.onnx` (or run once online).
+The model and aligner need about 7 GB of GPU memory.
+
+The two runtimes are different weights and kernels (the MLX aligner is 8-bit), so
+their transcripts are close but not byte-identical; the decoded 16 kHz audio can
+also differ in float rounding between ffmpeg versions, which the cache's
+`audio_sha256` records. Treat a CUDA transcript as its own method in provenance
+gates rather than as the MLX model id.
+
 ## Results, resume, and quality
 
 Exports use the normal per-input output directory and include TXT, SRT, and JSONL

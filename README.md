@@ -12,6 +12,7 @@ Local speech transcription for mixed recordings, isolated speaker audio, and mul
 | Input | Workflow |
 | --- | --- |
 | Isolated speaker tracks on Apple Silicon | [Qwen ASR + vocabulary](docs/mac-isolated-track-transcription.md): automatic for known speakers, aligned timestamps, and resumable chunks |
+| Isolated speaker tracks on an NVIDIA GPU | [Qwen ASR on CUDA](docs/mac-isolated-track-transcription.md#nvidia-gpu-cuda): `--backend qwen --device cuda`, same exports and chunk cache |
 | Mixed recording with enrolled voices on Apple Silicon | [Qwen ASR + trained MOSS](docs/mac-single-file-transcription.md): resumable full-recording processing, named turns, overlap handling, and an audio reader |
 | Isolated speaker recording or named multitrack stems | Regular `transcribe` CLI below; use speaker mapping for known track identities |
 | Mixed recording with generic speaker labels or a pyannote speaker bank | Regular CLI with the `faster` backend and pyannote diarization |
