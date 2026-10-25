@@ -33,6 +33,7 @@ data/
 config/speaker_mapping.yaml
 config/transcriber.yaml
 config/transcriber.qwen.local.yaml
+config/transcriber.qwen.cuda.local.yaml
 config/transcriber.watch.yaml
 
 # Private campaign evidence and trained voice assets are backed up separately.

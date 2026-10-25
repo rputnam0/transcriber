@@ -2075,13 +2075,22 @@ def run_transcribe(
             len(bank_info.get("speakers", [])),
         )
 
+    # CUDA is never chosen automatically: it is a different checkpoint and runtime.
+    qwen_runtime = None
+    if backend == "qwen" and device == "cuda":
+        qwen_runtime = "cuda"
+    elif backend == "qwen" and _is_apple_silicon() and device in {None, "auto"}:
+        qwen_runtime = "mlx"
     if backend == "qwen":
-        from .qwen_backend import MODEL, MODEL_REVISION, transcribe_files
+        from .qwen_backend import transcribe_files
         from .vocabulary import load_vocabulary
 
         try:
-            if not _is_apple_silicon() or device not in {None, "auto"}:
-                raise ValueError("Qwen uses Apple Silicon Metal; use --device auto on this Mac")
+            if qwen_runtime is None:
+                raise ValueError(
+                    "Qwen runs through MLX with --device auto on Apple Silicon, "
+                    "or through PyTorch with --device cuda"
+                )
             if min_speakers is not None or max_speakers is not None or speaker_bank:
                 raise ValueError(
                     "Qwen isolated tracks use file identity, not diarization/speaker bank"
@@ -2105,6 +2114,7 @@ def run_transcribe(
                 cache_root=hf_cache_root,
                 work_dir=Path(output_dir) / ".qwen",
                 local_files_only=local_files_only,
+                runtime=qwen_runtime,
             )
             if len(decoded) != len(files):
                 raise ValueError("Qwen returned an incomplete set of tracks")
@@ -2591,13 +2601,7 @@ def run_transcribe(
         asr_backend=backend,
         asr_requested_model=model_name,
         asr_model=(
-            local_model_name
-            if backend in {"parakeet", "mlx-whisper"}
-            else (
-                MODEL
-                if backend == "qwen" and model_name in {"qwen", "large-v3", "medium.en"}
-                else model_name
-            )
+            local_model_name if backend in {"parakeet", "mlx-whisper"} else model_name
         ),
         asr_compute_type=(fw_compute if backend == "faster" else compute_type),
     )
@@ -2607,8 +2611,20 @@ def run_transcribe(
         if local_model_name == DEFAULT_MODEL:
             craig_input_metadata["asr_model_revision"] = DEFAULT_REVISION
     elif backend == "qwen":
-        if craig_input_metadata["asr_model"] == MODEL:
-            craig_input_metadata["asr_model_revision"] = MODEL_REVISION
+        from .qwen_backend import RUNTIMES, resolve_model
+
+        pinned = RUNTIMES[qwen_runtime]
+        model, revision = resolve_model(model_name, qwen_runtime)
+        craig_input_metadata.update(
+            asr_model=model,
+            asr_runtime=qwen_runtime,
+            asr_aligner=pinned["aligner"],
+            asr_aligner_revision=pinned["aligner_revision"],
+        )
+        if qwen_runtime == "cuda":
+            craig_input_metadata["asr_compute_type"] = "bfloat16"
+        if revision:
+            craig_input_metadata["asr_model_revision"] = revision
     _write_transcription_completion_marker(
         transcript_output_path,
         input_path=input_path,

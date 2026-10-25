@@ -1,15 +1,18 @@
-"""Isolated Apple Silicon Qwen ASR worker with vocabulary and aligned chunk ownership.
+"""Isolated Qwen ASR worker with vocabulary and aligned chunk ownership.
 
-Run through the ordinary CLI with --backend qwen. Model dependencies are imported
+Run through the ordinary CLI with --backend qwen. Apple Silicon uses MLX; --device cuda
+uses the official Qwen checkpoints through PyTorch. Model dependencies are imported
 only in the separate worker so the existing application environment stays intact.
 """
 
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ProcessPoolExecutor
 from importlib.metadata import version
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -23,6 +26,37 @@ MODEL = "mlx-community/Qwen3-ASR-1.7B-bf16"
 MODEL_REVISION = "e1f6c266914abc5a46e8756e02580f834a6cf8a7"
 ALIGNER = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 ALIGNER_REVISION = "0e1a68e91d815300c7c9754b2a7639378b23db15"
+CUDA_MODEL = "Qwen/Qwen3-ASR-1.7B"
+CUDA_MODEL_REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
+CUDA_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
+CUDA_ALIGNER_REVISION = "c7cbfc2048c462b0d63a45797104fc9db3ad62b7"
+RUNTIMES = {
+    "mlx": dict(
+        model=MODEL,
+        model_revision=MODEL_REVISION,
+        aligner=ALIGNER,
+        aligner_revision=ALIGNER_REVISION,
+        python=".venv-qwen/bin/python",
+        batch_size=1,
+    ),
+    "cuda": dict(
+        model=CUDA_MODEL,
+        model_revision=CUDA_MODEL_REVISION,
+        aligner=CUDA_ALIGNER,
+        aligner_revision=CUDA_ALIGNER_REVISION,
+        python=".venv-qwen-cuda/bin/python",
+        # Batched first-pass decoding; 8 chunks peak near 7 GB of GPU memory.
+        batch_size=8,
+    ),
+}
+
+
+def resolve_model(model: str, runtime: str) -> tuple[str, str | None]:
+    """Map the generic CLI model names to the runtime's pinned checkpoint."""
+    pinned = RUNTIMES[runtime]
+    if model in {"qwen", "large-v3", "medium.en"}:
+        model = pinned["model"]
+    return model, pinned["model_revision"] if model == pinned["model"] else None
 
 
 def _save(path: Path, value: dict) -> None:
@@ -41,19 +75,20 @@ def transcribe_files(
     cache_root: str | None,
     work_dir: Path,
     local_files_only: bool,
+    runtime: str = "mlx",
 ) -> list[list[dict]]:
     executable = (
         Path(python).expanduser()
         if python
-        else (Path(__file__).resolve().parents[2] / ".venv-qwen/bin/python")
+        else (Path(__file__).resolve().parents[2] / RUNTIMES[runtime]["python"])
     )
     if not executable.is_file():
         raise ValueError("Qwen runtime missing; see docs/mac-isolated-track-transcription.md")
-    model = MODEL if model in {"qwen", "large-v3", "medium.en"} else model
     request = dict(
         files=[str(Path(f).resolve()) for f in files],
         vocabulary=vocabulary,
-        model=model,
+        runtime=runtime,
+        model=resolve_model(model, runtime)[0],
         cache_root=cache_root,
         work_dir=str(work_dir.resolve()),
         local_files_only=local_files_only,
@@ -110,8 +145,14 @@ def aligned_words(text: str, aligned: list[dict], duration: float) -> list[dict]
     return words
 
 
-def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regions=None):
-    """Decode speech regions without removing their offsets on the source timeline."""
+def transcribe_wave(
+    wave, model, aligner, *, vocabulary, cache, provenance, regions=None, batch_size=1
+):
+    """Decode speech regions without removing their offsets on the source timeline.
+
+    With ``batch_size`` > 1 the first hinted decode of up to that many uncached chunks runs as one
+    ``model.generate_batch`` call; retries, alignment and the chunk records stay per chunk.
+    """
     rate, core_samples, padding = 16000, 30 * 16000, 3 * 16000
     segments = []
     regions = [[0, len(wave)]] if regions is None else regions
@@ -128,6 +169,24 @@ def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regi
                     end == region_end,
                 )
             )
+    first_pass = {}
+
+    def decode_ahead(first):
+        pending = []
+        for j in range(first, len(windows)):
+            if len(pending) == batch_size:
+                break
+            if not (cache / f"{j:06d}.json").exists() and wave[windows[j][2] : windows[j][3]].any():
+                pending.append(j)
+        results = model.generate_batch(
+            [wave[windows[j][2] : windows[j][3]] for j in pending],
+            language="English",
+            hotwords=vocabulary["terms"] or None,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        first_pass.update(zip(pending, results))
+
     for index, (start, end, lo, hi, final_window) in enumerate(windows):
         target = cache / f"{index:06d}.json"
         if target.exists():
@@ -142,7 +201,9 @@ def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regi
             if not clip.any():
                 text, aligned, generated = "", [], 0
             else:
-                result = model.generate(
+                if batch_size > 1 and index not in first_pass:
+                    decode_ahead(index)
+                result = first_pass.pop(index, None) or model.generate(
                     clip,
                     language="English",
                     hotwords=vocabulary["terms"] or None,
@@ -266,12 +327,33 @@ def transcribe_wave(wave, model, aligner, *, vocabulary, cache, provenance, regi
     return segments
 
 
+def _load_runtime(runtime: str, model_path: str, aligner_path: str):
+    """Load the recognizer and aligner; return them with the runtime's package versions."""
+    if runtime == "cuda":
+        from .qwen_cuda import load
+
+        return load(model_path, aligner_path)
+    from mlx_audio.stt import load
+
+    versions = dict(mlx_audio=version("mlx-audio"), mlx=version("mlx"))
+    return load(model_path), load(aligner_path), versions
+
+
+def _prepare_track(path: str, vad_path: str):
+    """Decode one track and find its speech regions (CPU work, run ahead in another process)."""
+    from .speech_activity import SETTINGS, probabilities, speech_regions
+
+    wave = load_audio_mono(path)
+    return wave, speech_regions(probabilities(wave, Path(vad_path)), len(wave), **SETTINGS)
+
+
 def run_worker(request: dict) -> dict:
     started = time.perf_counter()
     from huggingface_hub import snapshot_download
-    from mlx_audio.stt import load
-    import mlx.core as mx
-    from .speech_activity import SETTINGS, VAD_SHA256, probabilities, resolve_vad, speech_regions
+    from .speech_activity import SETTINGS, VAD_SHA256, resolve_vad
+
+    runtime = request.get("runtime", "mlx")
+    pinned = RUNTIMES[runtime]
 
     def resolve(name, revision=None):
         if Path(name).is_dir():
@@ -282,73 +364,90 @@ def run_worker(request: dict) -> dict:
             name, revision=revision, cache_dir=hub, local_files_only=request["local_files_only"]
         )
 
-    model_path = resolve(request["model"], MODEL_REVISION if request["model"] == MODEL else None)
-    aligner_path = resolve(ALIGNER, ALIGNER_REVISION)
+    model_path = resolve(*resolve_model(request["model"], runtime))
+    aligner_path = resolve(pinned["aligner"], pinned["aligner_revision"])
     vad_path = resolve_vad(request["cache_root"], request["local_files_only"])
-    model, aligner = load(model_path), load(aligner_path)
+    model, aligner, runtime_versions = _load_runtime(runtime, model_path, aligner_path)
     setup_seconds = time.perf_counter() - started
     vocabulary = request["vocabulary"]
     files = []
     timings = []
     activity = []
-    for path in request["files"]:
-        track_started = time.perf_counter()
-        wave = load_audio_mono(path)
-        regions = speech_regions(probabilities(wave, vad_path), len(wave), **SETTINGS)
-        speech = dict(
-            regions=[dict(start=a / 16000, end=b / 16000) for a, b in regions],
-            retained_seconds=sum(b - a for a, b in regions) / 16000,
-            audio_seconds=len(wave) / 16000,
-        )
-        provenance = dict(
-            schema=6,
-            model_path=model_path,
-            aligner_path=aligner_path,
-            mlx_audio=version("mlx-audio"),
-            mlx=version("mlx"),
-            transformers=version("transformers"),
-            tokenizers=version("tokenizers"),
-            numpy=version("numpy"),
-            vocabulary=vocabulary,
-            audio_sha256=hashlib.sha256(wave.tobytes()).hexdigest(),
-            sample_rate=16000,
-            core_seconds=30,
-            context_seconds=3,
-            language="English",
-            temperature=0.0,
-            max_tokens=1024,
-            speech_detection=dict(
-                model_sha256=VAD_SHA256, settings=SETTINGS, onnxruntime=version("onnxruntime")
-            ),
-        )
-        ident = hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
-        cache = Path(request["work_dir"]) / ident
-        print(
-            f"Qwen track {len(files) + 1}/{len(request['files'])}; "
-            f"{len(vocabulary['terms'])} vocabulary terms",
-            flush=True,
-        )
-        segments = transcribe_wave(
-            wave,
-            model,
-            aligner,
-            vocabulary=vocabulary,
-            cache=cache,
-            provenance=provenance,
-            regions=regions,
-        )
-        _save(
-            cache / "result.json", dict(provenance=provenance, segments=segments, activity=speech)
-        )
-        files.append(segments)
-        activity.append(speech)
-        timings.append(
-            dict(
+    # Decoding and speech detection take ~30 s of CPU per long track; the next track is prepared
+    # while the current one is recognized. At most two decoded tracks wait in memory.
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        prepared = {}
+        for index, path in enumerate(request["files"]):
+            for ahead in request["files"][index : index + 2]:
+                if ahead not in prepared:
+                    prepared[ahead] = pool.submit(_prepare_track, ahead, str(vad_path))
+            track_started = time.perf_counter()
+            wave, regions = prepared.pop(path).result()
+            speech = dict(
+                regions=[dict(start=a / 16000, end=b / 16000) for a, b in regions],
+                retained_seconds=sum(b - a for a, b in regions) / 16000,
                 audio_seconds=len(wave) / 16000,
-                processing_seconds=time.perf_counter() - track_started,
             )
-        )
-        mx.clear_cache()
+            # MLX keeps its original key set so existing chunk caches still resume.
+            provenance = dict(
+                schema=6,
+                **(
+                    {}
+                    if runtime == "mlx"
+                    else dict(runtime=runtime, batch_size=pinned["batch_size"])
+                ),
+                model_path=model_path,
+                aligner_path=aligner_path,
+                **runtime_versions,
+                transformers=version("transformers"),
+                tokenizers=version("tokenizers"),
+                numpy=version("numpy"),
+                vocabulary=vocabulary,
+                audio_sha256=hashlib.sha256(wave.tobytes()).hexdigest(),
+                sample_rate=16000,
+                core_seconds=30,
+                context_seconds=3,
+                language="English",
+                temperature=0.0,
+                max_tokens=1024,
+                speech_detection=dict(
+                    model_sha256=VAD_SHA256, settings=SETTINGS, onnxruntime=version("onnxruntime")
+                ),
+            )
+            ident = hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
+            cache = Path(request["work_dir"]) / ident
+            print(
+                f"Qwen track {len(files) + 1}/{len(request['files'])}; "
+                f"{len(vocabulary['terms'])} vocabulary terms",
+                flush=True,
+            )
+            segments = transcribe_wave(
+                wave,
+                model,
+                aligner,
+                vocabulary=vocabulary,
+                cache=cache,
+                provenance=provenance,
+                regions=regions,
+                batch_size=pinned["batch_size"],
+            )
+            _save(
+                cache / "result.json",
+                dict(provenance=provenance, segments=segments, activity=speech),
+            )
+            files.append(segments)
+            activity.append(speech)
+            timings.append(
+                dict(
+                    audio_seconds=len(wave) / 16000,
+                    processing_seconds=time.perf_counter() - track_started,
+                )
+            )
+            if runtime == "mlx":
+                import mlx.core as mx
+
+                mx.clear_cache()
     return {
         "files": files,
         "activity": activity,

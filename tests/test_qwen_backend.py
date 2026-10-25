@@ -171,3 +171,180 @@ def test_complete_hint_echo_is_retried_without_hints(tmp_path, prefix):
     assert calls == [bank["terms"], None]
     assert "Kaladen" in json.loads((tmp_path / "000000.hint_echo.json").read_text())["text"]
     assert json.loads((tmp_path / "000000.json").read_text())["hint_echo_retry"]
+
+
+@pytest.mark.parametrize(
+    "device, runtime, model, revision",
+    [
+        (
+            "auto",
+            "mlx",
+            "mlx-community/Qwen3-ASR-1.7B-bf16",
+            "e1f6c266914abc5a46e8756e02580f834a6cf8a7",
+        ),
+        ("cuda", "cuda", "Qwen/Qwen3-ASR-1.7B", "7278e1e70fe206f11671096ffdd38061171dd6e5"),
+    ],
+)
+def test_qwen_completion_record_names_runtime(
+    monkeypatch, tmp_path, device, runtime, model, revision
+):
+    from transcriber import cli
+
+    paths = [str(tmp_path / "one.wav"), str(tmp_path / "two.wav")]
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"one": "Player One", "two": "Player Two"}))
+    monkeypatch.setattr(cli, "gather_inputs", lambda _: (paths, None))
+    monkeypatch.setattr(cli, "_is_apple_silicon", lambda: True)
+    monkeypatch.setattr(cli, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli, "_preload_cudnn_libs", lambda: None)
+    runtimes = []
+
+    def decode(files, **kwargs):
+        runtimes.append(kwargs["runtime"])
+        return [[dict(start=1, end=2, text="Hello", speaker=None)] for _ in files]
+
+    monkeypatch.setattr("transcriber.qwen_backend.transcribe_files", decode)
+    out = tmp_path / "out"
+    cli.run_transcribe(
+        str(tmp_path / "tracks"),
+        backend="qwen",
+        model_name="qwen",
+        device=device,
+        speaker_mapping_path=str(mapping),
+        output_dir=str(out),
+        hf_cache_root=str(tmp_path / "hf"),
+    )
+    marker = json.loads((out / "tracks" / "tracks.transcribe.json").read_text())
+    assert runtimes == [runtime]
+    assert marker["status"] == "completed"
+    assert (marker["asr_runtime"], marker["asr_model"], marker["asr_model_revision"]) == (
+        runtime,
+        model,
+        revision,
+    )
+
+
+def test_cuda_qwen_is_explicit_and_unavailable_elsewhere(monkeypatch, tmp_path):
+    from transcriber import cli
+
+    paths = [str(tmp_path / "one.wav"), str(tmp_path / "two.wav")]
+    monkeypatch.setattr(cli, "gather_inputs", lambda _: (paths, "/tmp/zip"))
+    monkeypatch.setattr(cli, "_is_apple_silicon", lambda: False)
+    monkeypatch.setattr(cli, "_ensure_cuda_libs_on_path", lambda: None)
+    monkeypatch.setattr(cli, "cleanup_tmp", lambda _: None)
+    assert (
+        cli._resolve_backend_choice(
+            "auto",
+            files=paths,
+            tmp_root="/tmp/zip",
+            min_speakers=None,
+            max_speakers=None,
+            single_file_speaker=None,
+            device="cuda",
+            speaker_bank_config=None,
+        )
+        == "faster"
+    )
+    with pytest.raises(ValueError, match="--device cuda"):
+        cli.run_transcribe(
+            str(tmp_path / "s.zip"),
+            backend="qwen",
+            device="auto",
+            output_dir=str(tmp_path / "out"),
+            hf_cache_root=str(tmp_path / "hf"),
+        )
+
+
+def test_cuda_recognizer_matches_mlx_prompt_and_counts_budget():
+    import torch
+
+    from transcriber.qwen_cuda import Recognizer
+
+    seen = {}
+
+    class Tokenizer:
+        eos_token_id, pad_token_id = 0, 2
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|im_end|>": 1, "<|endoftext|>": 2}[token]
+
+        def decode(self, tokens, **kwargs):
+            return " ".join(f"w{t}" for t in tokens)
+
+    class Inputs(dict):
+        def to(self, _):
+            return self
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+        def __call__(self, *, text, audio, **kwargs):
+            seen["prompt"] = text[0]
+            return Inputs(input_ids=torch.zeros((1, 3), dtype=torch.long))
+
+    class Model:
+        device, dtype = "cpu", torch.float32
+
+        def generate(self, *, max_new_tokens, do_sample, pad_token_id, **inputs):
+            new = list(range(10, 10 + max_new_tokens))
+            return SimpleNamespace(sequences=torch.tensor([[0, 0, 0] + new[:5] + [1, 9]]))
+
+    recognizer = Recognizer(Model(), Processor())
+    result = recognizer.generate(
+        np.zeros(16000, dtype=np.float32),
+        language="English",
+        hotwords=["Kaladen", "Zariel"],
+        max_tokens=1024,
+        temperature=0.0,
+    )
+    assert seen["prompt"] == (
+        "<|im_start|>system\nKaladen, Zariel\n<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+        "<|im_start|>assistant\nlanguage English<asr_text>"
+    )
+    assert (result.text, result.generation_tokens) == ("w10 w11 w12 w13 w14", 5)
+    # Without an end token the whole budget was used, which triggers the review path.
+    assert (
+        recognizer.generate(
+            np.zeros(16000, dtype=np.float32),
+            language="English",
+            hotwords=None,
+            max_tokens=3,
+            temperature=0.0,
+        ).generation_tokens
+        == 3
+    )
+    assert "system\n<|im_end|>" in seen["prompt"]
+
+
+def test_batched_first_pass_matches_sequential_decoding(tmp_path):
+    wave = np.arange(100 * 16000, dtype=np.float32) + 1
+    batches = []
+
+    def text(clip):
+        return f"Chunk{int(clip[0]) // 16000}."
+
+    class Model:
+        def generate(self, clip, **kwargs):
+            # Only the unhinted retry of the echoed chunk is decoded alone.
+            assert kwargs["hotwords"] is None
+            return SimpleNamespace(text="Retried.", generation_tokens=3)
+
+        def generate_batch(self, clips, **kwargs):
+            batches.append(len(clips))
+            out = [SimpleNamespace(text=text(c), generation_tokens=3) for c in clips]
+            out[0] = SimpleNamespace(text="Kaladen, Leopold, Cyrus, Zariel", generation_tokens=9)
+            return out
+
+    class Aligner:
+        def generate(self, *, audio, text, **kwargs):
+            return SimpleNamespace(segments=[dict(text=text.rstrip("."), start=4.0, end=4.5)])
+
+    bank = {"terms": ["Kaladen", "Leopold", "Cyrus", "Zariel"]}
+    result = transcribe_wave(
+        wave, Model(), Aligner(), vocabulary=bank, cache=tmp_path, provenance={}, batch_size=2
+    )
+    # Four windows decode as two batches; the echoed first chunk of each batch is retried alone.
+    assert batches == [2, 2]
+    assert [s["text"] for s in result] == ["Retried.", "Chunk27.", "Retried.", "Chunk87."]
+    assert json.loads((tmp_path / "000002.json").read_text())["retry_reason"] == "hint_echo"
