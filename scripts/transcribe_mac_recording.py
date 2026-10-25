@@ -108,6 +108,10 @@ def commands(args, plan):
             args.output,
             "--rosters",
             args.rosters,
+            "--identity",
+            args.assets / "speaker_model.npz",
+            "--policy",
+            args.assets / "turn_refinement.json",
         ),
     ]
     return jobs
