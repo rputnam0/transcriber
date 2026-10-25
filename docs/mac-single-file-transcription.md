@@ -50,10 +50,22 @@ New voices require new enrollment/training, not merely another display name.
 
 An existing verified asset directory can be passed directly to `--assets`; a ZIP
 restore is unnecessary on a machine that already has the checkpoint and enrollment.
-The initial private Drive model backup is incomplete (2 of 55 model parts uploaded).
-It is not a usable fresh-machine restore source yet. The complete, verified local
-asset copy remains the source for the current workflow; preserve it independently
-of this repository. Code on GitHub alone cannot reproduce the enrolled voices.
+The complete private backup is in the owner's Google Drive at
+`DND/Model backups/moss-private-20260922/`: 55 `model-partNNN.zip` files,
+`private-assets.zip`, `backup_manifest.json` and a README. A restore from it was
+verified on 2026-10-25. It rebuilt `model.safetensors` with SHA-256
+`af4ad00691d04fa405a9c554ec346d933515e14a24b9696c9dd7ffa6a7c0c219`, identical to the
+deployed Mac copy at `~/.cache/transcriber/private-voices-20260922/`, and it rebuilt
+byte-identical `speaker_model.npz`, `turn_refinement.json` and `rosters.json`.
+Download it with rclone through the Weave GCP project's OAuth client
+(`gdrive-weave:` remote) to stay off rclone's shared quota:
+
+```sh
+rclone copy "gdrive-weave:DND/Model backups/moss-private-20260922" /path/to/downloaded-backup
+```
+
+`DND/Transcriber private assets 2026-09-22/` is the earlier partial upload (2 of 55
+parts); do not restore from it. Code on GitHub alone cannot reproduce the enrolled voices.
 
 ## Run or resume a complete recording
 
