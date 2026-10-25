@@ -81,3 +81,48 @@ def test_plan_requires_explicit_attendance_and_keeps_whole_recording(tmp_path):
     assert row["audio"].endswith("full.wav")
     with pytest.raises(ValueError, match="roster"):
         build_plan(tmp_path / "full.wav", 71, tmp_path / "work", rosters)
+
+
+def test_finished_release_records_the_configured_mixed_method(tmp_path):
+    from finish_mac_asr_release import completion_record
+    from resolve_mac_asr_models import MODELS
+
+    audio, identity, policy = (
+        tmp_path / n for n in ("full.m4a", "speaker_model.npz", "policy.json")
+    )
+    for path in (audio, identity, policy):
+        path.write_bytes(path.name.encode())
+    rosters = tmp_path / "rosters.json"
+    rosters.write_text(
+        json.dumps(
+            dict(
+                session_rosters={"70": ["voice_a", "voice_b"]},
+                display_names={"voice_a": "Dungeon Master", "voice_b": "Hero", "voice_c": "Absent"},
+                session_display_names={"70": {"voice_b": "Hero Two"}},
+            )
+        )
+    )
+    asr, aligner = ({"path": "/m", "revision": revision} for revision in MODELS.values())
+    report = dict(
+        duration_seconds=12.5,
+        asr=dict(asr=asr, aligner=aligner),
+        diarizer=dict(checkpoint_sha256="c" * 64, decoder="greedy_equal_length_v1"),
+    )
+    entry = dict(session=70, audio=str(audio))
+    record = completion_record(
+        report, entry, tmp_path / "Session 70.txt", rosters, identity, policy
+    )
+    assert record["status"] == "completed" and record["asr_backend"] == "qwen"
+    assert record["transcription_method"] == "qwen_mixed_voice_attribution"
+    assert record["asr_model"] == "mlx-community/Qwen3-ASR-1.7B-bf16"
+    assert record["asr_model_revision"] == MODELS["mlx-community/Qwen3-ASR-1.7B-bf16"]
+    assert record["input_sha256"] == hashlib.sha256(b"full.m4a").hexdigest()
+    assert (
+        record["voice_set"]["speaker_model_sha256"]
+        == hashlib.sha256(b"speaker_model.npz").hexdigest()
+    )
+    assert record["roster"]["display_names"] == {"voice_a": "Dungeon Master", "voice_b": "Hero Two"}
+    assert record["diarizer"]["checkpoint_sha256"] == "c" * 64
+    report["asr"]["asr"] = {"path": "/m", "revision": "other"}
+    with pytest.raises(ValueError, match="pinned"):
+        completion_record(report, entry, tmp_path / "Session 70.txt", rosters, identity, policy)
