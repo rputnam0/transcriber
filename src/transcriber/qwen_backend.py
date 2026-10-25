@@ -8,9 +8,11 @@ only in the separate worker so the existing application environment stays intact
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ProcessPoolExecutor
 from importlib.metadata import version
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -337,10 +339,18 @@ def _load_runtime(runtime: str, model_path: str, aligner_path: str):
     return load(model_path), load(aligner_path), versions
 
 
+def _prepare_track(path: str, vad_path: str):
+    """Decode one track and find its speech regions (CPU work, run ahead in another process)."""
+    from .speech_activity import SETTINGS, probabilities, speech_regions
+
+    wave = load_audio_mono(path)
+    return wave, speech_regions(probabilities(wave, Path(vad_path)), len(wave), **SETTINGS)
+
+
 def run_worker(request: dict) -> dict:
     started = time.perf_counter()
     from huggingface_hub import snapshot_download
-    from .speech_activity import SETTINGS, VAD_SHA256, probabilities, resolve_vad, speech_regions
+    from .speech_activity import SETTINGS, VAD_SHA256, resolve_vad
 
     runtime = request.get("runtime", "mlx")
     pinned = RUNTIMES[runtime]
@@ -363,69 +373,81 @@ def run_worker(request: dict) -> dict:
     files = []
     timings = []
     activity = []
-    for path in request["files"]:
-        track_started = time.perf_counter()
-        wave = load_audio_mono(path)
-        regions = speech_regions(probabilities(wave, vad_path), len(wave), **SETTINGS)
-        speech = dict(
-            regions=[dict(start=a / 16000, end=b / 16000) for a, b in regions],
-            retained_seconds=sum(b - a for a, b in regions) / 16000,
-            audio_seconds=len(wave) / 16000,
-        )
-        # MLX keeps its original key set so existing chunk caches still resume.
-        provenance = dict(
-            schema=6,
-            **({} if runtime == "mlx" else dict(runtime=runtime, batch_size=pinned["batch_size"])),
-            model_path=model_path,
-            aligner_path=aligner_path,
-            **runtime_versions,
-            transformers=version("transformers"),
-            tokenizers=version("tokenizers"),
-            numpy=version("numpy"),
-            vocabulary=vocabulary,
-            audio_sha256=hashlib.sha256(wave.tobytes()).hexdigest(),
-            sample_rate=16000,
-            core_seconds=30,
-            context_seconds=3,
-            language="English",
-            temperature=0.0,
-            max_tokens=1024,
-            speech_detection=dict(
-                model_sha256=VAD_SHA256, settings=SETTINGS, onnxruntime=version("onnxruntime")
-            ),
-        )
-        ident = hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
-        cache = Path(request["work_dir"]) / ident
-        print(
-            f"Qwen track {len(files) + 1}/{len(request['files'])}; "
-            f"{len(vocabulary['terms'])} vocabulary terms",
-            flush=True,
-        )
-        segments = transcribe_wave(
-            wave,
-            model,
-            aligner,
-            vocabulary=vocabulary,
-            cache=cache,
-            provenance=provenance,
-            regions=regions,
-            batch_size=pinned["batch_size"],
-        )
-        _save(
-            cache / "result.json", dict(provenance=provenance, segments=segments, activity=speech)
-        )
-        files.append(segments)
-        activity.append(speech)
-        timings.append(
-            dict(
+    # Decoding and speech detection take ~30 s of CPU per long track; the next track is prepared
+    # while the current one is recognized. At most two decoded tracks wait in memory.
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        prepared = {}
+        for index, path in enumerate(request["files"]):
+            for ahead in request["files"][index : index + 2]:
+                if ahead not in prepared:
+                    prepared[ahead] = pool.submit(_prepare_track, ahead, str(vad_path))
+            track_started = time.perf_counter()
+            wave, regions = prepared.pop(path).result()
+            speech = dict(
+                regions=[dict(start=a / 16000, end=b / 16000) for a, b in regions],
+                retained_seconds=sum(b - a for a, b in regions) / 16000,
                 audio_seconds=len(wave) / 16000,
-                processing_seconds=time.perf_counter() - track_started,
             )
-        )
-        if runtime == "mlx":
-            import mlx.core as mx
+            # MLX keeps its original key set so existing chunk caches still resume.
+            provenance = dict(
+                schema=6,
+                **(
+                    {}
+                    if runtime == "mlx"
+                    else dict(runtime=runtime, batch_size=pinned["batch_size"])
+                ),
+                model_path=model_path,
+                aligner_path=aligner_path,
+                **runtime_versions,
+                transformers=version("transformers"),
+                tokenizers=version("tokenizers"),
+                numpy=version("numpy"),
+                vocabulary=vocabulary,
+                audio_sha256=hashlib.sha256(wave.tobytes()).hexdigest(),
+                sample_rate=16000,
+                core_seconds=30,
+                context_seconds=3,
+                language="English",
+                temperature=0.0,
+                max_tokens=1024,
+                speech_detection=dict(
+                    model_sha256=VAD_SHA256, settings=SETTINGS, onnxruntime=version("onnxruntime")
+                ),
+            )
+            ident = hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
+            cache = Path(request["work_dir"]) / ident
+            print(
+                f"Qwen track {len(files) + 1}/{len(request['files'])}; "
+                f"{len(vocabulary['terms'])} vocabulary terms",
+                flush=True,
+            )
+            segments = transcribe_wave(
+                wave,
+                model,
+                aligner,
+                vocabulary=vocabulary,
+                cache=cache,
+                provenance=provenance,
+                regions=regions,
+                batch_size=pinned["batch_size"],
+            )
+            _save(
+                cache / "result.json",
+                dict(provenance=provenance, segments=segments, activity=speech),
+            )
+            files.append(segments)
+            activity.append(speech)
+            timings.append(
+                dict(
+                    audio_seconds=len(wave) / 16000,
+                    processing_seconds=time.perf_counter() - track_started,
+                )
+            )
+            if runtime == "mlx":
+                import mlx.core as mx
 
-            mx.clear_cache()
+                mx.clear_cache()
     return {
         "files": files,
         "activity": activity,
